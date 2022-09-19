@@ -1,0 +1,15 @@
+Component   : DBR-M-25
+PCB Library : r_Miscel.lib
+Date        : 16.02.2012
+Time        : 14:54:38
+
+
+
+Dimension : 2.118 x 0.793 in
+
+ Layer(s)              Pads(s)  Tracks(s)  Fill(s)  Arc(s)  Text(s)
+--------------------------------------------------------------------
+ Top Overlay                 0         33        0       0        1
+ Multi Layer                27          0        0       0        0
+--------------------------------------------------------------------
+ Total                      27         33        0       0        1
