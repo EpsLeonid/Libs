@@ -1,0 +1,324 @@
+
+TITLE "Data reception from ethernet PHY or LANC";
+------------------------------------------------------------------------------
+-- Version 2.0, 
+-- Copyright Arkady Selivanov, November 19, 1998
+
+-- This module can be used to recieve data block from :
+--
+-- a. Ethernet Interface Adapter (tested with LXT905, LevelOne inc.).
+-- b. Ethernet LAN Controller    (tested with  82557, Intel).
+--
+--#  _Carr_ input is under control of pin TEN (transmit enable) in case b.
+--#  _Carr_ input is under control of pin CRS (carrier sense)   in case a.
+--
+-- Module search in incoming data EthDat Start Frame Delimeter (SFD).
+--
+-- After SFD reception serial to parallel convertion starts (LSB - goes first).
+--
+-- Every recieved data byte is stored in hold register with _RxRdy_ pulse.
+--
+-- Additionally, at the end of  RxProgr one of this outputs  generates 
+-- 100ns(SysClk period) pulse: _PktEnd_ , _PktBad_
+-- Reception stops after _Carr_ input low level is detected. 
+-- Recieve progress indicator __RxProgr__ is active between SFD and Carr=0
+------------------------------------------------------------------------------
+-- WARNING !!! CRC32 is on output in Reverse Inverted Nibble order.
+
+
+INCLUDE "crc32eth4.inc";
+INCLUDE "Edge_Sensing_Sync.inc";
+INCLUDE "lpm_counter.inc";
+INCLUDE "lpm_shiftreg.inc";
+
+
+Subdesign Fr_ether100_new
+(
+		System_Clock	: input;	--FPGA Clock
+	--DDR sampled and alighned Inputs
+	RxClk_Edge_at_System_Clock		: input;		--resynchronized in external DDR-buffer
+	Rx_Data_nibble_input[3..0]		: input;		-- Incoming Data.			--resynchronized in external DDR-buffer
+	Carr 							: input;		-- Carrier ( receive...)	--resynchronized in external DDR-buffer
+	Rx_Dv							: input;									--resynchronized in external DDR-buffer
+	Reset 							: input = GND;		-- Reset.		already synchronouse
+
+--Minimal set of outputs
+		Data_Frame_is_in_Progress	: output;
+		Byte_Output_Strobe			: output;
+		Byte_Output[7..0]			: output;
+		Packet_Good_End 			: output;
+		Packet_bad_End				: output;
+		
+		
+--Extended set of outputs
+	Packet_is_too_long				: output;	--to Warning counter
+		Row_output[11..0]				: output;--Virtual pin
+	Gap_is_too_small				: output;	--to Warning counter
+		Gap_output[4..0]				: output;--Virtual pin
+		Preamble_progress_Cnt_out[4..0]	: output;--Virtual pin
+		End_of_preamble					: output;--Virtual pin
+	Preamble_failed				: output;			--to Warning counter
+		Byte_Ready_Strobe				: output;	-- note the difference to 'Byte_Output_Strobe'
+--CRC adjust outputs
+		CRC_check_out[31..0]			: output;--Virtual pin
+	CRC_Good					: output;	--to Warning counter
+		Bypass_Shifter_Output[31..0]	: output;--Virtual pin
+)
+
+VARIABLE
+
+	Row_Cnt				: lpm_counter with (lpm_width = 12); 	--Count nibbles when Phy asserts Rx_DV
+	Gap_Cnt				: lpm_counter with (lpm_width = 5);		--Count nibbles when Phy de-asserts Rx_DV
+	Interframe_Gap_in_Progress	: SRFFE;
+
+	Rx_Clock_Edge				: 	node;	--Short name to 'RxClk_Edge_at_System_Clock'
+	Rx_Data_Valid				: 	node;	--Long name to Rx_DV and Carrier_sence
+	Rx_Data_Valid_Back_Edge		:	Edge_Sensing_Sync;
+	Preamble_progress_Cnt		: lpm_counter with (lpm_width = 5); -- Condition checker
+	Preamble_yet_good			: SRFFE;
+	Preamble_check_enable		: 	node;
+	End_of_good_Preamble		: 	node;
+	Preamble_failed				: 	node;
+	
+	Frame_of_Data_is_in_Progress		: SRFFE;
+	
+	Nibble_Cnt				: lpm_counter with (lpm_width = 12);	--Count nibbles when 'Frame_of_Data_is_in_Progress'
+	LSN_Register			: lpm_shiftreg with (lpm_width=4);		--least sig nibbble
+	Byte_output_Register	: lpm_shiftreg with (lpm_width=8);
+		CRC32_new 			:	crc32eth4;
+	Bypass_Shifter[31..0]	: DFFE;
+	CRC_of_packet_Looks_Good	: 	node;
+	CRC_Good_Recorder		: lpm_shiftreg with (lpm_width=3);	--Accumulator
+
+	
+BEGIN
+------MII signalling proc
+Rx_Clock_Edge	=	RxClk_Edge_at_System_Clock;
+Rx_Data_Valid	=	Carr; --and Rx_DV;
+
+----------------------------------------------------------
+
+---------------------Simple timing check
+Row_Cnt.(clock, cnt_en, sclr)	=	(System_Clock, Rx_Clock_Edge, !Rx_Data_Valid);
+if ((Row_Cnt.q[11..0] == (1530*2)) and (Rx_Clock_Edge)) --including preamble and CRC, non-jumbo
+then Packet_is_too_long		=	VCC; else Packet_is_too_long		=	GND; end if;
+Row_output[11..0]	=	Row_Cnt.q[11..0];
+
+Rx_Data_Valid_Back_Edge.(clk, d)		=	(System_Clock, !Rx_Data_Valid);
+Gap_Cnt.(clock, cnt_en, clk_en, sclr)	=	(System_Clock, Interframe_Gap_in_Progress.q, Rx_Clock_Edge , Rx_Data_Valid);
+Gap_output[4..0]	=	Gap_Cnt.q[];
+
+Interframe_Gap_in_Progress.(S, R, clk, ena) =	(	Rx_Data_Valid_Back_Edge.q,
+													(Gap_Cnt.q[] > 27) OR Rx_Data_Valid,
+													System_Clock, VCC
+												);
+	Gap_is_too_small	=	Interframe_Gap_in_Progress.q and Rx_Data_Valid;
+------------------------End of Simple timing check
+
+
+
+
+-- Is preamble good?
+Preamble_progress_Cnt.(clock, cnt_en, sclr)	=	(System_Clock, 
+												Rx_Clock_Edge and Preamble_yet_good.q , 
+												(!Rx_Data_Valid) or (!Preamble_yet_good.q) or Frame_of_Data_is_in_Progress.q
+												);
+if (Row_Cnt.q[11..0] <= 20)   -- CRS assertion is far away from Data Valid, And Rx_DV is not guaranteed for data immediately
+then Preamble_check_enable = Rx_Clock_Edge and Rx_Data_Valid;
+else Preamble_check_enable = gnd;
+end if;
+Preamble_yet_good.(S, R, clk, ena) = (	Rx_Data_nibble_input[3..0] == b"0101", 
+										Rx_Data_nibble_input[3..0] != b"0101", 
+										System_Clock, Preamble_check_enable
+									);
+	
+IF  ( 	(Row_Cnt.q[11..0] <= 22) 				--	not so far from begin
+	and	(Preamble_progress_Cnt.q[4..0] >= 9)	--	not too short good simbols of preamble (15 is max possible)
+	and	(Rx_Data_nibble_input[3..0] == b"1101")	--	SFD simbol valid
+	and (Rx_Clock_Edge)
+	)
+then	End_of_good_Preamble	=	VCC;
+else	End_of_good_Preamble	=	gnd;
+end IF;
+End_of_preamble		=	DFF(.clk=System_Clock, .d=End_of_good_Preamble);
+Preamble_progress_Cnt_out[4..0]	=	Preamble_progress_Cnt.q[4..0];
+
+IF  ( 	(Row_Cnt.q[11..0] == 23) 
+	and	(!Frame_of_Data_is_in_Progress.q)
+	and (Rx_Clock_Edge)
+	)
+then	Preamble_failed			=	VCC;
+else	Preamble_failed			=	gnd;
+end IF;
+
+--- Will we start frame data receive???
+
+Frame_of_Data_is_in_Progress.(S, R, clk, ena) =	(	End_of_good_Preamble,
+													Rx_Data_Valid_Back_Edge.q,
+													System_Clock, VCC);
+
+Data_Frame_is_in_Progress	=	Frame_of_Data_is_in_Progress.q;
+
+------------------- End of preamble check-----------------------------
+
+-- Error processing to be here!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+----------------------------------------------------------------------
+
+
+Nibble_Cnt.(clock, cnt_en, sclr)	=	(System_Clock, Rx_Clock_Edge, 
+					((!Rx_Data_Valid) or(!Frame_of_Data_is_in_Progress.q) or End_of_good_Preamble));
+
+	Byte_Ready_Strobe	=	(Rx_Clock_Edge) and Nibble_Cnt.q[0] 
+											and Frame_of_Data_is_in_Progress.q ;
+--											and ;
+LSN_Register.(clock, enable, data[3..0], load)	=	(System_Clock, Rx_Clock_Edge, Rx_Data_nibble_input[3..0], VCC);
+Byte_output_Register.(clock, enable, load)		=	(System_Clock, 
+													Rx_Clock_Edge and Nibble_Cnt.q[0], VCC);
+Byte_output_Register.(data[3..0], data[7..4])	=	(LSN_Register.q[3..0], Rx_Data_nibble_input[3..0]);
+
+	Byte_Output[7..0]	=	Byte_output_Register.q[];
+	Byte_Output_Strobe	=	DFF(.clk=System_Clock, .d=Byte_Ready_Strobe);
+
+
+----------------------------------------------------------
+CRC32_new.clock			=	System_Clock;
+CRC32_new.in[3..0]		=	Bypass_Shifter[31..28].q;	-- to match delay of CRC calc
+
+CRC32_new.reset			=	(Nibble_Cnt.q[]==7) and Rx_Clock_Edge; --End_of_good_Preamble;
+CRC32_new.write			=	Rx_Clock_Edge;
+CRC32_new.enable		=	Rx_Clock_Edge;
+
+CRC_check_out[31..0]	=	CRC32_new.out[31..0];
+CRC_Good				=	CRC32_new.out[31..0]==Bypass_Shifter[].q;
+
+for j in 0 to 7 generate
+for i in 0 to 3 generate
+if j==0 generate
+Bypass_Shifter[4*j+i].d	=	Rx_Data_nibble_input[3-i];
+else generate 
+Bypass_Shifter[4*j+i].d	=	Bypass_Shifter[4*(j-1)+i].q;
+end generate;
+end generate;
+end generate;
+Bypass_Shifter[].(clk, ena)	=	(System_Clock, Rx_Clock_Edge);
+Bypass_Shifter_Output[31..0]	=	Bypass_Shifter[].q;
+------------------------------------------------------------------------------------------
+-- Since time interval from end of data and Rx_DV deassertion is not stable -see datasheet of lxt972-
+-- we need allow to check CRC_Good with some margin in time!!!
+CRC_Good_Recorder.(clock, enable, shiftin)	=	(System_Clock, Rx_Clock_Edge, CRC_Good);
+CRC_of_packet_Looks_Good	=	CRC_Good_Recorder.q[] != GND; -- CRC was good near Rx_DV deassertion Rx_Data_Valid_Back_Edge.q
+Packet_Good_End	=	DFF(.clk=System_Clock, .d= 
+						(Rx_Data_Valid_Back_Edge.q 
+						and CRC_of_packet_Looks_Good
+						and DFF(.clk=System_Clock, .d=(Nibble_Cnt.q[] > (45*2)))
+							)
+						);
+Packet_bad_End	=	DFF(.clk=System_Clock, .d= 
+						(Rx_Data_Valid_Back_Edge.q 
+						and (!CRC_of_packet_Looks_Good
+							or !DFF(.clk=System_Clock, .d=(Nibble_Cnt.q[] > (45*2))))
+						)
+						);
+						
+
+
+
+--XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+%
+SysClk								=	MII_Eth_Rx_CLK;
+--RxClk_Edge_at_System_Clock			=	RxClk_Edg_at_System_Clock.q;
+--RxClk_Edg_at_System_Clock.(clk,d)	=	(System_Clock, DFF(.clk=System_Clock, .d=MII_Eth_Rx_CLK));
+
+	RxRdyr.clk		= SysClk;
+	PCR[].clk 		= SysClk;
+	Cnt.(clk,clrn) = (SysClk, !Reset);
+	
+-- Hold register & Data shift. 
+	ShReg.(clock, sclr) = (SysClk, Reset); 
+	ShReg.enable = VCC; --Carr;--VCC; --
+	ShReg.data[3] = EthDat[0]; 
+	ShReg.data[2] = EthDat[1]; 
+	ShReg.data[1] = EthDat[2]; 
+	ShReg.data[0] = EthDat[3]; 
+
+	HoldRg[].(clk,clrn) = (SysClk,!Reset); 	
+	HoldRg[].ena = (Progress & Cnt.q);
+	
+	HoldRg[7].d = ShReg.out[0];
+	HoldRg[6].d = ShReg.out[1];
+	HoldRg[5].d = ShReg.out[2];
+	HoldRg[4].d = ShReg.out[3];
+	
+	HoldRg[3].d = ShReg.out[4];
+	HoldRg[2].d = ShReg.out[5];
+	HoldRg[1].d = ShReg.out[6];
+	HoldRg[0].d = ShReg.out[7];
+	Do[7..0] = HoldRg[7..0].q;
+	
+--d_shreg[7..0] = ShReg.out[7..0];
+-- SFD detection & Progress state indication. 
+	 
+	sfd_detect_n		= (ShReg.out[7..0] == b"10101011");	
+	Progress.(clk,clrn) = (SysClk,!Reset); 	
+	Progress.s 			= sfd_detect_n;
+	Progress.r 			= !Carr;
+
+	rx_progr_l.(clk,clrn) 	= (SysClk, !Reset);
+	rx_progr_l.s			= sfd_detect_n;
+	rx_progr_l.r			= !Progress.q & RxRdyr.q;
+	RxProgr = rx_progr_l.q;
+	
+-- Preset CRC register delay.
+	PCR[].prn =  Progress; 
+	IF PCR[] == 0 THEN 			
+		PCR[] = 0; 
+	ELSE 
+		PCR[] = PCR[] - 1; 
+	END IF; 
+	  
+
+-- Nibble in Byte counter.  
+	Cnt.j = !(ShReg.out[7..0] == b"10101011" and !Progress);
+--Cnt.j = !(ShReg.out[7..0] == b"10101011"); --Error (ovchar) -- false toggle in packet (depends on data)
+	Cnt.k = vcc;
+	  
+-- Next byte ready.  
+	RxRdyr.d = (Progress & Cnt.q);	
+	RxRdy = RxRdyr.q;
+	
+------------------------------------------------------------------------------------------
+-- CRC32 counting.
+	CRC32.clock 	= SysClk;
+	CRC32.in[3..0] 	= ShReg.out[31..28];
+	CRC32.write 	= Progress.q;
+	CRC32.enable 	= Progress.q;
+	CRC32.reset 	= (PCR[]==1) # Reset;					-- Clear CRC32 before immediate data(skip SFD)
+															-- receiption.
+
+Old_CRC_Gate	=	Progress.q;
+Old_CRC_Reset	= (PCR[]==1) # Reset;
+Old_CRC_Good	=	pkt_good_n;
+Old_CRC_indata[3..0]		=	ShReg.out[31..28];
+Old_CRC_check_out[31..0]	=	CRC32.out[31..0];
+
+-- Check for successful packet receiving.
+	pkt_good_n = (CRC32.out[31..0] == ShReg.out[31..0]); 	-- If calculated CRC32 eq received CRC32
+	
+	
+	Proge.clk 	= SysClk;	
+	Proge.d 	= Carr;									-- (aux reg to form PktEnd or PktBad pulse)
+	Pend_n 		= (!Carr & Proge.q);
+
+	pkt_bad_l.clk	= SysClk;
+	pkt_bad_l.d		= !Pkt_Good_n & Pend_n;
+	
+	pkt_end_l.clk	= SysClk;
+	pkt_end_l.d		= Pkt_Good_n & Pend_n; 
+
+	PktBad	=	pkt_bad_l.q;
+	PktEnd	=	pkt_end_l.q; 
+	%
+--XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
+
+END;

@@ -1,0 +1,309 @@
+TITLE " Функция DS18B20 " ;
+
+INCLUDE "lpm_counter.inc" ;
+INCLUDE "lpm_shiftreg.inc" ;
+INCLUDE "Edge_Sensing.inc"; 
+INCLUDE "Pulse_Shaper.inc"; 
+INCLUDE "DP_ID_RAM.inc"; 
+INCLUDE "parameters.inc"; 
+
+
+PARAMETERS
+(
+   RefClock      = 100, -- Пользователь здесь указывает частоту в МГц-ах (целых), которую он подал на вход "Clock" 
+   TimeCNTPeriod = 1   -- Пользователь здесь указывает период в микросекудах (целых), на которой работает основной счетчик проекта
+);
+ASSERT (RefClock>20 AND RefClock<156)
+REPORT "You enter RefClock (%) which is not suitable for Link function" RefClock
+SEVERITY ERROR;
+Constant PrescalerModule = RefClock * TimeCNTPeriod ;
+Constant SCALER_SIZE = CEIL (LOG2(PrescalerModule))+1;  -- определение размера счетчика;
+
+Constant COMMAND_SIZE = 8;
+Constant FAMILY_CODE_SIZE = 8;
+Constant SERIAL_NUMBER_SIZE = 48;
+Constant CRC_SIZE = 8;
+Constant COUNTER_SIZE = 16;  -- определение размера счетчика;
+Constant WORD_WIDTH = 16;
+
+Constant TIME_SLOT          = CEIL (120 div TimeCNTPeriod);
+Constant RECOVERY_TIME      = CEIL (5   div TimeCNTPeriod);
+Constant LOW_TIME           = CEIL (10  div TimeCNTPeriod);
+Constant READ_MSW_TIME      = CEIL (5  div TimeCNTPeriod); --5
+
+
+
+
+Constant RESET_PULSE_BEGIN  = 0;--CEIL (1 div TimeCNTPeriod);
+Constant RESET_PULSE_END    = RESET_PULSE_BEGIN + CEIL (512 div TimeCNTPeriod);
+Constant PRESENCE_DETECT_ST = RESET_PULSE_END   + CEIL (100 div TimeCNTPeriod);
+Constant PRESENCE_DETECT_END= RESET_PULSE_END   + CEIL (480 div TimeCNTPeriod);
+
+--Constant END_SEND_CMD_TIME  = PRESENCE_DETECT_END+TIME_SLOT*16+RECOVERY_TIME*15;
+
+Constant END_SEND_CMD_TIME_ID  = PRESENCE_DETECT_END+TIME_SLOT*8+RECOVERY_TIME*8;
+Constant END_SEND_CMD_TIME_T  = PRESENCE_DETECT_END+TIME_SLOT*16+RECOVERY_TIME*16;
+Constant TIME_SLOT_NUM   = 96;
+Constant ANSWER_BIT_NUM  = TIME_SLOT_NUM - 16;
+
+
+--Constant CYCLE_END_TIME     = END_SEND_CMD_TIME+(TIME_SLOT+RECOVERY_TIME)*64+1;
+
+
+--Constant FAMILY_CODE_TIME   = END_SEND_CMD_TIME+(TIME_SLOT+RECOVERY_TIME)*8;
+--Constant DATA_TIME          = (TIME_SLOT+RECOVERY_TIME)*16;
+--Constant CRC_TIME           = (TIME_SLOT+RECOVERY_TIME)*8;
+
+
+
+-- команды
+Constant ReadROM            = H"33";
+Constant SkipCommand        = H"CC";--H"CC";
+
+
+SUBDESIGN DS18B20
+(
+-- Сигналы со стороны последовательного канала
+        Wire_Data_in				: input ; -- Данные для приема/передачи в/из 1-Wire линка
+		Wire_Data_out				: output;
+
+-- Сигналы для соединения с шиной проекта 
+	    Clock						: input; -- Тактовая частота
+		Reset						: input = GND;  -- Common FPGA Reset
+		DataBus_In[15..0]			: input;  -- отправляемые с Внутренней Шины в Линк данные
+		DataBusOut[15..0]   		: output; -- выдаваемые на Внутреннюю Шину из Линка данные
+		DataBusStrobe 			    : input;  -- строб приема/передачи данных наружу (высокий уровень, защелкиваем по заднему фронту)
+		Error              			: output; -- сигнал ошибки (неверная команда)
+
+		Select						: input;  -- Выбор Модуля для работы с памятью Командного Листа в режиме Slave (с КАМАК-ом)
+		DirectIn					: input;  -- направление передачи данных, Если =GND, то данный Модуль читается, если =VCC, то пишется.
+		AddrBus_In[4..0]			: input;  -- адрес при операциях доступа чтения/записи Командного Листа с КАМАК-а
+		
+		test                        : output;
+		
+		Ext_latch_ID 				: input = GND;
+
+)
+
+-- VARIABLE section ____________________________________________________
+VARIABLE
+  
+  AutoStart            : node;
+  ExtStart,IntStart	   : node;
+  EndLoopCycle         : node; -- конец основного цикла
+  PEndLoopCycle        : node;
+  EEndLoopCycle        : node;
+  MainLoop             : SRFF; -- основной цикл получения ID 
+  SampleEnable               : node;
+
+
+  Rst_Pulse            : Pulse_Shaper with (MAX_DURATION = RESET_PULSE_END-RESET_PULSE_BEGIN);     -- импульс сброса, он же запрос о наличии (готовности) микросхемы
+
+  Tx_Shifter           : lpm_shiftreg with (LPM_WIDTH = 17, LPM_DIRECTION="RIGHT"); -- сдвиговый регистр
+  FCommand_Reg         : lpm_shiftreg with (LPM_WIDTH = 16, LPM_DIRECTION="unused"); -- регистр команд  
+  RCommand_Reg         : lpm_shiftreg with (LPM_WIDTH = 16, LPM_DIRECTION="unused"); -- регистр команд  
+  SaveFuncCMD          : node; -- сигнал защелкивания команды в регистр
+  SaveROMCMD           : node;
+  
+  LinkBitCounter       : LPM_COUNTER with ( lpm_width=COUNTER_SIZE, lpm_direction="up" );
+
+  Prescaler		  	   : LPM_COUNTER with ( lpm_width=SCALER_SIZE, lpm_direction="up" );
+  
+  OutBIT               : node;
+  OutBIT_ES            : Edge_Sensing;
+  RecoveryBIT          : node;
+  CONVERT_T            : node;
+
+  LockRxBit            : node;
+  Rx_Reload            : Edge_Sensing;
+ 
+  RAM_Word_Counter	   : LPM_COUNTER with ( lpm_width=7 ); -- счетчик числа принятых/переданных слов - указатель адреса памяти
+  Buffer_RAM	  	   : DP_ID_RAM ; -- Dual-Port RAM 16x16W
+  SaveRAM              : node; -- сигнал защелкивания данных в память
+
+  ErrorCode            : node;
+  
+  Rx_Shifter           : lpm_shiftreg with (LPM_WIDTH = ANSWER_BIT_NUM, LPM_DIRECTION="RIGHT");  -- сдвиговый регистр
+  Rx_Reg               : lpm_shiftreg with (LPM_WIDTH = 64, LPM_DIRECTION="unused");
+
+  Ext_latch_ID_SRFF    : SRFF;
+  Ext_latch_ID_PreCnt  : LPM_COUNTER with ( lpm_width=10);
+  Ext_latch_ID_TCnt    : LPM_COUNTER with ( lpm_width=16);
+  Ext_latch_ID_ES      : Edge_Sensing;
+  Ext_latch_ID_EndT    : node;
+  Pre_Sample_Enable    : node;
+  
+  
+  END_SEND_CMD_TIME[COUNTER_SIZE-1..0]  : node;
+  INIT_STATE		   : node;
+
+-- LOGIC section _______________________________________________________
+BEGIN
+
+DEFAULTS
+  EndLoopCycle  = GND;
+  PEndLoopCycle = GND;
+  EEndLoopCycle = GND;
+  DataBusOut[15..0] = GND;
+  RecoveryBIT = VCC;
+  --CONVERT_T = GND;
+END DEFAULTS;
+
+-------------------------------------------------------------------------------------
+-- Делитель частоты
+IF (Prescaler.q[] == (PrescalerModule-1) ) 	THEN SampleEnable = VCC;
+											ELSE SampleEnable = GND;
+END IF;
+Prescaler.clock	=	Clock;
+Prescaler.sclr	=	SampleEnable OR Reset ; 
+-------------------------------------------------------------------------------------
+
+  Error    = ErrorCode;
+  MainLoop.(S,clk,R) = (AutoStart, Clock, EndLoopCycle OR Reset);
+  EndLoopCycle = PEndLoopCycle OR EEndLoopCycle OR CONVERT_T;
+
+  --Wire_Data_out = (Rst_Pulse.q OR OutBIT OR Tx_Shifter.q[0]) AND RecoveryBIT;--Rst_Pulse.q OR OutBIT OR Tx_Shifter.shiftout;
+  Wire_Data_out = DFF(.d=Rst_Pulse.q OR ((OutBIT OR Tx_Shifter.shiftout) AND RecoveryBIT AND INIT_STATE),.clk=Clock);--Rst_Pulse.q OR OutBIT OR Tx_Shifter.shiftout;
+
+-- инициализация
+  Rst_Pulse.(d,clk, cnt_en, Duration[]) = (AutoStart, Clock, SampleEnable AND MainLoop.q, RESET_PULSE_END-RESET_PULSE_BEGIN);   -- сброс 
+  LinkBitCounter.(clock,cnt_en,sclr) = (Clock,MainLoop.q AND SampleEnable,EndLoopCycle);
+  IF ( (LinkBitCounter.q[COUNTER_SIZE-1..0] == PRESENCE_DETECT_ST) AND (Wire_Data_in == VCC) )
+       THEN PEndLoopCycle = VCC; -- заканчиваем цикл работы, генерим ошибку
+            ErrorCode     = VCC;
+       ELSE PEndLoopCycle = GND; 
+            ErrorCode     = GND;
+  END IF;
+  
+  IF LinkBitCounter.q[COUNTER_SIZE-1..0] < PRESENCE_DETECT_END
+            THEN INIT_STATE = GND;
+            ELSE INIT_STATE = VCC;  
+  END IF; 
+ -- обозначаем границы TIME_SLOT
+  FOR i IN 1 TO TIME_SLOT_NUM GENERATE 
+     IF LinkBitCounter.q[COUNTER_SIZE-1..0] >= PRESENCE_DETECT_END+RECOVERY_TIME+(TIME_SLOT+RECOVERY_TIME)*(i-1) and LinkBitCounter.q[COUNTER_SIZE-1..0] < PRESENCE_DETECT_END+RECOVERY_TIME+5+(TIME_SLOT+RECOVERY_TIME)*(i-1)
+            THEN OutBIT = VCC;
+            ELSE OutBIT = GND;  
+     END IF; 
+     IF LinkBitCounter.q[COUNTER_SIZE-1..0] >= PRESENCE_DETECT_END+(TIME_SLOT+RECOVERY_TIME)*(i-1) and LinkBitCounter.q[COUNTER_SIZE-1..0] < PRESENCE_DETECT_END+RECOVERY_TIME+(TIME_SLOT+RECOVERY_TIME)*(i-1)     
+            THEN RecoveryBIT = GND;
+            ELSE RecoveryBIT = VCC;  
+     END IF; 
+   END GENERATE;
+  OutBIT_ES.(d,clk) = (OutBIT,Clock);
+  
+  IF LinkBitCounter.q[COUNTER_SIZE-1..0] == PRESENCE_DETECT_END+(TIME_SLOT+RECOVERY_TIME)*TIME_SLOT_NUM   
+            THEN EEndLoopCycle = VCC;
+            ELSE EEndLoopCycle = GND;  
+  END IF; 
+  
+  Tx_Shifter.(clock,enable,load,shiftin) = (Clock, OutBIT_ES.q OR AutoStart OR EndLoopCycle, AutoStart OR EndLoopCycle,GND);
+  Tx_Shifter.data[16..1] = (!FCommand_Reg.q[7..0],!RCommand_Reg.q[7..0]);
+  Tx_Shifter.data[0]     =  GND;
+  
+  IF (RCommand_Reg.q[7..0] == H"33") THEN END_SEND_CMD_TIME[] = END_SEND_CMD_TIME_ID;
+                                     ELSE END_SEND_CMD_TIME[] = END_SEND_CMD_TIME_T;
+  END IF; 
+  -- на команду H"44" (начать преобразование АЦП) ответа нет, поэтому завершаем цикл
+  IF ((LinkBitCounter.q[COUNTER_SIZE-1..0] >= END_SEND_CMD_TIME[]) AND (FCommand_Reg.q[7..0] == H"44")) THEN CONVERT_T = VCC;
+                                                                                                        ELSE CONVERT_T = GND;
+  END IF; 
+ 
+-- Цикл чтения 
+  -- читаем ANSWER_BIT_NUM бита из линка
+  FOR i IN 1 TO ANSWER_BIT_NUM GENERATE
+     IF LinkBitCounter.q[COUNTER_SIZE-1..0] == (END_SEND_CMD_TIME[]+(TIME_SLOT+RECOVERY_TIME)*(i-1)+(LOW_TIME+READ_MSW_TIME) ) 
+ 	       	THEN LockRxBit = VCC; -- формируем импульс для защелкивания бита в регистр 
+	        ELSE LockRxBit = GND;
+     END IF;
+  END GENERATE;
+-- счетчик-указатель адреса Буферного ОЗУ
+  RAM_Word_Counter.clock  =  Clock; -- считаем на реальной частоте приема/передачи данных
+  RAM_Word_Counter.cnt_en =  Rx_Reload.q ; -- счетчик-указатель считает номера слов на приемо/передачу данных
+  RAM_Word_Counter.sload  =  !MainLoop.q OR Reset;  -- обнуление счета происходит  при неактивности линка
+  RAM_Word_Counter.data[] =  0;
+
+  Rx_Reload.(d,clk)       = (LockRxBit,Clock);
+
+-- запись в память со стороны 1-wire 
+  Buffer_RAM.data_a[0] = Wire_Data_in;  -- записывать данные в порт А может только Линк
+  Buffer_RAM.clock_a = Clock;
+  Buffer_RAM.address_a[6..0] = RAM_Word_Counter.q[6..0];
+  Buffer_RAM.wren_a = Rx_Reload.q;
+
+-- запись и чтение памяти со стороны Bus Master 
+  Buffer_RAM.clock_b         = Clock;
+  Buffer_RAM.data_b[15..0]	 = DataBus_In[];
+  Buffer_RAM.address_b[2..0] = AddrBus_In[2..0];
+  Buffer_RAM.wren_b          = SaveRAM;
+ 
+ 
+ 
+-- Section "User Interface Control" Begin
+  -- запуск обмена данными по линку
+  AutoStart = ExtStart OR IntStart;
+  IF ( (AddrBus_In[4..0] == 9) AND DataBusStrobe and  DirectIn AND Select )
+      THEN IntStart = VCC;
+      ELSE IntStart = GND;
+  END IF;
+  IF (  AddrBus_In[4..0] == 11 )
+      THEN SaveFuncCMD = DataBusStrobe and  DirectIn AND Select; DataBusOut[15..0]  = FCommand_Reg.q[15..0];
+      ELSE SaveFuncCMD = GND;
+  END IF;
+    IF (  AddrBus_In[4..0] == 10 )
+      THEN SaveROMCMD = DataBusStrobe and  DirectIn AND Select; DataBusOut[15..0]  = RCommand_Reg.q[15..0];
+      ELSE SaveROMCMD = GND;
+  END IF;
+  
+  IF ( (AddrBus_In[4..0] >= 0) AND (AddrBus_In[4..0] <= 8) ) 
+      THEN SaveRAM = DataBusStrobe and  DirectIn AND Select; DataBusOut[15..0] = Buffer_RAM.q_b[15..0]; 
+      ELSE SaveRAM = GND;
+  END IF;
+  IF (  AddrBus_In[4..0] == 12 )
+      THEN DataBusOut[15..0]  = Rx_Reg.q[15..0];
+  END IF;
+  IF (  AddrBus_In[4..0] == 13 )
+      THEN DataBusOut[15..0]  = Rx_Reg.q[31..16];
+  END IF;
+  IF (  AddrBus_In[4..0] == 14 )
+      THEN DataBusOut[15..0]  = Rx_Reg.q[47..32];
+  END IF;
+  IF (  AddrBus_In[4..0] == 15 )
+      THEN DataBusOut[15..0]  = Rx_Reg.q[63..48];
+  END IF;
+  IF (  AddrBus_In[4..0] == 16 )
+      THEN DataBusOut[15..0]  = UNIT_TYPE;--H"AAAA";
+  END IF;
+  IF (  AddrBus_In[4..0] == 17 )
+      THEN DataBusOut[15..0]  = VERSION;--H"0002";
+  END IF;
+  IF ( (AddrBus_In[4..0] == 18) AND DataBusStrobe and  DirectIn AND Select )
+      THEN ExtStart = VCC;
+      ELSE ExtStart = GND;
+  END IF;
+  
+   
+  FCommand_Reg.(data[],clock,enable,load) = (DataBus_In[15..0],Clock, SaveFuncCMD,VCC);
+  RCommand_Reg.(data[],clock,enable,load) = (DataBus_In[15..0],Clock, SaveROMCMD,VCC);
+  
+-- Section "User Interface Control" End
+
+  test = LockRxBit;
+
+  Rx_Shifter.(clock,enable,load,shiftin) = (Clock, Rx_Reload.q, GND, Wire_Data_in);
+  Rx_Reg.(clock,data[63..0],enable,load) = (Clock,Rx_Shifter.q[63..0],EndLoopCycle AND Ext_latch_ID_SRFF.q, VCC);
+  
+  
+  
+  Ext_latch_ID_ES.(d,clk) = (Ext_latch_ID OR ExtStart, Clock);
+  Ext_latch_ID_PreCnt.(clock, sclr) = (Clock, Pre_Sample_Enable OR Ext_latch_ID_ES.q);
+  IF (Ext_latch_ID_PreCnt.q[] ==  1000-1) THEN  Pre_Sample_Enable = VCC;
+										  ELSE  Pre_Sample_Enable = GND;
+  END IF; 
+  Ext_latch_ID_SRFF.(S,clk,R) = (Ext_latch_ID_ES.q,Clock,Ext_latch_ID_EndT);
+  Ext_latch_ID_TCnt.(clock, sclr,cnt_en) = (Clock, !Ext_latch_ID_SRFF.q, Ext_latch_ID_SRFF.q AND Pre_Sample_Enable);
+  IF (Ext_latch_ID_TCnt.q[] ==  10000-1)  THEN  Ext_latch_ID_EndT = VCC;
+										  ELSE  Ext_latch_ID_EndT = GND;
+  END IF;
+
+END; -- End design

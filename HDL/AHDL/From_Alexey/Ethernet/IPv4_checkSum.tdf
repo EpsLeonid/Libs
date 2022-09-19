@@ -1,0 +1,150 @@
+TITLE "Ethernet IPv4 checksum ";
+
+INCLUDE "Edge_Sensing_Sync.inc";
+INCLUDE "lpm_shiftreg.inc";
+INCLUDE "lpm_counter.inc";
+INCLUDE "Adder2x20.inc";
+INCLUDE "Adder2x16.inc";
+
+Constant PARCER_CYLCLE_WIDTH = 2;--4
+Constant PARCER_CYLCLE_CNT_WIDTH = Ceil(log2(PARCER_CYLCLE_WIDTH))+1;
+Constant WORD_WIDTH	= 16; 
+
+CONSTANT PacketLenghts_at_signaling_layer  = 4096;--2048;-- maximum length value in bytes
+CONSTANT RxByte_Cnt_Width = Ceil( LOG2(PacketLenghts_at_signaling_layer))-1;
+
+CONSTANT IP_HEADER_OFFSET = 7;
+CONSTANT IP_HEADER_SIZE   = 10;
+CONSTANT IP_CHECKSUM_ADDR = 12;
+
+
+
+SUBDESIGN IPv4_checkSum
+(
+  Clock                         : input; -- System Clock, really Bus_Clock
+
+  Rx_Data[WORD_WIDTH-1..0]  	: input;
+  Rx_Addr[10..0]  				: output;
+  Rx_Parcer_RQ					: input;
+   
+  Tx_Addr[10..0]  				: output;
+  Tx_Data[WORD_WIDTH-1..0]  	: output;
+  Tx_Word_Strobe      			: output;
+  
+  Reset                         : input;
+  
+  IPv4_CheckSum_Complete		: output;
+  
+  IP_ID[WORD_WIDTH-1..0]		: input;
+  
+  
+  -----------------
+  Sample_Enable   : output;
+  Sum20_Reg_out[19..0] : output;
+  Sum16_Reg_out[15..0] : output;
+  RxParcerActive_out : output;
+  
+)
+VARIABLE
+  Rx_Parcer_RQ_ES               : Edge_Sensing_Sync;
+  RxParcerActive                : SRFF;
+  ParcerEndCycle				: node;
+
+  ParcerCnt						: LPM_COUNTER WITH (LPM_WIDTH = RxByte_Cnt_Width);
+  
+  Prescaler                     : LPM_COUNTER WITH (LPM_WIDTH = PARCER_CYLCLE_CNT_WIDTH);
+  Pascer_Sample_Enable 			: node;
+  
+  Sum20_Reg						: LPM_SHIFTREG WITH (LPM_WIDTH = 20);
+  Sum16_Reg						: LPM_SHIFTREG WITH (LPM_WIDTH = 16);
+  
+  Adder2x20_data                : Adder2x20; -- суммируем весь заголовок IP
+  Adder2x16_data                : Adder2x16; -- суммируем биты переноса
+  FinAdder2x16_data             : Adder2x16; -- суммируем биты переноса приводим к 16битному числу CheckSum
+  
+  HeaderSum_Complete 			: node; 
+  HeaderSum_with_carry_count 	: node;
+  IP_CheckSum_Complete 			: node;
+  Tx_Word_Strobe_				: node;
+  
+  Rx_Data_[WORD_WIDTH-1..0]		: node;
+  
+  --Data_Strobe : node;
+
+  
+BEGIN
+
+   Prescaler.(clock, sclr) = (Clock, Pascer_Sample_Enable OR Rx_Parcer_RQ_ES.q);
+   IF (Prescaler.q[] ==  PARCER_CYLCLE_WIDTH-1) THEN  Pascer_Sample_Enable = VCC;
+											    ELSE  Pascer_Sample_Enable = GND;
+   END IF;
+
+-------------------------------------------- Rx section --------------------------------------------
+   Rx_Parcer_RQ_ES.(d,clk)  = (Rx_Parcer_RQ, Clock);
+   RxParcerActive.(S,clk,R) = (Rx_Parcer_RQ_ES.q, Clock, ParcerEndCycle OR Reset);
+   
+   ParcerCnt.(clock,sload,cnt_en) = (Clock, Rx_Parcer_RQ_ES.q %OR ParcerEndCycle%, RxParcerActive.q AND Pascer_Sample_Enable);
+   ParcerCnt.data[] = IP_HEADER_OFFSET;
+   
+   Adder2x20_data.(clock,clken) 	= (Clock,RxParcerActive.q AND Pascer_Sample_Enable AND ((ParcerCnt.q[]>=IP_HEADER_OFFSET) AND (ParcerCnt.q[]<IP_HEADER_SIZE+IP_HEADER_OFFSET)));
+   Adder2x20_data.dataa[19..16]		= GND;
+   Adder2x20_data.dataa[15..0] 		= Rx_Data_[];
+   Adder2x20_data.datab[] 			= Sum20_Reg.q[];
+   
+   Sum20_Reg.(data[],clock,enable,load,sclr) = (Adder2x20_data.result[],Clock,DFF(.d=RxParcerActive.q AND Pascer_Sample_Enable AND ((ParcerCnt.q[]>=IP_HEADER_OFFSET) AND (ParcerCnt.q[]<IP_HEADER_SIZE+IP_HEADER_OFFSET)),.clk=Clock) OR Rx_Parcer_RQ_ES.q,VCC,Rx_Parcer_RQ_ES.q);
+   
+   Adder2x16_data.(clock,clken) 	= (Clock,HeaderSum_Complete AND Pascer_Sample_Enable);
+   Adder2x16_data.dataa[15..4] 		= GND;
+   Adder2x16_data.dataa[3..0] 		= Sum20_Reg.q[19..16];
+   Adder2x16_data.datab[] 			= Sum20_Reg.q[15..0];
+   
+   FinAdder2x16_data.(clock,clken) 	= (Clock,HeaderSum_with_carry_count AND Pascer_Sample_Enable);
+   FinAdder2x16_data.dataa[15..1] 	= GND;
+   FinAdder2x16_data.dataa[0] 		= Adder2x16_data.cout;
+   FinAdder2x16_data.datab[] 		= Adder2x16_data.result[];
+   
+   Sum16_Reg.(data[],clock,enable,load,sclr) = (FinAdder2x16_data.result[],Clock,(IP_CheckSum_Complete AND Pascer_Sample_Enable) OR Rx_Parcer_RQ_ES.q,VCC,Rx_Parcer_RQ_ES.q);
+
+   
+   
+   IF(RxParcerActive.q == VCC) THEN
+        Rx_Addr[10..0] = ParcerCnt.q[];
+        --Tx_Addr[9..0] = IP_CHECKSUM_ADDR;
+        --Tx_Data[] 	  = Sum16_Reg.q[];--H"EFAB";--!Sum16_Reg.q[];
+        
+        IF (ParcerCnt.q[] == IP_HEADER_OFFSET+2)   THEN  Rx_Data_[] = IP_ID[]; -- подставляем новый ID_IP в заголовок IP
+				ELSE IF (ParcerCnt.q[] == IP_HEADER_OFFSET+5)   THEN  Rx_Data_[] = GND; -- убираем пришедшую CheckSum из вычислений
+																ELSE  Rx_Data_[] = Rx_Data[];
+					 END IF;
+		END IF;
+
+         
+        IF (ParcerCnt.q[] == IP_HEADER_SIZE+IP_HEADER_OFFSET)   THEN  HeaderSum_Complete 			= VCC; END IF;
+        IF (ParcerCnt.q[] == IP_HEADER_SIZE+IP_HEADER_OFFSET+1) THEN  HeaderSum_with_carry_count 	= VCC; END IF;
+        IF (ParcerCnt.q[] == IP_HEADER_SIZE+IP_HEADER_OFFSET+2) THEN  IP_CheckSum_Complete 			= VCC; END IF;
+        IF (ParcerCnt.q[] == IP_HEADER_SIZE+IP_HEADER_OFFSET+3) THEN  Tx_Word_Strobe_				= VCC; Tx_Addr[10..0] = IP_CHECKSUM_ADDR; Tx_Data[] = !Sum16_Reg.q[]; END IF;
+        IF (ParcerCnt.q[] == IP_HEADER_SIZE+IP_HEADER_OFFSET+4) THEN  ParcerEndCycle 				= Pascer_Sample_Enable; END IF;
+        
+							   ELSE  
+		HeaderSum_Complete 			= GND; 
+		HeaderSum_with_carry_count 	= GND;
+		IP_CheckSum_Complete 		= GND;
+		Rx_Addr[10..0] 				= GND;
+        Tx_Addr[10..0] 				= GND;
+        Tx_Data[]					= GND;
+        ParcerEndCycle				= GND;
+  
+   END IF;   
+    
+   Tx_Word_Strobe = Tx_Word_Strobe_ AND Pascer_Sample_Enable;--Edge_Sensing_Sync(.d=Tx_Word_Strobe_,.clk=Clock);
+   IPv4_CheckSum_Complete = ParcerEndCycle;--DFF(.d=ParcerEndCycle,.clk=Clock);
+   
+   
+   ----------------------
+   Sample_Enable = RxParcerActive.q AND Pascer_Sample_Enable AND ((ParcerCnt.q[]>=IP_HEADER_OFFSET) AND (ParcerCnt.q[]<IP_HEADER_SIZE+IP_HEADER_OFFSET));--Pascer_Sample_Enable;
+   Sum20_Reg_out[] = Sum20_Reg.q[];
+   Sum16_Reg_out[] = Sum16_Reg.q[];
+   RxParcerActive_out = RxParcerActive.q;
+   
+
+END;

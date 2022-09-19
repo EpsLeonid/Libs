@@ -1,0 +1,562 @@
+TITLE "UpLink - right version" ;
+-- Файл содержит унифицированную реализацию медленного линка КМД-3 - 
+-- модуль "UpLink", работающий на нижестоящем узле ССД.
+-- Данная часть должна встраиваться в платы сбора данных и обеспечивать 
+-- связь с "вышестоящим"
+-- по дереву блоком - БППД (он же - селивановская коробка)
+% Данная версия расширена узлами :
+"Пресэмплер" - автоматическая подстройка фазы, компенсирующая
+возможную разность задержки фазы и данных в селивановской коробке
+%
+Include "CMD3_DAQ_LINK.inc";
+Include "PulseShaper.inc";
+--INCLUDE "RedirectorRAM.inc" ;
+INCLUDE "CRC_Gen.inc";
+INCLUDE "lpm_shiftreg.inc" ;
+INCLUDE "lpm_counter.inc" ;
+
+PARAMETERS
+(
+RefClock=100   -- value of frequency (MHz) fed at "Clock" input; 
+               -- must be Flink x2, x3 or x4 ;    default=100 (Flink x4)
+);
+ASSERT (RefClock>24 AND RefClock<126)
+REPORT "You enter RefClock (%) which is not suitable for Link function" RefClock
+SEVERITY ERROR;
+
+Constant PrescalerModule = RefClock DIV Link_Speed ;
+
+SUBDESIGN  UpLink
+(
+-- Module specific signals
+-- Connections to Serial Link
+LinkClk             : INPUT ;   -- Clock (25MHz) from Link's SynchroLine
+LinkData_in         : input ;   -- Serial data <= from DataLine
+LinkData_out        : output ;  -- Serial data => into DataLine
+TxRx                : OUTPUT; -- направление передачи, управляет приемо-передатчиком LVDS
+
+-- Connections to User Project
+Clock               : input;    -- Global Clock used in user project, usually 100MHz 
+
+LinkMessage         : output;-- сообщение о приходе валидной команды, аналог сигнала FLT+ для "энергетических" каналов
+IORq                : output; -- Data_ready or Data_required	
+RdWr_out            : output; -- =1(Wr) => Data_ready / =0(Rd) => Data_required
+
+OpCode_out[(Command_Size + Pause -1)..0]: output; -- получаемая-она_же-отправляемая команда
+InData_out[15..0]   : output; -- 1st word - "InData" 
+CRC_Out[15..0]      : output;
+
+DataBus_in[15..0]   : input;    -- отправляемые с Внутренней Шины в Линк данные
+DataBus_out[15..0]  : output;   -- выдаваемые на Внутреннюю Шину из Линка данные
+
+Select              : input = GND; -- Link is selected for data reading/writing
+RdWr_in             : input = GND; -- RdWr=0 => data will be read from Link / RdWr=1 => data will be written to Link
+DataStrobe          : input = GND; -- input data must be latched while DataStrobe=1 
+
+Error               : output;   -- сигнал ошибки (неверная команда)
+Reset               : input = GND;   -- Common FPGA Reset
+
+%
+-- Master Mode Signals -- используется при работе данного Модуля в режиме Master)
+AccessRequest       : output; -- запрос к Арбитру на доступ к шине для чтения/записи данных Пользователя в режиме Master	
+AccessGranted		: input;  -- Разрешение Арбитра выставить Адрес и направление обмена (захват шины)
+RdWr_out            : output; -- направление передачи данных, на внутреннюю шину или с нее, по умолчанию =GND, передача от внутренних ресурсов платы Модуль,
+AddrBusOut[15..0]   : output; -- адрес при операциях доступа ко внутренним ресурсам Оцифровщика (чтения/записи по Командному Листу).
+%
+-- Slave Mode Signals	-- используется при работе данного Модуля в режиме Slave
+--AddrBus_In[15..0]   : input;  -- адрес при операциях доступа чтения/записи Командного Листа с КАМАК-а
+	
+-- От Пользователя требуется только обеспечить реакцию на запрос модуля Линка
+-- (забрать или предоставить данные), не превышающую 18..16 тактов линка. 
+-- Число выдаваемых/забираемых Линком определено Протоколом работы Линка 
+-- и для данного модуля задано константами.
+
+Test[8..1]          : output ; -- to be conected to test output of main Project 
+)
+
+VARIABLE
+--**************** Automatic Phase Adjustment ********************************
+LinkD[8..1]         : node; --pipeline, contains input data sampled at HIGH Rate
+
+-- Reg_LinkD_a: register, latches 8-bit "LinkD[]"word and holds it for 1Tclk
+Reg_LinkD_a         : LPM_SHIFTREG with (lpm_width= 2*PrescalerModule,
+                                    lpm_direction="left"); --shift: q0 -> q[MSB]
+-- Reg_LinkD_a: register, latches 8-bit "LinkD[]"word and holds it for 1Tclk
+Reg_LinkD_b         : LPM_SHIFTREG with (lpm_width= 2*PrescalerModule, 
+                                    lpm_direction="left"); --shift: q0 -> q[MSB]
+
+StBit_a, StBit_b    : node; -- Flags: StartBit recognized at Reg_LinkD_a / _b 
+StBitDet_a,                 --StBit(case A) detected \ only ONE flag of two 
+StBitDet_b          : node; --StBit(case B) detected /   can be set =1
+StBitDet            : node; --final Flag: StartBit detected (any case)
+
+Prescaler           : LPM_COUNTER with ( lpm_width=3, lpm_direction="down" );
+SmplStrobe          : node; -- a strobe which enables execution of ONE BIT
+Strobe2             : node; -- a strobe delayed by 1clock
+
+LinkD_a, LinkD_b    : node; -- Recognized_Bit non-registered (for case A/B)
+LinkData_a,                 -- Recognized_Bit registered (case A)
+LinkData_b,                 -- Recognized_Bit registered (case B)
+LinkData_sel,               -- data selected according to case A/B
+LinkData            : node; -- data selected registered
+
+--**************** Flow Control **********************************************
+LinkBitCounter		: LPM_COUNTER with ( lpm_width=WORD_WIDTH, lpm_direction="up" ); -- счетчик числа принятых/переданных бит из/в линк
+--LinkActive          : node; -- Flag of FULL cycle of Link operation
+CycleBeg            : node; -- indicates the beginning of Command execution
+Cycle               : node; -- Flag: a Cycle of Lonk operation is in progress
+CycleEnd            : node; -- флаг окончания цикла приема/передачи  из/в  линк
+ChangeDirect        : node; -- сигнал о преключении направления передачи
+
+RxOpCode_ld	        : node;
+RxInData_ld         : node;
+RxWord_ld           : node; -- сигнал конца фрейма (о приеме одного слова), 
+-- высоким уровнем разрешает перезагрузку принятого слова из RxShifter в Reg_RxData
+-- LockRxData[WordsToGoDown + 1..0] : node ; -- выходы компараторов-формирователей, используются для явного определения схемы "ИЛИ"
+
+TxOpCode_ld         : node ;
+TxInData_ld         : node; -- высоким уровнем разрешает перезагрузку команды и первого слова в TxShifter
+TxWord_ld           : node; -- высоким уровнем разрешает перезагрузку слова из TxDataReg в TxShifter
+CRC_ld              : node ;
+--LockTxWord[WordsToGoUp+1..0] : node ;-- выходы компараторов-формирователей
+
+--**************** Reciever Part *********************************************
+RxShifter           : LPM_SHIFTREG with (lpm_width=(WordSize + Pause + Pause), -- contains input data (running), sampled at NORMAL rate 
+                                    lpm_direction="left"); --shift: q0 -> q[MSB]
+Reg_OpCode          : LPM_SHIFTREG with (lpm_width=(CommandSize + Pause), -- contains Command
+                                    lpm_direction="left"); -- not important
+Reg_InData          : LPM_SHIFTREG with (lpm_width=WordSize, lpm_direction="left");  -- регистр номера события (первое слово после OpCode, влючая биты паузы )
+Reg_RxData          : LPM_SHIFTREG with (lpm_width=WordSize, lpm_direction="left");  -- регистр номера события (первое слово после OpCode, влючая биты паузы )
+HeaderErr           : node; --  
+Header_Error        : node; -- Flag to desable data movement, not TIMING of Link
+DeadTimePulse       : PulseShaper with (
+                Duration = FLOOR( (DeadTime*RefClock)/ 1000 ) ); -- Формирователь мертвого времени - защитного промежутка
+--ParityError         : node; --
+--CRC_Error           : node;
+RdWr_Error          : node; -- error during Read/Write operation 
+
+--Command[COMMAND_SIZE+PAUSE-1..0]	: node; -- Command is used instead of RegOpCode.q if Error occured
+--First_Word[WORD_WIDTH-1..0]	: node;
+
+--******** Transmitter Part ********
+TxShifter           : LPM_SHIFTREG with (lpm_width=WordSize,  -- регистр-передатчик выходных данных 
+                                    lpm_direction="left"); --shift: q0 -> q[MSB]
+Reg_TxData          : LPM_SHIFTREG with (lpm_width=WordSize, lpm_direction="left"); -- регистр-буфер данных передатчика 
+%
+-- Redirector Part
+WordCounter                : LPM_COUNTER with ( lpm_width=OrderOfBitNumber, lpm_direction="up" ); -- счетчик числа принятых/переданных слов
+
+RedirRAM                    : RedirectorRAM;
+Addr_Page_offset[9..0]		: node;
+Data_Page_offset[9..0]		: node;
+--RAM_a_we					: node;
+--RAM_b_we					: node;
+%
+	
+CRC_Checker         : CRC_Gen with (PolinomPower = WordSize);
+
+--**********************************************************************************************
+BEGIN
+
+DEFAULTS
+	RxWord_ld = GND;
+	TxWord_ld = GND;
+END DEFAULTS;
+
+--============================================================================
+--************ Data Sampling and Clock Adjustment ************
+-- Input signal from DataLine is being sampled at HIGH rate: Fsampl = 2*Fclk
+--    Moments:      t1    t2    t3    t4    t5    t6    t7    t8    t9   t10   t11   t12   t13
+-- 100MHz Clock ____/^^^^^\_____/^^^^^\_____/^^^^^\_____/^^^^^\_____/^^^^^\_____/^^^^^\_____/^^^^
+--  LinkData_in _//^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\\________StBit, case A
+--  LinkData_in _______//^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\\__StBit, case B
+--    Samples       s1    s2    s3    s4    s5    s6    s7    s8    s9 
+--   StBitDet_a _________________________________________________________________/^^^^^^^^^^^^^^^ case A
+--   StBitDet_b _______________________________________________________________________/^^^^^^^^^ case B
+--   StBitDet   _____________________________________________________________________________/^^^ any case
+
+LinkD1  = DFF(.d=LinkData_in, .clk=Clock);
+                    LinkD2  = DFF(.d=LinkData_in, .clk=!Clock);
+LinkD3  = DFF(.d=LinkD1, .clk=Clock);
+                    LinkD4  = DFF(.d=LinkD2, .clk=!Clock);
+LinkD5  = DFF(.d=LinkD3, .clk=Clock);
+                    LinkD6  = DFF(.d=LinkD4, .clk=!Clock);
+LinkD7  = DFF(.d=LinkD5, .clk=Clock);
+                    LinkD8  = DFF(.d=LinkD6, .clk=!Clock);
+--LinkD9  = DFF(.d=LinkD7, .clk=Clock);
+--                    LinkD10 = DFF(.d=LinkD8, .clk=!Clock);
+--LinkD11 = DFF(.d=LinkD9, .clk=Clock);
+--                    LinkD12 = DFF(.d=LinkD10, .clk=!Clock);
+-- Triggers' contents at: 
+--  moment t8(after \_)     moment t9(after _/)     moment t12(after \_)
+--  LinkD1:s7               LinkD1:s9               LinkD1:s11
+--          LinkD2:s8               LinkD2:s8               LinkD2:s12
+--  LinkD3:s5               LinkD3:s7               LinkD3:s9
+--          LinkD4:s6               LinkD4:s6               LinkD4:s10
+--  LinkD5:s3               LinkD5:s5               LinkD5:s7
+--          LinkD6:s4               LinkD6:s4               LinkD6:s8
+--  LinkD7:s1               LinkD7:s3               LinkD7:s5
+--          LinkD8:s2               LinkD8:s2               LinkD8:s6
+--  LinkD9:s-1              LinkD9:s1               LinkD9:s3
+--          LinkD8:s0               LinkD10:s0              LinkD10:s4
+--  LinkD11:s-3             LinkD11:s-1             LinkD11:s1
+--          LinkD12:s-2             LinkD12:s-2             LinkD12:s2
+
+-- Reg_LinkD_a: by t7 - gets LinkD[] states latched by (t5,t6) \and holds them 
+--              by t9 - gets LinkD[] states latched by (t7,t8) /  for 10ns
+Reg_LinkD_a.data[7..0]  = (LinkD7, LinkD8, LinkD5, LinkD6,  -- [MSB:s1 ..
+                           LinkD3, LinkD4, LinkD1, LinkD2); --     .. LSB:s8]
+Reg_LinkD_a.(clock,enable,load) = ( Clock, VCC, VCC);  -- operates by _/ 
+Reg_LinkD_a.(aclr, sclr)        = (Reset, CycleEnd%GND% );
+-- Reg_LinkD_b: by t8 - gets LinkD[] states latched by (t6,t7) \and holds them 
+--              by t10- gets LinkD[] states latched by (t8,t9) /  for 10ns
+Reg_LinkD_b.data[7..0]  = LinkD[8..1];  -- [MSB:s2 .. LSB:s9]
+Reg_LinkD_b.(clock,enable,load) = (!Clock, VCC, VCC);  -- operates by \_ 
+Reg_LinkD_b.(aclr, sclr)        = (Reset, CycleEnd%GND% );
+
+--**************** StartBit detection ****************************************
+-- Patterns to be recognized:   
+--  B"11111111"                         B"11111111"
+-- (B"01111111")-recognized below      (B"00111111")-recognized below
+--  B"10111111"                         B"10011111"
+--  B"11011111"                         B"11001111"
+--  B"11101111"\ restricted..           B"11100111"\ restricted.. 
+--  B"11111101"/ ..restricted           B"11111111"/ ..restricted
+--  B"11111110"                         B"01111110"
+IF ( (Reg_LinkD_a.q[7..0] == B"11111111") -- ideal case - all eight "1"s
+   OR(Reg_LinkD_a.q[7..0] == B"10111111") --\ 
+   OR(Reg_LinkD_a.q[7..0] == B"11011111") -- >short glitch - one "0" among "1"s
+   OR(Reg_LinkD_a.q[7..0] == B"11101111") --/ 
+   OR(Reg_LinkD_a.q[7..0] == B"11111110") -- usual case - one "1" missing
+   OR(Reg_LinkD_a.q[7..0] == B"10011111") --\ long glitch - two "0"s among "1"s
+   OR(Reg_LinkD_a.q[7..0] == B"11001111") --/ 
+   OR(Reg_LinkD_a.q[7..0] == B"01111110"))-- not good case - two "1"s missing
+    Then StBit_a = VCC;
+    Else StBit_a = GND;
+End IF;
+IF ( (Reg_LinkD_b.q[7..0] == B"11111111") -- ideal case - all eight "1"s
+   OR(Reg_LinkD_b.q[7..0] == B"10111111") --\ 
+   OR(Reg_LinkD_b.q[7..0] == B"11011111") -- >short glitch - one "0" among "1"s
+   OR(Reg_LinkD_b.q[7..0] == B"11101111") --/ 
+   OR(Reg_LinkD_b.q[7..0] == B"11111110") -- usual case - one "1" missing
+   OR(Reg_LinkD_b.q[7..0] == B"10011111") --\ long glitch - two "0"s among "1"s
+   OR(Reg_LinkD_b.q[7..0] == B"11001111") --/ 
+   OR(Reg_LinkD_b.q[7..0] == B"01111110"))-- not good case - two "1"s missing
+    Then StBit_b = VCC;
+    Else StBit_b = GND;
+End IF;
+
+StBitDet_a  = SRFF(.s=(StBit_a & !StBitDet_b), .clk=Clock ,  --\ ONLY ONE
+                    .r=CycleEnd, .clrn=!Reset);              -- \of these Trigs
+StBitDet_b  = SRFF(.s=(StBit_b & !StBitDet_a), .clk=!Clock , -- / can be 
+                    .r=CycleEnd, .clrn=!Reset);              --/  set to =1
+--final Flag, aligned to Clock's_/ : 6.5..5.5 Tclk after _/ of StartBit;
+StBitDet    = DFF (.d=(StBitDet_a # StBitDet_b & !CycleEnd), --flips to =1 @ t13
+                    .clk=Clock, .clrn=!Reset);               --resets synchronously with StBitDet_a and StBitDet_b
+
+--**************** Synchronization *******************************************
+--    Moments:      t1  t2  t3  t4  t5  t6  t7  t8  t9  t10 t11 t12 t13
+-- 100MHz Clock ^\___/^^^\___/^^^\___/^^^\___/^^^\___/^^^\___/^^^\___/^^^\___/^^^\___
+--  LinkData_in __//^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\\_____________StBit, case A
+--  LinkData_in ______//^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\\_________StBit, case B
+--   StBitDet   ______________________________________________________/^^any case
+--   SmplStrobe _______________________________________________________/^^^^^^^\_____
+
+Prescaler.(clock, clk_en)   = (Clock, VCC);
+Prescaler.cnt_en            = StBitDet;
+Prescaler.data[2..0]        =(PrescalerModule-1); -- defines Prescaling Factor
+Prescaler.(sclr,sset,sload) =
+            (!StBitDet,GND, Prescaler.eq0); --is holded =#0 until StBit detected
+Prescaler.aclr              = Reset;
+-- Определяем относительную фазу сэмплирования:
+    -- Initially the Prescaler is stopped at =#0. When the StartBit's samples 
+    -- are fully pulled into "LinkD[]" pipeline and this 8-bit word is then 
+    -- latched into Reg_LinkD_?, the bit pattern is recognized as StartBit. 
+    -- StBitDet_a or StBitDet_b (whichever is first) flips to =1, => the final 
+    -- flag StBitDet flips to =1, and the 1st "SmplStrobe" pulse is generated 
+    -- immediately (while Prescaler is still =#0 ).  
+    -- The StartBit appears at LinkData.q synchronously with StBitDet setting =>
+    -- StartBit will be latched into RxShifter by next _/.
+SmplStrobe  = Prescaler.eq0 AND StBitDet;       --flips to =1 after t13, t21, ..
+
+Strobe2 = DFF (.d=(SmplStrobe AND !CycleEnd),   --Strobe delayed by 1clock,
+                .clk=Clock, .clrn=!Reset);      --    flips to =1 @ t15, t23, ..
+---- LinkActive is set to =1 in any case when StartBit detected, aligned to StBit
+--LinkActive  = SRFF(.s=Strobe2,  --flips to =1 @ t17, ~8clocks after _/ of StBit
+--                .r=(CycleEnd OR Reset), .clk=Clock);
+
+-- Recognition of "0" from "1" - more soft conditions on samples pattern
+IF ( (Reg_LinkD_a.q[6..1] == B"111111") 
+   OR(Reg_LinkD_a.q[6..1] == B"011111")
+   OR(Reg_LinkD_a.q[6..1] == B"101111")
+   OR(Reg_LinkD_a.q[6..1] == B"110111")
+   OR(Reg_LinkD_a.q[6..1] == B"111011")
+   OR(Reg_LinkD_a.q[6..1] == B"111101")
+   OR(Reg_LinkD_a.q[6..1] == B"111110")
+   OR(Reg_LinkD_a.q[6..1] == B"011110")
+   OR(Reg_LinkD_a.q[6..1] == B"001111")
+   OR(Reg_LinkD_a.q[6..1] == B"100111")
+   OR(Reg_LinkD_a.q[6..1] == B"110011")
+   OR(Reg_LinkD_a.q[6..1] == B"111001")
+   OR(Reg_LinkD_a.q[6..1] == B"111100") )
+    Then LinkD_a = VCC;
+    Else LinkD_a = GND;
+End IF;
+IF ( (Reg_LinkD_b.q[6..1] == B"111111") 
+   OR(Reg_LinkD_b.q[6..1] == B"011111")
+   OR(Reg_LinkD_b.q[6..1] == B"101111")
+   OR(Reg_LinkD_b.q[6..1] == B"110111")
+   OR(Reg_LinkD_b.q[6..1] == B"111011")
+   OR(Reg_LinkD_b.q[6..1] == B"111101")
+   OR(Reg_LinkD_b.q[6..1] == B"111110")
+   OR(Reg_LinkD_b.q[6..1] == B"011110")
+   OR(Reg_LinkD_b.q[6..1] == B"001111")
+   OR(Reg_LinkD_b.q[6..1] == B"100111")
+   OR(Reg_LinkD_b.q[6..1] == B"110011")
+   OR(Reg_LinkD_b.q[6..1] == B"111001")
+   OR(Reg_LinkD_b.q[6..1] == B"111100") )
+    Then LinkD_b = VCC;
+    Else LinkD_b = GND;
+End IF;
+
+-- Select the source of data (channel A or B) and align the data to _/
+LinkData_a  = DFF(.d=LinkD_a, .clk= Clock);
+LinkData_b  = DFF(.d=LinkD_b, .clk=!Clock);
+LinkData_sel= (LinkData_a AND StBitDet_a) OR (LinkData_b AND StBitDet_b);
+LinkData    = DFF(.d=LinkData_sel, .clk=Clock); -- final Data, aligned to _/
+
+-- RxShifter: catches serial data, and collects a portion of data 
+--            to be transformed to a parallel Data_Word
+RxShifter.shiftin       = LinkData;             -- Data are catched..
+RxShifter.(clock,enable)= (Clock, SmplStrobe);  --.. and shifted at NORMAL rate, 
+    -- Момент защелкивания БИТА данных определяется выходной фазой предделителя.
+    -- The 1st "SmplStrobe" allows to latch the StartBit, at moment t15 
+    -- data is shifted q[0] -> q[CommandSize+Pause -1]
+RxShifter.aclr	=	!StBitDet ;    -- Нет синхронизма -> нет данных
+RxShifter.sclr	=	TxRx OR Header_Error ;
+
+--============================================================================
+--************ Link Cycle operation Control ************
+
+CycleBeg= RxShifter.q[CommandSize+Pause-1]; -- start treatment when whole Command entered RxShifter
+Cycle   = SRFF(.s=CycleBeg, .clk=Clock,     -- Flag: =1 in any case after whole Command entered RxShifter
+                .r=(CycleEnd OR Reset));
+
+CASE RxShifter.q[CommandSize+Pause-1..0] IS
+--    WHEN  CMDL_Cfg_Read     => HeaderErr = GND;   -- Чтение памати редиректора
+--    WHEN  CMDL_Cfg_Write    => HeaderErr = GND;	-- Запись в память редиректора
+    WHEN  Read1             => HeaderErr = GND;	-- Read  1 word from Object
+    WHEN  Write1            => HeaderErr = GND;	-- Write 1 word  to Object
+    WHEN  Read              => HeaderErr = GND;	-- Read 62 words from Object(s)
+    WHEN  Write             => HeaderErr = GND;	-- Write 8 words  to Object(s)
+    WHEN  CMDL_Exe_Read_000 => HeaderErr = GND;	-- Чтение 0
+    WHEN  CMDL_Exe_Read_010 => HeaderErr = GND;	-- Start_Regul (Чтение 1)
+    WHEN  CMDL_Exe_Read_100 => HeaderErr = GND;	-- Start_Alter (Чтение 2)
+    WHEN  CMDL_Exe_Read_110 => HeaderErr = GND;	-- Чтение 3
+    WHEN  CMDL_Exe_Write_001=> HeaderErr = GND;	-- Запись 0
+    WHEN  CMDL_Exe_Write_011=> HeaderErr = GND;	-- Запись 1
+    WHEN  CMDL_Exe_Write_101=> HeaderErr = GND;	-- Запись 2
+    WHEN  CMDL_Exe_Write_111=> HeaderErr = GND;	-- Запись 3
+    WHEN OTHERS             => HeaderErr = VCC;
+End CASE;
+
+Header_Error= DFFE(.d=HeaderErr, .clk=Clock,  -- check validity when..
+                    .ena=(CycleBeg & !Cycle), -- .. whole Command entered RxShifter
+                    .clrn=!CycleEnd);         -- reset at the End of Cycle
+Error       = Header_Error OR RdWr_Error ;-- OR Marker_Error_Flag.q ;
+
+--Flag: VALID OpCode received, 
+--  its _/ occures at (32.5..31.5)clocks after _/ of StartBit
+--LinkMessage = SRFF(.s=((Cycle AND !Header_Error)& Strobe2), -- flips to =1 by..
+LinkMessage = SRFF(.s=(Cycle & Strobe2), --for TEST only! flips to =1 by..
+                .clk=Clock,                     -- .. 8th "Strobe2" pulse
+                .r=CycleEnd, .clrn=!Reset)      -- reset at the End of Cycle
+                OR CycleEnd ;   -- Duration extended with DeadTime.
+
+-- Управление защелкиванием Reg_OpCode
+RxOpCode_ld  = (CycleBeg & !Cycle) AND !HeaderErr;  --_/^\_ ONE pulse, if VALID command recognized
+
+--********  The "reference" counter:  ********
+--    counts LinkClock periods => this counter's state defines all signals 
+--    which handle the Link operation
+LinkBitCounter.(clock,cnt_en)= (clock, (Cycle AND SmplStrobe));
+--LinkBitCounter.sclr = EndLinkCycle OR HeaderError OR Reset ;
+LinkBitCounter.sclr = CycleEnd OR Reset ;
+
+-- Управление защелкиванием Reg_InData
+IF (LinkBitCounter.q[(OrderOfBitNumber-1)..0] == (WORD_WIDTH+PAUSE)) 	
+    THEN  RxInData_ld = VCC;    -- _/^\_  ONE pulse
+    ELSE  RxInData_ld = GND;
+End IF;
+
+-- Генерим схемы совпадения на моменты заполнения Rx shiftera и используем их 
+-- для записи Data_Word в буферный регистр приёмника
+FOR i in 1 to WordsToGoDown GENERATE
+    IF (LinkBitCounter.q[OrderOfBitNumber-1..0] == ((WORD_WIDTH+PAUSE)*(1+i))) 
+        Then  RxWord_ld = VCC;  -- _/^\_ - (WordsToGoDown) pulses
+        Else  RxWord_ld = GND;
+    End IF;
+End GENERATE;
+
+-- условие переключения с приема на передачу:
+IF  (LinkBitCounter.q[OrderOfBitNumber-1..0] == BitOfReverse)
+    THEN ChangeDirect = VCC;            -- переключаемся с приема на передачу
+    ELSE ChangeDirect = GND;
+END IF;     
+-- Receiving mode <=> TxRx=0 / Transmission mode <=> TxRx=1
+-- по концу цикла переключаемся на прием (состояние по умолчанию)
+--TxRx.(S,clk,R) = (ChangeDirect,Clock,EndLinkCycle OR HeaderError);
+TxRx = SRFF(.s=ChangeDirect, .clk=Clock, .r=CycleEnd, .clrn=!Reset);
+
+
+-- Handling  the TxShifter  and  selection of Data to be transmitted:
+CASE LinkBitCounter.q[(OrderOfBitNumber-1)..0] IS
+-- подсоединяем к Tx шифтеру выходы с Reg_OpCode
+    WHEN  BitOfAnswerStart  =>  
+                    TxOpCode_ld = VCC;  -- load OpCode
+            TxShifter.data[WORD_WIDTH-1..(WORD_WIDTH-(COMMAND_SIZE+PAUSE))] = Reg_OpCode.q[]; 
+-- подсоединяем к Tx шифтеру выходы с Reg_InData
+	WHEN  Bit_of_Header_UP_Reload => 
+                    TxInData_ld = VCC;  -- load InData
+                    TxShifter.data[] = Reg_InData.q[];
+-- подсоединяем к Tx шифтеру остальные данные
+    --WHEN... comparators for strobing data loading are described below
+    --                TxShifter.data[] = Reg_TxData.q[];
+-- подсоединяем к Tx шифтеру CRC register
+    WHEN  Bit_of_CRC_Reload =>  
+                    CRC_ld      = VCC;  -- load CRC
+                    TxShifter.data[] = CRC_Checker.CRC_Parallel_Out[];
+    WHEN OTHERS =>  TxOpCode_ld = GND;
+                    TxInData_ld = GND; 
+                    TxWord_ld   = GND; 
+                    CRC_ld      = GND;
+                    TxShifter.data[] = Reg_TxData.q[];
+End CASE;
+
+-- Гененерим схемы совпадения на моменты перезагрузки данных в Tx shifter
+FOR i in 1 to (WordsToGoUp) GENERATE
+    IF  LinkBitCounter.q[(OrderOfBitNumber-1)..0] == ((BitOfAnswerStart+COMMAND_SIZE+PAUSE)+(WORD_WIDTH+PAUSE)*i) 
+        THEN  TxWord_ld = VCC; -- формируем импульс для защелкивания данных в регистр Tx shifter
+        ELSE  TxWord_ld = GND;
+    End IF;
+End GENERATE;
+
+
+-- По концу работы линка запускаем формировку защитного промежутка	
+IF ( LinkBitCounter.q[OrderOfBitNumber-1..0] == (MaxNumberOfBit+1) ) 	
+    THEN  DeadTimePulse.d = VCC;
+    ELSE  DeadTimePulse.d = GND;
+End IF;
+DeadTimePulse.(Clk, Reset)= (Clock, Reset); -- _/^^^^\_
+
+CycleEnd    = DeadTimePulse.q ; 
+
+--============================================================================
+--************ Registers and Bus Connections ************
+-- Here the Registers which take part in data transmission and their
+-- connections to user project are defined
+
+-- Reg_OpCode catches and holds the OpCode
+Reg_OpCode.data[(CommandSize+Pause-1)..0]= RxShifter.q[(CommandSize+Pause-1)..0];
+Reg_OpCode.(clock, enable, load)= (Clock, RxOpCode_ld, VCC); -- catch data when RxOpCodeReload=1 
+Reg_OpCode.(aclr, sclr)         = (Reset, CycleEnd );
+
+--IF (Header_Error == GND)      -- 
+--    THEN  Command[]	= Reg_OpCode.q[];   -- If OpCode valid - send it to user project
+--          First_Word[]= Reg_InData.q[];
+--    ELSE  Command[]   = CMDL_Cfg_Read ;   -- Substitution if Error found
+--          First_Word[]= 512; -- Addreses of Pedestals
+--END IF;
+OpCode_out[]    = Reg_OpCode.q[];           -- OpCode => user project
+
+-- Reg_InData catches and holds the InData_word
+-- Note: If Error, Reg_InData will be loaded with 0000, since RxShifter is cleared
+Reg_InData.data[(WordSize-1)..0]= RxShifter.q[(WordSize+Pause-1)..Pause]; 
+Reg_InData.(clock,enable, load) = (Clock, SmplStrobe AND RxInData_ld, VCC);
+Reg_InData.(aclr, sclr)         = (Reset, CycleEnd%GND% );
+InData_out[15..0]   = Reg_InData.q[15..0];  -- InData => user project
+--AddrBus_out[15..0] = Reg_InData.q[15..0]; -- InData используется как адрес 
+            -- только при операциях Rd/Wr  from/to  user project's objects
+
+-- Reg_RxData catches and holds the data words coming in Command_Sequence
+-- Note: If Error, Reg_RxData will be loaded with 0000, since RxShifter is cleared
+Reg_RxData.data[(WordSize-1)..0]= RxShifter.q[(WordSize+Pause-1)..Pause]; 
+Reg_RxData.(clock, enable, load)= (Clock, SmplStrobe AND RxWord_ld, VCC);
+Reg_RxData.(aclr, sclr)         = (Reset, CycleEnd );
+DataBus_out[15..0] = Reg_RxData.q[15..0];   -- Data received => user project
+
+-- Buffer register: loads Data words to be transmitted from Data bus
+Reg_TxData.data[]  = DataBus_in[]; -- подключение буферного параллельного регистра Tx к интерфейсу пользователя
+Reg_TxData.(clock, enable, load) = (Clock, 
+                (Select AND DataStrobe AND RdWr_in), VCC); -- load data at "Write" operation when DataStrobe comes
+Reg_TxData.(sclr, aclr) = (CycleEnd, Reset);
+
+-- TxShifter: loads Data_Word to be transmitted and shifts it,
+--            thus transforming a parallel Data_Word into serial bits sequence
+TxShifter.shiftin = GND; -- используется для создания паузы (сдвигаем на PAUSE тактов)
+--TxShifter.data[] -- see above, in "Link Cycle operation Control" section
+TxShifter.(clock,enable)= (Clock, SmplStrobe); -- сдвигаем данные для передачи в линк
+TxShifter.load  =   TxOpCode_ld
+                OR  TxInData_ld
+                OR  TxWord_ld
+                OR  CRC_ld ;    -- защелкиваем данные для передачи в линк
+
+LinkData_out = TRI(TxShifter.shiftout, TxRx); -- connection to BIDIR output
+
+--============================================================================
+--************ Section "User Interface Control" ************
+IORq    =SRFF(.S=(((RxInData_ld # RxWord_ld)& SmplStrobe)   -- Request: user should read data
+                OR((TxInData_ld # TxWord_ld)& SmplStrobe)), -- Request: user MUST supply data
+    -- С-л TxInData_ld грузит "InData" в TxShifter, и запрашиват чтение с шины 
+    -- в Reg_TxData (не инкрементируя счетчика слов).  Следующий запрос на 
+    -- чтение возникает одновременно с перезагрузкой в TxShifter уже готового 
+    -- слова данных, прочитанного по первому запросу.
+               .R=(Select AND DataStrobe),   -- Reset when data transfer done
+               .clk=Clock,
+               .clrn=!(CycleEnd # Reset)) ;
+
+RdWr_out= SRFF(.S=(RxInData_ld OR RxWord_ld),--"Write": Link => user project
+               .R=(Select AND DataStrobe),   -- Reset when data transfer done
+               .clk=Clock,
+               .clrn=!(CycleEnd # Reset)) ;
+
+-- When RdWr_out=1: (Link => UserProj ("Write")) requested, =>     \
+--    => UserProj should "read" data from Link => RdWr_in must be =0\ Must be:
+-- When RdWr_out=0: (Link <= UserProj ("Read")) requested, =>       /RdWr_in != RdWr_out
+--    => UserProj must "write" data to Link => RdWr_in must be =1  /
+IF ( ((IORq & Select) == VCC) AND (RdWr_in == RdWr_out) ) 
+    Then RdWr_Error = VCC; 
+    Else RdWr_Error = GND;
+End IF;
+
+--============================================================================
+-- CRC Checker
+CRC_Checker.Clock				=	Clock;
+CRC_Checker.Bit_Sample_Enable	=	SmplStrobe;
+CRC_Checker.Serial_In			=	TxShifter.shiftout;
+CRC_Checker.Reset				=	Reset ;
+
+%-- CRC_Gen control for data block only
+CRC_Checker.Start_Seed_Load = TxHeaderReload ; -- CRC Check begin with
+CRC_Checker.Message_End		=	TxWordReload;
+%
+-- CRC_Gen check from Start Bit
+CRC_Checker.Start_Seed_Load 	=	TxRx ;
+CRC_Checker.Message_Begin		=	TxOpCode_ld;
+
+CRC_Out[]   = CRC_Checker.CRC_Parallel_Out[];
+
+--============================================================================
+--Test1 = CRC_Checker.Residue_OK ;
+Test1 = LinkD1;--SmplStrobe;
+Test2 = LinkD2;--Cycle ;
+Test3 = StBitDet_a;--RxOpCode_ld OR RxInData_ld OR RxWord_ld;
+Test4 = StBitDet_b;--TxInData_ld ;--TxInData_ld OR TxWord_ld ;
+Test5 = StBitDet;  --RxShifter.q[0];
+Test6 = LinkData_a;--RxShifter.q[1];
+Test7 = LinkData_b;--RxShifter.q[2]; 
+--Test7 = CRC_Checker.Test1;
+Test8 = LinkBitCounter.q0 ;
+--Test8 = CRC_Checker.CRC_Serial_Out;
+
+END;

@@ -1,0 +1,53 @@
+Title "Pulse_Width_Shaper";
+-- This file contain function for pulse one-short
+-- Edge sensing, non-continue type.
+INCLUDE "lpm_counter.inc" ;
+
+
+
+PARAMETERS
+(
+  Duration=40,		-- ns
+  RefClock=100		-- MHz
+);
+
+Assert (Duration > 20)
+Report " Duration is (%), but must be greater then 20ns " Duration;
+
+CONSTANT Counter_Module = CEIL (Duration DIV (CEIL(1000 DIV RefClock)) );
+
+Subdesign Pulse_Width_Shaper
+(
+    Clock	: input;
+    Event	: input;
+	Reset	: input;
+	
+    PulseOut : output;
+)
+
+VARIABLE
+	Timer		: lpm_counter WITH ( LPM_WIDTH = CEIL(LOG2(Counter_Module+1)));
+	 Shaper		: SRFF; -- Shaping Flip-Flop
+	Non_Continue: SRFF; -- Non continue output pulse, if input high level is present at end
+		End_Pulse	: node;
+BEGIN
+
+Shaper.S	=	Event AND ! Non_Continue.q ;
+Shaper.R	=	End_Pulse OR Reset ;
+Shaper.clk	=	Clock;
+
+Non_Continue.S	=	Shaper.q ;
+Non_Continue.R	=	!Event;
+Non_Continue.clk=	Clock;
+
+-- if (Timer.q[] == (Counter_Module-1))
+if (Timer.q[] == (Counter_Module-1))
+THEN End_Pulse	=	VCC;
+ELSE End_Pulse	=	GND;
+end if;
+Timer.clock	=	Clock;
+Timer.sclr	=	End_Pulse OR Reset ;
+Timer.cnt_en	=	Shaper.q ;
+
+	PulseOut	=	Shaper.q ;
+END;

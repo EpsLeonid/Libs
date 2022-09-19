@@ -1,0 +1,125 @@
+TITLE "Utility_Gen";
+%Переписано из контроллера блокировок. Нет длительности - выходной импульс длиной в прескэйлер. 
+Описаны два генератора, имеющие такт 1мкс и глубину 32 бита.
+Имеется управляющий регистр, через который можно независимо запретить входы, разрешить генераторы, 
+дать одиночные толчки. На выходе имеются импульсы, которые подключаются
+на Event_Meneger. 
+%
+INCLUDE "lpm_shiftreg.inc" ;
+INCLUDE "lpm_counter.inc" ;
+Include "CMD3_DAQ_LINK.inc";
+INCLUDE "Edge_Sensing_Sync.inc";
+
+PARAMETERS
+(
+RefClock=100   -- Пользователь здесь указывает частоту в МГц-ах (целых), которую он подал на вход "Clock" 
+);
+
+Constant PrescalerModule = RefClock ;
+
+
+SUBDESIGN Utility_Gen
+(
+-- Module specific signals
+--	Short_Blocking_Pulse	: input=GND;
+--	Long_Blocking_Pulse		: input=GND;
+	
+--	Blocking_Begin, Blocking_End, To_be_Blocked	: output ;
+PulseOut0, PulseOut1		: output ;
+	
+-- Standard Bus signaling for Master/Slave connection
+			-- General Signals
+			Clock					: input; -- Global FPGA Clock, assumed 100MHz for T2Q project 
+			Reset					: input=GND ;  -- Common FPGA Reset
+			DataBus_In[15..0]		: input;  -- отправляемые с Внутренней Шины в Линк данные
+			DataBusOut[15..0]       : output; -- выдаваемые на Внутреннюю Шину из Линка данные
+			DataBusStrobe           : input;  -- строб приема/передачи данных наружу (высокий уровень, используя его как Enable, "защелкиваем" по заднему фронту
+			Error                   : output; -- сигнал ошибки (неверная команда)
+%	-- Master Mode Signals -- используется при работе данного Модуля в режиме Master)
+	AccessRequest           : output; -- запрос к Арбитру на доступ к шине для чтения/записи данных Пользователя в режиме Master	
+	AccessGranted			: input;  -- Разрешение Арбитра выставить Адрес и направление обмена (захват шины)
+	DirectOut				: output; -- направление передачи данных, на внутреннюю шину или с нее, по умолчанию =GND, передача от внутренних ресурсов платы Модуль,
+	AddrBusOut[15..0]       : output; -- адрес при операциях доступа ко внутренним ресурсам Оцифровщика (чтения/записи по Командному Листу).
+%		-- Slave Mode Signals	-- используется при работе данного Модуля в режиме Slave
+		Select					: input;  -- Выбор Модуля для работы с памятью Командного Листа в режиме Slave (с КАМАК-ом)
+		DirectIn				: input;  -- направление передачи данных, Если =GND, то данный Модуль читается, если =VCC, то пишется.
+		AddrBus_In[3..0]		: input;  -- адрес при операциях доступа чтения/записи Командного Листа с КАМАК-а
+
+)
+
+VARIABLE
+Short_Sim_Edge, Long_Sim_Edge		: Edge_Sensing_Sync;
+
+	Short_Freq_CNT					: LPM_COUNTER with ( LPM_WIDTH=(WORD_WIDTH*2));
+	SF_End								: node;
+	SF_outdeglitch						: DFFE;
+	SF_REG_LW, SF_REG_UW	: lpm_shiftreg with (lpm_width=WORD_WIDTH);
+	SF_REG_LW_wren,	SF_REG_UW_wren		: node;
+
+	Long_Freq_CNT					: LPM_COUNTER with ( LPM_WIDTH=(WORD_WIDTH*2));
+	LF_End								: node;
+	LF_outdeglitch						: DFFE;
+	LF_REG_LW, LF_REG_UW	: lpm_shiftreg with (lpm_width=WORD_WIDTH);
+	LF_REG_LW_wren,	LF_REG_UW_wren		: node;
+
+
+Prescaler							:	lpm_counter with (lpm_width=CEIL(LOG2 (RefClock)));
+Sample_Enable		: node ;
+--Sample_Enable[2..0]	:DFF;
+
+CSR						:   lpm_shiftreg with (lpm_width=4);
+CSR_wren				: node;
+DataBusOut_[WORD_WIDTH-1..0]		: node;
+DataBusOut_Reg[WORD_WIDTH-1..0]		: DFF;
+
+
+begin
+
+-- Find rising edges 
+Short_Sim_Edge.(clk, d, ena)		=	(Clock, CSR.q[2], Sample_Enable);
+Long_Sim_Edge.(clk, d, ena)			=	(Clock, CSR.q[3], Sample_Enable);
+
+
+Prescaler.(clock, sclr)	=	(Clock, Sample_Enable) ;
+		Sample_Enable	=	DFF(.clk=Clock, .d=( Prescaler.q[] == PrescalerModule-2 ));
+
+
+-- Connect frequency counters
+Short_Freq_CNT.(clock, sclr, cnt_en)	=	(Clock, (SF_outdeglitch.q OR !CSR.q[0]), Sample_Enable);
+IF (Short_Freq_CNT.q[WORD_WIDTH-1..0]==SF_REG_LW.q[WORD_WIDTH-1..0] AND Short_Freq_CNT.q[(WORD_WIDTH*2)-1..WORD_WIDTH]==SF_REG_UW.q[WORD_WIDTH-1..0] )
+then SF_End=VCC; else SF_End=GND; end if;
+SF_outdeglitch.(clk, d, ena)	=	(Clock, SF_End, Sample_Enable);
+
+Long_Freq_CNT.(clock, sclr, cnt_en)		=	(Clock, (LF_outdeglitch.q OR !CSR.q[1]), Sample_Enable);
+IF (Long_Freq_CNT.q[WORD_WIDTH-1..0]==LF_REG_LW.q[WORD_WIDTH-1..0] AND Long_Freq_CNT.q[(WORD_WIDTH*2)-1..WORD_WIDTH]==LF_REG_UW.q[WORD_WIDTH-1..0] )
+then LF_End=VCC; else LF_End=GND; end if;
+LF_outdeglitch.(clk, d, ena)	=	(Clock, LF_End, Sample_Enable);
+
+PulseOut0	=	DFF(.d=(SF_outdeglitch.q OR Short_Sim_Edge.q), .clk=Clock);
+PulseOut1	=	DFF(.d=(LF_outdeglitch.q OR Long_Sim_Edge.q),  .clk=Clock);
+
+-- IF duration is in progress and NEW pulse coming -- this is error !
+--Error =	(SD_outdeglitch.q AND Short_Rising_Edge.q ) OR (LD_outdeglitch.q AND Long_Rising_Edge.q);
+
+-- Connect Control Registers to Project Bus
+
+SF_REG_LW.(clock, data[], enable, load)	=	(Clock, DataBus_In[], SF_REG_LW_wren, VCC);
+SF_REG_UW.(clock, data[], enable, load)	=	(Clock, DataBus_In[], SF_REG_UW_wren, VCC);
+LF_REG_LW.(clock, data[], enable, load)	=	(Clock, DataBus_In[], LF_REG_LW_wren, VCC);
+LF_REG_UW.(clock, data[], enable, load)	=	(Clock, DataBus_In[], LF_REG_UW_wren, VCC);
+CSR.(clock, data[3..0], enable, load)	=	(Clock, DataBus_In[3..0], CSR_wren, VCC);
+
+-- Address map
+CASE AddrBus_In[3..0] IS
+WHEN 6 => DataBusOut_[] = SF_REG_LW.q[]; SF_REG_LW_wren = Select AND DirectIn AND DataBusStrobe;
+WHEN 7 => DataBusOut_[] = SF_REG_UW.q[]; SF_REG_UW_wren = Select AND DirectIn AND DataBusStrobe;
+WHEN 8 => DataBusOut_[] = LF_REG_LW.q[]; LF_REG_LW_wren = Select AND DirectIn AND DataBusStrobe;
+WHEN 9 => DataBusOut_[] = LF_REG_UW.q[]; LF_REG_UW_wren = Select AND DirectIn AND DataBusStrobe;
+
+WHEN 10 => 	DataBusOut_[3..0] = CSR.q[3..0]; 
+			DataBusOut_[WORD_WIDTH-1..4] = GND;	CSR_wren = Select AND DirectIn AND DataBusStrobe;
+			
+WHEN OTHERS => DataBusOut_[] = GND; SF_REG_LW_wren = GND; SF_REG_UW_wren = GND; LF_REG_LW_wren = GND; LF_REG_UW_wren = GND;
+END CASE;
+DataBusOut[]=DataBusOut_Reg[].q; DataBusOut_Reg[].clk=Clock; DataBusOut_Reg[].d=DataBusOut_[];
+end;

@@ -1,0 +1,275 @@
+
+INCLUDE "Fr_ether100_new.inc";
+INCLUDE "Tx_Eth100_Sync.inc";
+INCLUDE "Eth_ext_pkt.inc";
+INCLUDE "Eth_int_pkt.inc";
+
+
+
+INCLUDE "Eth_In_FIFO4kb.inc";
+INCLUDE "lpm_counter.inc";
+
+PARAMETERS ( 
+	ETH_MODULE_FUNC_SET = 1,
+	NUM_MS_SIGNALS 		= 1 
+);
+
+SUBDESIGN Ethernet_TxRx
+(
+  System_Clock                  : input; -- System Clock, really Bus_Clock
+-- PHY Ethernet I/O
+   -- Rx section    --Preambula, SOF and CRC are cutted out
+  Eth_Phy_RxClk                 : input;
+  Rx_Reset						: input = GND;
+  Carr 							: input;	-- Crs and RxDv; -- по наличию этого сигнала идет работа модуля
+  Rx_Data_nibble_input[3..0]    : input;
+  RxIntStart                    : input;
+  
+	-- Tx section
+  Tx_Reset						: input = GND;	
+  Eth_Phy_TxClk					: input;	--Eth0_Phy_TxClk
+  Eth_Phy_TxEn					: output;	--Eth0_Phy_TxEn
+  Eth_Phy_TxD[3..0]		    	: output;	--Eth0_Phy_TxD[3..0]
+  Eth_Phy_MdC					: output;	--Eth0_Phy_MdC
+  Eth_Phy_MdIO					: input;	--Eth0_Phy_MdIO
+   
+  Eth_RxTx_In_Progress			: output; -- модуль обрабатывает пакет
+  Eth_Tx_End					: output; 
+  Transmit_of_Data_RQ			: output; 
+  
+  -- Standard bus connections 
+  DataBus_In[NUM_MS_SIGNALS-1..0][15..0] : input;  -- отправляемые с Внутренней Шины в Модуль данные
+  DataBusOut[NUM_MS_SIGNALS-1..0][15..0] : output; -- выдаваемые на Внутреннюю Шину из Модуля данные (младшие 16бит шины R)
+  
+  DataBusStrobe[NUM_MS_SIGNALS-1..0]     : input;  -- строб приема/передачи данных наружу (высокий уровень, защелкиваем по заднему фронту)
+  Select[NUM_MS_SIGNALS-1..0]	 	     : input;  -- Выбор Модуля для работы с памятью Командного Листа в режиме Slave (с КАМАК-ом)
+  DirectIn[NUM_MS_SIGNALS-1..0]	  	     : input;  -- направление передачи данных, Если =GND, то данный Модуль читается, если =VCC, то пишется.
+  AddrBus_In[NUM_MS_SIGNALS-1..0][12..0] : input;  -- адрес при операциях доступа чтения/записи Командного Листа с КАМАК-а
+  Parcer_Reset							 : input = GND;
+  	-- Master Mode Signals 
+  AccessRequest[NUM_MS_SIGNALS-1..0]   	 : output;
+  AccessGranted[NUM_MS_SIGNALS-1..0]	 : input; 
+  DirectOut[NUM_MS_SIGNALS-1..0]		 : output;
+  AddrBusOut[NUM_MS_SIGNALS-1..0][15..0] : output;
+
+  Test_out	                    : output;
+
+)
+VARIABLE
+   Data_Layer_Parser       		: Eth_ext_pkt;
+   Dummy_Layer_Parser       	: Eth_int_pkt;
+   Rx_Data_Layer_Coverter 		: Fr_ether100_new;	
+   Tx_Data_Layer_Coverter 		: Tx_Eth100_Sync;
+   
+   -- output FIFO
+   Out_FIFO									: Eth_In_FIFO4kb;
+   Tx_FIFO_RQ								: node;
+   
+   Eth_Tx_In_Progress						: node;
+   Byte_Strobe_Tx                           : node;
+   
+   Tx_Data_packet_RQ						: SRFF;
+   Tx_Dummy_packet_RQ						: SRFF;
+   Tx_Dummy_RQ_in_progress					: SRFF;
+   Tx_Data_RQ_in_progress					: SRFF;
+   Tx_Data_packet_AG						: node;
+   Tx_Dummy_packet_AG						: node;
+   -- защитный промежуток между пакетами, передаваемыми наружу
+   GuardTime_Cnt                       		: LPM_COUNTER WITH (LPM_WIDTH = 8);
+   GuardTime_Cnt_Rst						: node;
+   GuardTime								: node;
+ 
+BEGIN
+  
+  
+  --**************************************** Ethernet  ****************************************************	
+  ------------------------------------- Ethernet Reciver ---------------------------------
+	Rx_Data_Layer_Coverter.System_Clock 					= 	System_Clock;	
+	Rx_Data_Layer_Coverter.RxClk_Edge_at_System_Clock		= 	Eth_Phy_RxClk;
+
+	Rx_Data_Layer_Coverter.Reset						    = 	Rx_Reset;
+	Rx_Data_Layer_Coverter.Carr 							=	Carr;--Crs and RxDv; -- по наличию этого сигнала идет работа модуля
+	Rx_Data_Layer_Coverter.Rx_Data_nibble_input[3..0] 		= 	Rx_Data_nibble_input[3..0];
+
+  ------------------------------------ Ethernet Trasmitter ------------------------------
+ 	Tx_Data_Layer_Coverter.System_Clock						=	System_Clock;
+	Tx_Data_Layer_Coverter.Reset							=	Tx_Reset;--GND;
+	Tx_Data_Layer_Coverter.Transmit_of_Data_RQ				=	Tx_FIFO_RQ;	-- начало передачи
+	Tx_Data_Layer_Coverter.Data_to_Transmit[7..0]			=	Out_FIFO.q[7..0];   		-- данные для передачи
+	
+	-- Phy MII connection
+	Tx_Data_Layer_Coverter.MII_Tx_CLK						=	Eth_Phy_TxClk;
+	Eth_Phy_TxEn											=	Tx_Data_Layer_Coverter.MII_Tx_En;
+	Eth_Phy_TxD[3..0]										=	Tx_Data_Layer_Coverter.MII_Tx_Data[3..0];
+	Eth_Phy_MdC                                				=	GND;
+    
+----------------------------------  Ethernet Data_Layer_Parser ------------------------------- 
+	-- external ethernet packets
+	IF ETH_MODULE_FUNC_SET == 1 GENERATE
+		Data_Layer_Parser.Clock 					= System_Clock;
+		Data_Layer_Parser.Byte_Strobe_Rx			= DFF(.clk=System_Clock, .d=(Rx_Data_Layer_Coverter.Byte_Output_Strobe));
+		Data_Layer_Parser.Rx_Data[7..0]				= Rx_Data_Layer_Coverter.Byte_Output[7..0];
+		Data_Layer_Parser.RxPacket_in_progress		= DFF(.clk=System_Clock, .d=(Rx_Data_Layer_Coverter.Data_Frame_is_in_Progress));
+		Data_Layer_Parser.RxPacket_End				= DFF(.clk=System_Clock, .d=(Rx_Data_Layer_Coverter.Packet_Good_End OR Rx_Data_Layer_Coverter.Packet_bad_End));
+		Data_Layer_Parser.Packet_Good_End			= DFF(.clk=System_Clock, .d=(Rx_Data_Layer_Coverter.Packet_Good_End));
+		Data_Layer_Parser.Packet_bad_End			= DFF(.clk=System_Clock, .d=(Rx_Data_Layer_Coverter.Packet_bad_End));
+		Data_Layer_Parser.Out_FIFO_full			    = Out_FIFO.full;
+		Data_Layer_Parser.Tx_packet_AG			    = Data_Layer_Parser.Tx_packet_RQ;
+
+    
+		Data_Layer_Parser.(BUS_Clock   , DataBus_In[15..0], DataBusStrobe) =
+						  (System_Clock, DataBus_In[0][]  , DataBusStrobe[0]);
+		Data_Layer_Parser.Reset			    		= Parcer_Reset;
+		Data_Layer_Parser.DirectIn					= DirectIn[0];
+		Data_Layer_Parser.AddrBus_In[12..0]			= AddrBus_In[0][12..0];
+		Data_Layer_Parser.Select			    	= Select[0];
+    
+		Data_Layer_Parser.AccessGranted	    		= AccessGranted[0];
+    
+
+		Eth_RxTx_In_Progress 						= Data_Layer_Parser.Eth_RxTx_In_Progress;
+
+		DataBusOut[0][] 							= Data_Layer_Parser.DataBusOut[];
+		AccessRequest[0]							= Data_Layer_Parser.AccessRequest;
+		DirectOut[0] 								= Data_Layer_Parser.DirectOut;
+		AddrBusOut[0][15..0] 						= Data_Layer_Parser.AddrBusOut[15..0];
+		Eth_Tx_End									= GND;
+    END GENERATE;
+	
+
+	IF ETH_MODULE_FUNC_SET == 2 GENERATE
+        -- internal ethernet packets
+		Dummy_Layer_Parser.Clock 					= System_Clock;
+		Dummy_Layer_Parser.Int_Start				= RxIntStart;
+		Dummy_Layer_Parser.Out_FIFO_full			= Out_FIFO.full;
+		Dummy_Layer_Parser.Tx_packet_AG			    = Tx_Dummy_packet_AG;
+	    
+		Dummy_Layer_Parser.(BUS_Clock   , DataBus_In[15..0], DataBusStrobe) =
+						   (System_Clock, DataBus_In[1][]  , DataBusStrobe[1]);
+		Dummy_Layer_Parser.Reset			    	= Parcer_Reset;
+		Dummy_Layer_Parser.DirectIn					= DirectIn[1];
+		Dummy_Layer_Parser.AddrBus_In[12..0]		= AddrBus_In[1][12..0];
+		Dummy_Layer_Parser.Select			    	= Select[1];
+    
+		Dummy_Layer_Parser.AccessGranted	    	= AccessGranted[1];
+
+		DataBusOut[1][] 							= Dummy_Layer_Parser.DataBusOut[];
+		AccessRequest[1]							= Dummy_Layer_Parser.AccessRequest;
+		DirectOut[1]								= Dummy_Layer_Parser.DirectOut;
+		AddrBusOut[1][15..0]						= Dummy_Layer_Parser.AddrBusOut[15..0];
+		Eth_Tx_End									= Dummy_Layer_Parser.Eth_Tx_End;
+	
+		
+		Data_Layer_Parser.Clock 					= System_Clock;
+		Data_Layer_Parser.Byte_Strobe_Rx			= DFF(.clk=System_Clock, .d=(Rx_Data_Layer_Coverter.Byte_Output_Strobe));
+		Data_Layer_Parser.Rx_Data[7..0]				= Rx_Data_Layer_Coverter.Byte_Output[7..0];
+		Data_Layer_Parser.RxPacket_in_progress		= DFF(.clk=System_Clock, .d=(Rx_Data_Layer_Coverter.Data_Frame_is_in_Progress));
+		Data_Layer_Parser.RxPacket_End				= DFF(.clk=System_Clock, .d=(Rx_Data_Layer_Coverter.Packet_Good_End OR Rx_Data_Layer_Coverter.Packet_bad_End));
+		Data_Layer_Parser.Packet_Good_End			= DFF(.clk=System_Clock, .d=(Rx_Data_Layer_Coverter.Packet_Good_End));
+		Data_Layer_Parser.Packet_bad_End			= DFF(.clk=System_Clock, .d=(Rx_Data_Layer_Coverter.Packet_bad_End));
+		Data_Layer_Parser.Out_FIFO_full			    = Out_FIFO.full;
+		Data_Layer_Parser.Tx_packet_AG			    = Tx_Data_packet_AG;
+
+    
+		Data_Layer_Parser.(BUS_Clock   , DataBus_In[15..0], DataBusStrobe) =
+						  (System_Clock, DataBus_In[0][]  , DataBusStrobe[0]);
+		Data_Layer_Parser.Reset			    		= Parcer_Reset;
+		Data_Layer_Parser.DirectIn					= DirectIn[0];
+		Data_Layer_Parser.AddrBus_In[12..0]			= AddrBus_In[0][12..0];
+		Data_Layer_Parser.Select			    	= Select[0];
+    
+		Data_Layer_Parser.AccessGranted	    		= AccessGranted[0];
+ 
+		DataBusOut[0][] 							= Data_Layer_Parser.DataBusOut[];
+		AccessRequest[0]							= Data_Layer_Parser.AccessRequest;
+		DirectOut[0] 								= Data_Layer_Parser.DirectOut;
+		AddrBusOut[0][15..0] 						= Data_Layer_Parser.AddrBusOut[15..0];
+	
+
+	
+		Tx_Dummy_packet_RQ.(S,clk,R)						= (Dummy_Layer_Parser.Tx_packet_RQ, System_Clock, Tx_Dummy_packet_AG);
+		Tx_Data_packet_RQ.(S,clk,R)						= (Data_Layer_Parser.Tx_packet_RQ, System_Clock, Tx_Data_packet_AG);
+		CASE  (Tx_Dummy_packet_RQ.q, Tx_Data_packet_RQ.q,Tx_Dummy_RQ_in_progress.q, Tx_Data_RQ_in_progress.q) IS          
+			WHEN b"1000"  => Tx_Dummy_RQ_in_progress.S = VCC; Tx_Dummy_packet_AG = VCC;
+			WHEN b"1100"  => Tx_Dummy_RQ_in_progress.S = VCC; Tx_Dummy_packet_AG = VCC;
+			WHEN b"0100"  => Tx_Data_RQ_in_progress.S  = VCC; Tx_Data_packet_AG  = VCC;
+			WHEN OTHERS   => Tx_Data_RQ_in_progress.S  = GND;
+							 Tx_Dummy_RQ_in_progress.S = GND; 
+						     Tx_Data_packet_AG		   = GND;
+						     Tx_Dummy_packet_AG		   = GND;
+		END CASE;
+		Tx_Dummy_RQ_in_progress.(clk,R) = (System_Clock,Dummy_Layer_Parser.Tx_End_Pkt_for_FIFO);
+		Tx_Data_RQ_in_progress.(clk,R)  = (System_Clock,Data_Layer_Parser.Tx_End_Pkt_for_FIFO);
+    END GENERATE;
+    
+    
+    Byte_Strobe_Tx     							= Tx_Data_Layer_Coverter.Byte_Readed_Strob;
+	Transmit_of_Data_RQ                         = Tx_FIFO_RQ;
+	Test_out 									= GND;
+	
+	
+	
+	
+-------------------------------------------- Output FIFO --------------------------------------------
+    IF ETH_MODULE_FUNC_SET == 1 GENERATE
+		Out_FIFO.data[7..0] 	=	Data_Layer_Parser.Tx_Data_for_FIFO[];
+  		Out_FIFO.data[8] 		=	GND; 
+		Out_FIFO.data[9] 		=	Data_Layer_Parser.Tx_End_Pkt_for_FIFO;
+		Out_FIFO.clock			=	System_Clock;
+		Out_FIFO.wrreq  		=	Data_Layer_Parser.Tx_Strobe_for_FIFO;
+    END GENERATE;
+   
+    IF ETH_MODULE_FUNC_SET == 2 GENERATE
+		CASE  (Tx_Dummy_RQ_in_progress.q, Tx_Data_RQ_in_progress.q) IS  
+			WHEN b"10"  =>  Out_FIFO.data[7..0] 	=	Dummy_Layer_Parser.Tx_Data_for_FIFO[];
+							Out_FIFO.data[8] 		=	GND; 
+							Out_FIFO.data[9] 		=	Dummy_Layer_Parser.Tx_End_Pkt_for_FIFO;
+							Out_FIFO.clock			=	System_Clock;
+							Out_FIFO.wrreq  		=	Dummy_Layer_Parser.Tx_Strobe_for_FIFO;
+							Eth_RxTx_In_Progress 	= 	Tx_Dummy_RQ_in_progress.q;
+			WHEN b"01"  =>	Out_FIFO.data[7..0] 	=	Data_Layer_Parser.Tx_Data_for_FIFO[];
+							Out_FIFO.data[8] 		=	GND; 
+							Out_FIFO.data[9] 		=	Data_Layer_Parser.Tx_End_Pkt_for_FIFO;
+							Out_FIFO.clock			=	System_Clock;
+							Out_FIFO.wrreq  		=	Data_Layer_Parser.Tx_Strobe_for_FIFO;
+							Eth_RxTx_In_Progress	= 	Tx_Data_RQ_in_progress.q;
+			WHEN OTHERS =>  Out_FIFO.data[7..0] 	=	Dummy_Layer_Parser.Tx_Data_for_FIFO[];
+							Out_FIFO.data[8] 		=	GND; 
+							Out_FIFO.data[9] 		=	Dummy_Layer_Parser.Tx_End_Pkt_for_FIFO;
+							Out_FIFO.clock			=	System_Clock;
+							Out_FIFO.wrreq  		=	Dummy_Layer_Parser.Tx_Strobe_for_FIFO;
+							Eth_RxTx_In_Progress	= 	Tx_Dummy_RQ_in_progress.q;
+		END CASE;
+    END GENERATE;
+    Out_FIFO.rdreq  			=	Byte_Strobe_Tx;    
+     -- передача из выходного FIFO начинается, когда Out_FIFO не пустое, не идет передача данных прошлого пакета 
+     -- и отработан по концу передачи защитный промежуток
+    Tx_FIFO_RQ					=	SRFF(.S=!Out_FIFO.empty AND !Eth_Tx_In_Progress AND !GuardTime,.clk=System_Clock,.R=Out_FIFO.q[9] AND Byte_Strobe_Tx);
+         
+     -- guard time interval between packets
+    GuardTime_Cnt.(clock,cnt_en,sclr) = (System_Clock, GuardTime, GuardTime_Cnt_Rst);
+    IF(GuardTime_Cnt.q[] > 99) THEN GuardTime_Cnt_Rst = VCC;
+							   ELSE GuardTime_Cnt_Rst = GND;
+	END IF;
+	GuardTime = SRFF(.S=!Eth_Tx_In_Progress AND DFF(.d=Eth_Tx_In_Progress,.clk=System_Clock),.clk=System_Clock,.R=GuardTime_Cnt_Rst);
+	
+	Eth_Tx_In_Progress = DFF(.clk=System_Clock, .d=(Tx_Data_Layer_Coverter.Eth_Tx_In_Progress));
+	
+   ------------------------------------------------------------------------------------------------------------------- 
+ 	
+ 	
+
+END;
+
+
+
+
+
+
+
+
+
+
+
+
+

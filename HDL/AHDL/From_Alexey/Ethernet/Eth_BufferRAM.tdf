@@ -1,0 +1,194 @@
+TITLE "Ethernet packets byte RAM";
+-- OSI model   OpenSystem Interface
+-- This Module produce function of "Ethernet Signal layer to Data Link layer bridge"
+-- Media layer to Electrical Layer is done by external chip LXT972
+-- Electrical Layer to Signaling Layer is done by "Tx_Eth100_Sync" and "Fr_ether100_new" functions
+
+INCLUDE "Edge_Sensing_Sync.inc";
+INCLUDE "lpm_shiftreg.inc";
+INCLUDE "lpm_counter.inc";
+INCLUDE "EthBufferRAM2048.inc";
+
+
+CONSTANT PacketLenghts_at_signaling_layer  = 2048;-- maximum length value in bytes
+CONSTANT RxByte_Cnt_Width = Ceil( LOG2(PacketLenghts_at_signaling_layer));
+
+Constant WORD_WIDTH	= 16; 
+
+
+SUBDESIGN Eth_BufferRAM
+(
+   Clock                        : input; -- System Clock, really Bus_Clock
+-- PHY Ethernet I/O
+   -- Rx section    --Preambula, SOF and CRC are cutted out
+  Byte_Strobe_Rx      			: input;
+  Rx_Data[7..0]       	 		: input;
+  RxPacket_in_progress  		: input;
+  RxPacket_End             		: input;
+ 		Packet_Good_End 			: input=GND; -- CRC result
+		Packet_bad_End				: input=GND; -- CRC result
+   
+  Packet_Decode_Error			: output; --next packet is detected while current packet is in processing
+  
+	-- Tx section
+  Byte_Strobe_Tx      			: input;
+  Tx_Data[7..0]       	 		: output; 
+  Transmit_of_Data_RQ           : output;
+ 	Eth_Tx_In_Progress			: input=GND;	-- Transmittion is in progress(flag), Phy is busy
+
+  -- Standard bus connections
+  BUS_Clock                     : input;
+  DataBus_In[15..0]			    : input;  -- отправляемые с Внутренней Шины в Модуль данные
+  DataBusOut[15..0]     	  	: output; -- выдаваемые на Внутреннюю Шину из Модуля данные (младшие 16бит шины R)
+  
+  DataBusStrobe 			 	: input;  -- строб приема/передачи данных наружу (высокий уровень, защелкиваем по заднему фронту)
+  Select					 	: input;  -- Выбор Модуля для работы с памятью Командного Листа в режиме Slave (с КАМАК-ом)
+  DirectIn					  	: input;  -- направление передачи данных, Если =GND, то данный Модуль читается, если =VCC, то пишется.
+  AddrBus_In[11..0]			 	: input;  -- адрес при операциях доступа чтения/записи Командного Листа с КАМАК-а
+  Reset                        	: input = GND;
+
+)
+VARIABLE
+   RxByte_Cnt       	    	: LPM_COUNTER WITH (LPM_WIDTH = RxByte_Cnt_Width+1);
+   RAM_Overflow					: node;
+   RAM_Overflow_SRFF            : SRFF;
+   Cnt_Overflow_Edge			: Edge_Sensing_Sync;
+   RxReadyToRecive              : SRFF;
+   SetRxReadyToRecive           : node;
+   RxPacket_End_ES              : Edge_Sensing_Sync;
+   RxRAM                    	: EthBufferRAM2048;
+   RxRAM_CS                 	: node;
+   RxError_node                 : node;
+   Status_REG                   : LPM_SHIFTREG with (lpm_width=16); -- статус проиходящего (идет прием или передача)
+   Status_REG_CS                : node;
+   Status_REG_ES				: Edge_Sensing_Sync;
+   
+   RxError_ES                   : Edge_Sensing_Sync; 
+   RxPacketError_Cnt            : LPM_COUNTER  WITH (LPM_WIDTH = 16);
+   RxPacketError_Cnt_REG        : LPM_SHIFTREG WITH (LPM_WIDTH = 16);
+   RxPacketError_Cnt_REG_CS     : node;
+   RxPacketError_Cnt_REG_ES     : Edge_Sensing_Sync; 
+   
+   
+   TxByte_Cnt       	    	: LPM_COUNTER WITH (LPM_WIDTH = RxByte_Cnt_Width+1);
+   TxRAM                    	: EthBufferRAM2048;
+   TxRAM_CS                 	: node;
+   TxRQ_Reset					: node;
+   TxRQ_Reset_ES                : Edge_Sensing_Sync;
+   TxRQ_SRFF                    : SRFF;
+   InternalTxStart              : node;
+   
+   PacketLenghts_to_be_transmitted_Reg    : LPM_SHIFTREG WITH (LPM_WIDTH = 16);
+   PacketLenghts_to_be_transmitted_Reg_CS : node;
+   
+   
+
+BEGIN
+
+-------------------------------------------- Rx section --------------------------------------------
+   RxReadyToRecive.(S,clk,R) = (SetRxReadyToRecive,Clock,RxPacket_End_ES.q);
+   
+--   RxByte_Cnt.(clock,clk_en,cnt_en,sclr) = (Clock,VCC,Byte_Strobe_Rx AND !RAM_Overflow AND RxReadyToRecive.q, RxPacket_in_progress);
+  
+   RxByte_Cnt.(clock,clk_en,cnt_en,sclr) = (Clock,VCC, (Byte_Strobe_Rx AND RxReadyToRecive.q), --Enable to count actual length
+														SetRxReadyToRecive       				--Not to clear while processing in progress to know actual length
+															); 
+
+   IF 	(RxByte_Cnt.q[] == PacketLenghts_at_signaling_layer-1) --Check to not overwrite RAM at ubnormal length packets
+		THEN RAM_Overflow	= VCC;
+		ELSE RAM_Overflow	= GND;
+   END IF;
+   RAM_Overflow_SRFF.(S,clk,R) = (Cnt_Overflow_Edge.q,Clock,SetRxReadyToRecive);
+   Cnt_Overflow_Edge.(clk,d)	=	(Clock, RAM_Overflow); -- неверный размер пакета
+   Packet_Decode_Error = Cnt_Overflow_Edge.q; -- пакет имеет ошибки
+   
+   RxPacket_End_ES.(d,clk)   = (RxPacket_End,Clock);
+   
+   IF((RxPacket_in_progress == VCC) AND (RxReadyToRecive.q == GND)) THEN RxError_node = VCC;
+																    ELSE RxError_node = GND;
+   END IF;
+   
+   RxRAM.data_a[7..0] = Rx_Data[7..0];  -- входные данные
+   RxRAM.(address_a[10..0]   , clock_a, wren_a                       ) =
+         (RxByte_Cnt.q[10..0], Clock  , Byte_Strobe_Rx AND !RAM_Overflow_SRFF.q AND RxReadyToRecive.q); 
+
+   RxRAM.(address_b[9..0] , clock_b  , data_b[15..0], wren_b  ) =
+         (AddrBus_In[9..0], BUS_Clock, DataBus_In[] , RxRAM_CS AND DataBusStrobe AND DirectIn AND Select); 
+  
+   
+   RxError_ES.(d,clk)                                  = (RxError_node, Clock);
+   RxPacketError_Cnt.(clock,clk_en,cnt_en,sclr)        = (Clock, VCC, RxError_ES.q, RxPacketError_Cnt_REG_ES.q);
+   RxPacketError_Cnt_REG.(data[],clock, load, enable)  = (RxPacketError_Cnt.q[], BUS_Clock, VCC, RxPacketError_Cnt_REG_ES.q);
+   RxPacketError_Cnt_REG_ES.(d,clk)                    = (RxPacketError_Cnt_REG_CS AND Select, BUS_Clock);
+   
+   
+ 
+------------------------------------------- Tx section ------------------------------------------------- 
+   TxRQ_SRFF.(S,clk,R) = (InternalTxStart,Clock,TxRQ_Reset_ES.q OR Reset); 
+   TxByte_Cnt.(clock,clk_en,cnt_en,sclr) = (Clock,VCC, Byte_Strobe_Tx, InternalTxStart);
+   IF ((TxByte_Cnt.q[] >= PacketLenghts_at_signaling_layer-1) OR (TxByte_Cnt.q[] >= PacketLenghts_to_be_transmitted_Reg.q[11..0]))
+		THEN TxRQ_Reset	= VCC;
+		ELSE TxRQ_Reset	= GND;
+   END IF;
+   TxRQ_Reset_ES.(d,clk) = (TxRQ_Reset,Clock);
+    
+
+   TxRAM.data_a[7..0] = GND;  
+   TxRAM.(address_a[10..0]   , clock_a, wren_a) =
+         (TxByte_Cnt.q[10..0], Clock  , GND   ); 
+
+   TxRAM.(address_b[9..0] , clock_b  , data_b[15..0], wren_b  ) =
+         (AddrBus_In[9..0], BUS_Clock, DataBus_In[] , TxRAM_CS AND DataBusStrobe AND DirectIn AND Select); 
+   
+   
+   Transmit_of_Data_RQ = TxRQ_SRFF.q;
+   Tx_Data[] = TxRAM.q_a[];
+   
+   
+   
+   
+   IF ( (AddrBus_In[] >= 0) AND (AddrBus_In[] < 1024) ) 
+         THEN DataBusOut[] = TxRAM.q_b[];
+              TxRAM_CS     = VCC;    
+         ELSE TxRAM_CS     = GND;     
+   END IF;
+   IF ( (AddrBus_In[] >= 1024) AND (AddrBus_In[] < 2048) ) 
+         THEN DataBusOut[7..0] = RxRAM.q_b[15..8]; DataBusOut[15..8] = RxRAM.q_b[7..0];   --DataBusOut[] = RxRAM.q_b[]; 
+			  RxRAM_CS     = VCC;    
+         ELSE RxRAM_CS     = GND; 
+   END IF;
+   
+   IF (AddrBus_In[] ==  2048) THEN DataBusOut[]  = Status_REG.q[];
+                                   Status_REG_CS = VCC;  
+                              ELSE Status_REG_CS = GND; 
+   END IF;
+   IF (AddrBus_In[] ==  2049) 
+         THEN SetRxReadyToRecive = DataBusStrobe AND Select;
+         ELSE SetRxReadyToRecive = GND;
+   END IF;
+   IF (AddrBus_In[] ==  2050) 
+         THEN InternalTxStart    = DataBusStrobe AND Select;
+         ELSE InternalTxStart    = GND;
+   END IF;
+   IF (AddrBus_In[] ==  2051) THEN DataBusOut[] = PacketLenghts_to_be_transmitted_Reg.q[];
+                                   PacketLenghts_to_be_transmitted_Reg_CS = VCC;
+                              ELSE PacketLenghts_to_be_transmitted_Reg_CS = GND;
+   END IF;
+   IF (AddrBus_In[] ==  2052) THEN DataBusOut[] = RxPacketError_Cnt_REG.q[];
+                                   RxPacketError_Cnt_REG_CS = VCC;
+                              ELSE RxPacketError_Cnt_REG_CS = GND;
+   END IF;
+   
+   
+   Status_REG_ES.(d,clk) = (Status_REG_CS AND Select, Clock);
+   Status_REG.(clock, load, enable) = (BUS_Clock, VCC, Status_REG_ES.q);
+   Status_REG.data[RxByte_Cnt_Width..0]    = RxByte_Cnt.q[];
+   Status_REG.data[RxByte_Cnt_Width+1]     = RxPacket_in_progress;
+   Status_REG.data[RxByte_Cnt_Width+2]     = RxReadyToRecive.q;
+   Status_REG.data[RxByte_Cnt_Width+3]     = TxRQ_SRFF.q;
+   Status_REG.data[15..RxByte_Cnt_Width+4] = GND;
+   
+   
+   PacketLenghts_to_be_transmitted_Reg.(data[],clock, load, enable) = (DataBus_In[15..0], BUS_Clock, VCC, PacketLenghts_to_be_transmitted_Reg_CS AND DataBusStrobe AND DirectIn AND Select );
+
+END;

@@ -1,0 +1,249 @@
+TITLE "Data transmission to ethernet PHY or LANC";
+---------------------------------------------------------------------
+-- Version 1.0, 
+-- Copyright Arkady Selivanov, November 19, 1998
+-- You may use or distribute this function freely,
+-- provided you do not remove this copyright notice.
+-- If you have questions or comments, feel free to
+-- contact me by email at a.n.selivanov@inp.nsk.su 
+-- World Wide WEB: http://WWW.INP.NSK.SU/~seliv
+---------------------------------------------------------------------
+-- This module can be used to transmit data block via :
+--
+-- a. Ethernet Interface Adapter (tested with LXT905, LevelOne inc.).
+-- b. Ethernet LAN Controller    (tested with  82557, Intel).
+-- 
+--# Flag _EtxInPro_ must control pin TEN (transmit enable) in case a.
+--# Flag _EtxInPro_ must control pin CRS (carrier sense)   in case b.
+-- Transmission starts after _EtxGo_ input high level is detected with
+-- ethernet preamble at the beginning and _EtxInPro_ flag is asserted.
+-- Data source must provide next data byte at _Di[7..0]_ not later
+-- then 7 _clock_ periods interval after _EtxRdy_ flag pulse.
+-- Transmission stops after _EtxGo_ input low level is detected in 
+-- next sequence 1. last data byte serialization is completed.
+--			     2. CRC32 bytes transmission.
+--				 3. _EtxInPro_ flag deletion.
+---------------------------------------------------------------------
+
+INCLUDE "uni_shift_gt.inc";
+INCLUDE "lpm_counter.inc";
+INCLUDE "crc32eth4.inc";
+INCLUDE "Edge_Sensing_Sync.inc";
+INCLUDE "lpm_shiftreg.inc";
+
+
+CONSTANT PREAMBLE 	= b"01010101";
+CONSTANT JK_BYTE	= b"11010101";
+
+
+SUBDESIGN Tx_Eth100_Sync
+(
+-- Interface to System
+	System_Clock 				: INPUT;	-- FPGA Logic Clock.
+	
+	Reset 			: INPUT;	-- Reset at System_Clock
+	Transmit_of_Data_RQ			: INPUT;	-- While it's active, we transmitting data.
+	Data_to_Transmit[7..0]		: INPUT;	-- External incomming data Byte, buffered to MII_Eth_Tx_CLK
+	Byte_Readed_Strob			: OUTPUT;	--System_Clock referenced aknolege (1T clock)
+	Eth_Tx_In_Progress			: OUTPUT;	-- Transmittion is in progress(flag), System_Clock referenced
+	TxClk_Edge_at_System_Clock	: OUTPUT;	--Implicit timing of external packet-shaping logic
+
+	-- Interface to Phy device IC
+	MII_Tx_CLK				: input; 			-- Phy IC clock
+	MII_Tx_En	 			: OUTPUT;	-- Transmittion's in progress(flag).		(to i82555)
+	MII_Tx_Data[3..0] 		: OUTPUT;	-- Data Nibble.					(to i82555)
+-- No collision detect in mind
+	
+	--Old signals
+	EtxRdy 			: OUTPUT;	-- Ready to work out next byte(flag) - (not really data sampled!!!)
+	crc_out			: OUTPUT;	-- CRC32 Transmition (flag).
+	
+	-- Debug used
+	Frame_Started_Strobe 	: OUTPUT;
+	TX_PHASE_VP[3..0]		: OUTPUT;
+	Data_is_available		: OUTPUT;
+	Load_Data_to_Shift_Reg	: OUTPUT;
+	CRC_check_out[31..0]	: OUTPUT;
+
+)
+VARIABLE
+--Added items
+	TxClk_Edg_at_System_Clock	:	Edge_Sensing_Sync;
+	Input_Data_Buffer			:	lpm_shiftreg with (lpm_width=8);
+	Next_byte_Rq				:	Edge_Sensing_Sync;
+	Start_Frame_Strob			:	Edge_Sensing_Sync;
+	--Old 
+	EtxDat[3..0]		: dffe;
+	EtxInPro			: dffe;
+	Fast_Out_Buff[4..0]	:	DFF;	--	Fast_Out, 3..0 - data, 4 - Tx_En
+	
+	shift_reg		: uni_shift_gt 	-- Shift Register (8 to 4).
+						WITH (N_IN = 8, N_OUT = 4, DIRECTION = "RIGHT", INVERT = "OFF");	
+	tx_phase		: lpm_counter 	-- Transmition phase (byte counter)(For Preamble & SFD & CRC).
+						WITH (LPM_WIDTH=4);
+	crc32			: crc32eth4;
+	nibble_cnt		: dffe;			-- counter of nibbles in byte.
+	progress		: srffe;			-- Progress indicator flag.
+	sm				: MACHINE  WITH STATES (S_IDLE, S_PREAMBLE, S_JK, S_DATA, S_CRC, S_ERR);-- Should be one Hot!!!
+--	sm				: MACHINE OF BITS (q[4..0]) WITH STATES 
+--					(	S_IDLE			= h"0",	 	
+--						S_PREAMBLE		= h"1",		-- 0
+--						S_JK			= h"2",		-- 1-st
+--						S_DATA			= h"4",		-- 2-nd
+--						S_CRC			= h"8", 	-- 3-rd
+--						S_ERR			= h"10"		-- 4-th		Возможно, по-идее, только в начальный момент.
+--					);	
+	crc_ena_f		: srffe;
+--	start_n			: node;
+	end_n			: node;
+	idle_n			: node;
+	
+		
+BEGIN
+	DEFAULTS
+		tx_phase.cnt_en		= gnd;
+		end_n				= gnd;
+		crc_ena_f.s			= gnd;
+		crc_ena_f.r			= gnd;
+		crc32.reset			= gnd;
+		crc32.write			= gnd;
+		Load_Data_to_Shift_Reg	= gnd;
+	END DEFAULTS;
+
+
+--Start_Frame_RQ	=	Start_Frame_RQ;
+-- TX_CLK phase should be adjusted
+--TxClk_Edg_at_System_Clock.(clk,d)	=	(System_Clock, MII_Tx_CLK);
+TxClk_Edg_at_System_Clock.(clk,d)	=	(System_Clock, (DFF(.clk=System_Clock, .d=MII_Tx_CLK)));
+
+TxClk_Edge_at_System_Clock	=	(DFF(.clk=System_Clock, .d=TxClk_Edg_at_System_Clock.q));
+
+Data_is_available	=	DFFE(.clk=System_Clock, .ena=TxClk_Edge_at_System_Clock, .d=Transmit_of_Data_RQ); -- resync version of Start_Frame_RQ, EtxGo 
+
+--	idle_n	= !(sm.q0 # sm.q1 # sm.q2 # sm.q3 # sm.q4);
+	idle_n	= sm.S_IDLE;
+
+
+progress.(S, clk, R, ena)	=	(Transmit_of_Data_RQ, System_Clock, (end_n OR Reset), TxClk_Edge_at_System_Clock);
+EtxInPro.(d, clk,    ena)	=	(progress.q,     System_Clock,                   TxClk_Edge_at_System_Clock);
+Frame_Started_Strobe = Start_Frame_Strob.q;
+Start_Frame_Strob.(d, clk,    ena)	=	(Transmit_of_Data_RQ,     System_Clock,       TxClk_Edge_at_System_Clock);
+
+
+Eth_Tx_In_Progress = EtxInPro.q;
+
+Input_Data_Buffer.(clock, data[], load, enable)=(System_Clock, Data_to_Transmit[], VCC, Next_byte_Rq.q);
+
+
+
+--# Nibble counter (VCC - last nibble of the byte). ---------------------------
+	nibble_cnt.(d, clk, ena)	=	((!nibble_cnt.q AND !Start_Frame_Strob.q) or idle_n, System_Clock, TxClk_Edge_at_System_Clock);
+
+	Next_byte_Rq.(clk, d)		=	(System_Clock, Load_Data_to_Shift_Reg);--Edge_Sensing_Sync
+	Byte_Readed_Strob	=	Next_byte_Rq.q;	-- now referenced to real data load, not dummy as EtxRdy is
+	
+	EtxRdy = !nibble_cnt.q & sm.S_DATA; -- now ignored
+
+
+
+--# Shift register. -----------------------------------------------------------	
+-- No Reset needed.
+shift_reg.(clock, enable, load)	=	(System_Clock, TxClk_Edge_at_System_Clock, nibble_cnt.q);
+
+
+
+--# Crc counter. --------------------------------------------------------------
+	crc32.clock 	= System_Clock; --MII_Tx_CLK;
+	crc32.enable	= TxClk_Edge_at_System_Clock;--vcc; %progress.q or start_n;%
+	crc32.in3 		= shift_reg.out0;
+	crc32.in2 		= shift_reg.out1;
+	crc32.in1 		= shift_reg.out2;
+	crc32.in0 		= shift_reg.out3;
+	crc_out = sm.S_CRC;
+	CRC_check_out[31..0]	=	crc32.out[31..0];
+
+	-- Reset & write are in the state machine.
+
+--# The main state-machine logic. ---------------------------------------------
+	tx_phase.clock 	= System_Clock;--MII_Tx_CLK;
+	tx_phase.sclr = Reset # end_n;
+	-- 'enable' is in the state machine.
+TX_PHASE_VP[]	=	tx_phase.q[];
+
+	sm.clk = System_Clock;
+	sm.ena = nibble_cnt.q and TxClk_Edge_at_System_Clock;
+	
+	CASE sm IS
+		WHEN S_IDLE =>
+			IF (Data_is_available) THEN
+				shift_reg.data[] = PREAMBLE;
+				sm = S_PREAMBLE;
+				tx_phase.cnt_en =   TxClk_Edge_at_System_Clock;--vcc;
+			END IF;
+
+		WHEN S_PREAMBLE =>
+			tx_phase.cnt_en = nibble_cnt.q and TxClk_Edge_at_System_Clock;--;
+			IF(tx_phase.q[]==8) THEN
+				shift_reg.data[] = JK_BYTE;
+				sm = S_JK;
+			ELSIF(tx_phase.q[] < 8) THEN
+				shift_reg.data[] = PREAMBLE;
+			ELSE
+				sm = S_ERR;
+			END IF;
+
+		WHEN S_JK	=> 			
+			tx_phase.cnt_en = nibble_cnt.q and TxClk_Edge_at_System_Clock;--;
+			sm = S_DATA;
+			crc32.reset = nibble_cnt.q ;
+			shift_reg.data[] = Input_Data_Buffer.q[];--EtxDi[];
+		Load_Data_to_Shift_Reg	=	nibble_cnt.q;-- # start_n;
+
+		WHEN S_DATA	=> 
+			if(!Data_is_available) THEN
+				sm = S_CRC;
+				crc_ena_f.s = nibble_cnt.q;
+				crc32.write = vcc;
+				tx_phase.cnt_en = nibble_cnt.q and TxClk_Edge_at_System_Clock;--;
+			ELSE
+				crc32.write = vcc;
+				shift_reg.data[] = Input_Data_Buffer.q[];--EtxDi[];
+		Load_Data_to_Shift_Reg	=	nibble_cnt.q;-- # start_n;
+
+			END IF;
+
+		WHEN S_CRC	=> 				
+			IF(tx_phase.q[]==14)THEN
+				crc_ena_f.r	= nibble_cnt.q;
+				sm 		= S_IDLE;
+				end_n	= nibble_cnt.q and TxClk_Edge_at_System_Clock;--;
+			ELSIF(tx_phase.q[]<14 & tx_phase.q[]>9) THEN
+				tx_phase.cnt_en = nibble_cnt.q and TxClk_Edge_at_System_Clock;--;
+			ELSE
+				sm = S_ERR;
+			END IF;
+
+		WHEN OTHERS	=>	% в том числе и S_ERR %
+			IF(!Data_is_available) THEN
+				sm = S_IDLE;
+			END IF;
+	END CASE;
+
+--# Мультиплексирование выводов. ----------------------------------------------
+	EtxDat[].(clk, ena) 	=	(System_Clock, TxClk_Edge_at_System_Clock);
+	crc_ena_f.(clk, ena) 	=	(System_Clock, TxClk_Edge_at_System_Clock); --SRFFE
+	FOR i IN 3 TO 0 GENERATE
+		EtxDat[i].d = (crc32.out[31-i] & crc_ena_f.q ) OR (shift_reg.out[i] & !crc_ena_f.q );
+		Fast_Out_Buff[i].d	=	EtxDat[i].q;
+	END GENERATE;
+	
+	
+	-- Fast_buff length should be adjusted to ensure 12ns setup time and 0ns hold time to MII_Tx_CLK
+	-- of Phy device, depending of TX_CLK phase sampling method
+	Fast_Out_Buff[].clk	=	System_Clock;
+-----------------------------------------------------
+	MII_Tx_Data[3..0]	=	Fast_Out_Buff[3..0].q;
+	MII_Tx_En			=	Fast_Out_Buff[4].q;   Fast_Out_Buff[4].d	=	EtxInPro.q;
+
+	
+END;

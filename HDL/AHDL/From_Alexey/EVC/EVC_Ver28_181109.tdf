@@ -1,0 +1,396 @@
+TITLE "EVC_Ver28_181109" ;
+
+%
+This is reduced version module to control behavior of FPGA-internal sequence logic. 
+		What is reduced?
+	1. Event Time Command Set inputs. Ver23 re-entrance this functionality
+	2. Klukwa collaborator I/O.
+	3. Fast bypass channel control.
+	4. Asynchronouse Link control.
+New functionality of Dead_Time 
+Wait;Work;Stop_at_Brakes;Dead_Time;
+
+%
+
+INCLUDE "lpm_counter.inc"  ;
+INCLUDE "lpm_shiftreg.inc";
+INCLUDE "Edge_Sensing.inc" ;
+INCLUDE "Pulse_Width_Shaper.inc";
+
+CONSTANT WORD_WIDTH				= 16 ; -- ?acia? neiaa aaiiuo
+
+-- Parameters to be edited by Module User
+Constant RefClock				= 175 ; -- MHz, Cavity Clock speed
+
+Constant SubEventNumber			=	9; -- Time stemps inside Event, to be edited by Module User
+-- Constant Watch_Dog_Value        = 17500; -- 100us@175MHz   10000 ; -- 100us @100MHz RefClock
+Constant Watch_Dog_Value_Nova_only	=	75; -- 60us to read Event data with Nova DAQ
+Constant Watch_Dog_Value_CAMAC_Brake = 5000; -- 5ms to read Event data with CAMAC 
+Constant CAMAC_Brake_Release_Dead_Time	=	2000;--150; -- 750 ns, 2us normal value
+
+SUBDESIGN EVC_Ver28_181109
+(  
+-- Standard Bus Signals
+	Bus_Clock					: input  ; -- частота работы модул€ (25..125ћ√ц). Main clock, assumed F_link x 4 = 100MHz
+	Reset_Ext					: input=gnd ; -- Common FPGA signal Reset (Active HIGH)
+	DataBusIn[WORD_WIDTH-1..0]  : input  ; -- 
+	DataBusOut[WORD_WIDTH-1..0] : output ; -- 
+	DataBusStrobe				: input  ; -- no?ia i?eaia/ia?aaa?e aaiiuo ia?o?o (aunieee o?iaaiu, cauaeeeaaai ii caaiaio o?iioo)
+
+-- Slave Mode Signals	-- eniieucoaony i?e ?aaioa aaiiiai Iiaoey a ?a?eia Slave
+    AddrBusIn[7..0]				: input  ; -- oeia aa?ana aey ainooia a i?ino?ainoai iaiyoe
+	Select						: input  ; -- Module Select from External Address Comparator
+	DirectIn					: input  ; -- iai?aaeaiea ia?aaa?e aaiiuo ia oeio EAIAE
+-- Standard Bus Signals End
+
+
+----------------  Function Specific Signals
+
+	Cavity_Clock				: input ;
+
+	Time_Set_Command[7..0]		: input = GND;	-- Command from Event Manager
+	-- Time_Set_Command[0] Modifier for CLBR link's Start
+	-- Time_Set_Command[1] Modifier for Ordinar link's Start
+	-- Time_Set_Command[2] Modifier for CAMAC Brake
+	-- Time_Set_Command[3] Modifier for Klukwa Brake
+	-- Time_Set_Command[4] Modifier for Synchro_0 - synchro output desabled if bit=VCC
+	-- Time_Set_Command[5] Modifier for Synchro_1 - synchro output desabled if bit=VCC
+
+		--- Inputs to Start Event 
+	Internal_Start_request		: Input=GND  ;	-- Input from FPGA-internal devices to start (at positive edge)
+	Comb_FOR					: Input=GND  ;	-- Input from FPGA devices Combinatorial Fast Or Request
+	
+	Forward_Panel_In0			: input =GND ;	-- Off-System Inputs 
+	Forward_Panel_In1			: input =GND ;
+	
+	
+		--- Inputs to terminate Event
+    Busy_on_Link_Active		: Input=GND  ;	-- Possible to terminate Event Cycle at end of Link_Message (when falling edge occured)
+	Busy_on_Digitizing		: Input  ;		-- Possible to terminate Event Cycle at end of Digitizing (when falling edge occured)
+	Busy_on_Reloading		: Input=GND  ;	-- Possible to terminate Event Cycle at end of Status_Change (when falling edge occured)
+
+
+		--- Outputs to control Event Working Time Flow
+    Event					: Output ;    -- Event Working Time in progress, -- Event_Manager locks input 
+	Next_Event_Ena			: Output ;	--	EVM termenates PushEvent signal 
+	LAM						: Output ;		-- High If CAMAC-brakes active (enabled and switched ON)
+	
+	G5_78					: output; -- Mux'ed output
+	
+	Synchro_0				: output; -- Output to Scope, Forvard Panel or Test Pin
+	Synchro_1				: output; -- Output to Scope, Forvard Panel or Test Pin
+	Start_CLBR_Links		: output;
+	Start_ORDINAR_Links		: output;
+--------------  Serial Link & Time Control
+	Error  					: output ; -- Time Out, 2 type
+	Cavity_Refrensed_1us_period_Pulse	: output;
+	Cavity_Refrensed_1ms_period_Pulse	: output;
+	
+	
+	Test1					: output ;
+	Test2					: output ;
+	Test3					: output ;
+)
+
+VARIABLE
+----------- Event Cycle Main Loop section Begin
+		Triggering_Master		: SRFF ; -- Main Event Cycle loop control
+		Triggering_Master_Leading_Edge	: Edge_Sensing ;
+		Main_CNT				: lpm_counter WITH ( LPM_WIDTH = WORD_WIDTH ) ;
+		Control_Reg				: lpm_shiftreg WITH ( LPM_WIDTH = WORD_WIDTH ) ;
+		
+		SubEvent[SubEventNumber-1..0]		: node ;
+		SubEvent_Reg[SubEventNumber-1..0]	: lpm_shiftreg WITH ( LPM_WIDTH = WORD_WIDTH ) ;
+
+	--	Dead_Time Control
+			Dead_Time			: node;
+			Min_DT_Shaper		: Pulse_Width_Shaper with (Duration=500, RefClock=RefClock);
+----------- Event Cycle Main Loop section End
+		
+--	Start sourses
+	--	Release__Time_Ready			: Edge_Sensing ;
+	--	BLK_EOC_In_ES				: Edge_Sensing ;
+	--	Data_Comm_In_ES				: Edge_Sensing ;
+		Comb_FOR_ES					: Edge_Sensing ;
+	--	Flt_Async_ES				: Edge_Sensing ;
+		Internal_Start_request_ES	: Edge_Sensing ;
+	Internal_Start						: node ;
+--	External_Start						: node ;
+	Forward_Panel_Start0				: Edge_Sensing ;
+	Forward_Panel_Start1				: Edge_Sensing ;
+
+-- Stopping conditition
+		Reset						: node;
+		End_of_Event				: node;
+		SubEvents_Done		: node;		
+--		End_of_Conversion			: Edge_Sensing ; --Shaping at end of "Busy_on_Digitizing"
+--		All_Busy_Released			: Edge_Sensing ; --Shaping at end of Busy_
+		Busy_on_Dig_End				: Edge_Sensing ; --Shaping at end of Busy_
+		Any_Busy_Flag				: node;
+
+
+---------------------------Spesial brakers
+
+		
+-- CAMAC brake, to be used at Work Stations conditition
+		CAMAC_Brake_Ena			: node; -- Bit[4] of Control Reg OR -- Time_Set_Command[2] Modifier for CAMAC Brake
+		CAMAC_Brake_Flag		: SRFF ; 			-- Event Step-by-step control from CAMAC
+		Release_CAMAC_Brake		: Edge_Sensing ;	-- Clear CAMAC_Brake_Flag, by resynchronize bit5 from Bus_Clock to Cavity_Clock 
+Release_CAMAC_Brake_DT			: Pulse_Width_Shaper with (Duration=CAMAC_Brake_Release_Dead_Time, RefClock=RefClock);	-- Delay to deglitch CAMAC dataway operation
+
+-- Klukwa brake, to be used at Work Stations conditition
+	--	Klukwa_Brake_Ena		: node; -- Bit[6???] of Control Reg OR Time_Set_Command[3] Modifier for Klukwa Brake
+	--	Klukwa_Brake_Flag		: SRFF	;-- Event Step-by-step control from Klukwa
+	--	Release_Klukwa_Brake	: Edge_Sensing ;
+--	Release_CAMAC_Brake_DT		: Pulse_Width_Shaper with 		
+
+-- Deglitching flip-flops
+
+-- Timers for Event Simulating 
+		T_1us_Presc_CNT						:lpm_counter WITH ( LPM_WIDTH = 8 ) ;-- Up to 250MHz RefClock
+		T_1ms_Presc_CNT						:lpm_counter WITH ( LPM_WIDTH = 10 ) ;-- Down to 1kHz  scale
+		Cavity_Refrensed_1us_period_Pulse_	:node;
+		Cavity_Refrensed_1ms_period_Pulse_	:node;
+
+		Sim_Prescaler_cmp		: node ; -- comparator output	
+		Sim_Timer				: lpm_counter WITH ( LPM_WIDTH = WORD_WIDTH ) ;
+		Sim_Time_cmp			: node ; -- comparator output
+		Sim_Time_Request		: node  ; -- Resync of comparator output
+		Sim_Period_Reg			: lpm_shiftreg WITH ( LPM_WIDTH = WORD_WIDTH ) ;
+
+--		Sim_Prescaler			: lpm_counter WITH ( LPM_WIDTH = 12 ) ; -- Up to 250MHz RefClock
+
+-- Registers 	
+
+		Watch_Dog_Timer						: lpm_counter WITH ( LPM_WIDTH = WORD_WIDTH ) ;
+		Watch_Dog_Time_cmp,Watch_Dog_Time_cmp_1,Watch_Dog_Time_cmp_2          : node ; -- comparator output
+		Time_Out							: node ; -- dff'ed comparator output
+		
+		DataBusOut_Reg[WORD_WIDTH-1..0]		: DFF;
+		DataBusOut_[WORD_WIDTH-1..0]		: node;
+		
+		End_of_Command_List_Bus_Clk		: node;	--Command List access to Addr==20 
+		End_of_Reading			: Edge_Sensing ; --Command List access to Addr==20 , Cavity_Clock
+BEGIN
+
+
+
+----------------------- Specific Logic Section Begin
+
+ 
+-- Main Flag of Event Control  Section Begin ------------------------------------------
+Test1 = CAMAC_Brake_Flag.q;--Cavity_Refrensed_1us_period_Pulse_;--Triggering_Master.q ;
+Test2 = Release_CAMAC_Brake.q ;
+
+
+Event			=	(Triggering_Master.q OR Dead_Time) and !Reset ;  -- Main OUTPUT Signal; Gating is on while CAMAC Step-by-Step
+-- It's positive edge lock EventManager, nagative edge unlock
+Next_Event_Ena	=	Dead_Time;
+
+Reset=Reset_Ext;
+--Triggering_Master.q == VCC if Work,Stop,some part of Dead_Time
+--Triggering_Master.q == GND if some part of Dead_Time, Wait
+
+Triggering_Master.S	  =  (Internal_Start ) AND  ! (Reset OR Dead_Time OR (SubEvent_Reg[0].q[]==GND)) ; -- Begin Cycle from External OR Internal sources
+Triggering_Master.R	  =  End_of_Event; 
+Triggering_Master.clk =  Cavity_Clock ;
+Triggering_Master_Leading_Edge.(clk, d)=	(Cavity_Clock, Triggering_Master.q);
+
+-- Main Flag of Event Control Section End --------------------------------------------
+End_of_Event	=	SubEvents_Done OR Time_Out or Reset;
+
+Error = Time_Out OR (Any_Busy_Flag and SubEvents_Done);  -- Error if Event is not properly termenated
+--------
+--------------------------------- Gating & Braking Control section
+Dead_Time	=		Min_DT_Shaper.PulseOut
+							OR
+					(CAMAC_Brake_Flag.q 
+							OR 
+					Release_CAMAC_Brake_DT.PulseOut) ;
+							--OR
+					-- (Klukwa_Brake_Flag.q AND Control_Reg.q[6])	;
+					
+
+Min_DT_Shaper.(Event, Clock)	=	(SubEvents_Done OR Time_Out, Cavity_Clock);-- Minimum Dead_Time 500ns
+
+--  Single Step Control to CAMAC 
+	CAMAC_Brake_Ena	=	Control_Reg.q[4] OR Time_Set_Command[2];
+
+	CAMAC_Brake_Flag.S	= CAMAC_Brake_Ena AND DFF(.d=(Triggering_Master_Leading_Edge.q ), .clk=Cavity_Clock);  -- Lock/Unlock Single Event 
+	CAMAC_Brake_Flag.(R, clk)	= ((Release_CAMAC_Brake_DT.PulseOut OR !CAMAC_Brake_Ena OR Time_Out), Cavity_Clock);  -- Lock/Unlock Single Event 
+	
+		Release_CAMAC_Brake.(clk, d)	=	(Cavity_Clock, Control_Reg.q[5]);  -- Resynchronize from Bus_Clock to Cavity_Clock   
+		
+		Release_CAMAC_Brake_DT.(Event, Clock)	=	(((Release_CAMAC_Brake.q OR End_of_Reading.q)
+														AND CAMAC_Brake_Ena), 
+														Cavity_Clock);-- Shaping 5us dead time
+	
+LAM	=	CAMAC_Brake_Flag.q ;
+			   
+--	Step-by-step control to Klukwa
+--	CAMAC_Brake_Ena	=	Control_Reg.q[6] OR Time_Set_Command[3];
+--	Klukwa_Brake_Flag.S	=	DFF(.d=Triggering_Master_Leading_Edge.q, .clk=Cavity_Clock); 
+--	Klukwa_Brake_Flag.(R, clk)	=
+	
+		
+-- Loop & Braking Control section end 
+--------
+
+
+--- Start inputs Control
+	--		External_Start	=	pFLT_M	;	-- Main INPUT Signal from Hardware Fast Bypass Triggering Circuit
+
+-- Enable Control of Internal Starts 
+		Case Control_Reg.q[3..0] is
+			WHEN 0 => Internal_Start =	Internal_Start_request_ES.q; --  Start from Event Manager
+			WHEN 1 => Internal_Start =	Comb_FOR_ES.q ;				-- Start from FOR Controller
+			WHEN 5 => Internal_Start =	Sim_Time_Request;			-- Automatic Start
+			WHEN 9 => Internal_Start =	Forward_Panel_Start0.q;		-- Start 
+			WHEN 10=> Internal_Start =	Forward_Panel_Start1.q;		-- Start 
+			WHEN 11=> Internal_Start =	Forward_Panel_Start0.q OR Forward_Panel_Start1.q;		-- Start from 
+			WHEN Others  => Internal_Start = GND ;				-- Do not allow internal starts
+		End Case;
+-- Resynchronize and shape of input start sources
+				Internal_Start_request_ES.(d, clk)	=	(Internal_Start_request AND !Dead_Time,	Cavity_Clock);
+				Comb_FOR_ES.(d, clk)				=	(Comb_FOR,								Cavity_Clock);
+				Forward_Panel_Start0.(d, clk)		=	(Forward_Panel_In0, 					Cavity_Clock);
+				Forward_Panel_Start1.(d, clk)		=	(Forward_Panel_In1, 					Cavity_Clock);
+
+-- Stopping sources -- Looking for Event Desable Condition
+-- When ALL Event Desable Condition are ended, Triggering_Master may be Resetted
+--All_Busy_Released.(d, clk) = (! Any_Busy_Flag, Cavity_Clock) ; -- Asynchronouse Request to terminate Event,  Edge_Sensing
+-- End_of_Event	=	All_Busy_Released.q OR Time_out ;
+Any_Busy_Flag	=	Busy_on_Digitizing OR Busy_on_Link_Active OR Busy_on_Reloading ;
+
+
+
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+
+-- Built-In-Event Time Control, Signaling Layer
+Main_CNT.(clock, sclr, cnt_en)	=	(Cavity_Clock, !Triggering_Master.q, VCC );
+
+For i in 0 to SubEventNumber-1 generate -- subevent comparators
+--IF ((Main_CNT.q[]==SubEvent_Reg[i].q[]) and !(SubEvent_Reg[0].q[]==GND)) Then SubEvent[i]=VCC; Else SubEvent[i]=GND; end if;
+SubEvent[i]=DFF(.clk=Cavity_Clock, .d=(Main_CNT.q[]==SubEvent_Reg[i].q[])) and DFF(.clk=Cavity_Clock, .d=!(SubEvent_Reg[0].q[]==GND));
+end generate;
+
+SubEvents_Done	=	SRFF(.S=SubEvent[0], .R=DFF(.d=End_of_Event,.clk=Cavity_Clock), .clk=Cavity_Clock); -- 
+
+Synchro_0	=	SRFF(.S=(SubEvent[1] AND !Time_Set_Command[4]), .R=(SubEvent[2] OR End_of_Event), .clk=Cavity_Clock);
+Synchro_1	=	SRFF(.S=(SubEvent[3] AND !Time_Set_Command[5]), .R=(SubEvent[4] OR End_of_Event), .clk=Cavity_Clock);
+% -- Digitizer Board's signal layout
+Start_0		=	SRFF(.S=SubEvent[5], .R=End_of_Event, .clk=Cavity_Clock);
+Start_1		=	SRFF(.S=SubEvent[6], .R=End_of_Event, .clk=Cavity_Clock);
+Fast_Trigg_Sim		=	SRFF(.S=SubEvent[7], .R=End_of_Event, .clk=Cavity_Clock); 				-- Simulate Fast Trigg (Common Stop) in bypass 
+Analog_Window =	SRFF(.S=SubEvent[8], .R=Busy_on_Dig_End.q OR End_of_Event, .clk=Cavity_Clock); 	-- Release Analog Part at End of Digitizing
+%
+-- MChS board's signal
+Start_CLBR_Links	=	SRFF(.S=((SubEvent[5] AND !Time_Set_Command[0]) OR (SubEvent[6] AND Time_Set_Command[0])), .R=End_of_Event, .clk=Cavity_Clock);
+Start_ORDINAR_Links	=	SRFF(.S=((SubEvent[7] AND !Time_Set_Command[1]) OR (SubEvent[8] AND Time_Set_Command[1])), .R=End_of_Event, .clk=Cavity_Clock);
+
+-- Hardware Fast Bypass Triggering Circuit Control, T2Q, TQ, MCHs_on_T2Q etc.
+	Busy_on_Dig_End.(d, clk)	=	(! Busy_on_Digitizing, Cavity_Clock) ;   -- Edge_Sensing
+	
+	
+	
+---------------------------------------------------------------------------------
+---------------------------------------------------------------------------------
+
+
+
+-- Extended Control for Synchro
+Case Control_Reg.q[14..12] is
+	WHEN 1 =>  G5_78	=  Triggering_Master.q ;
+	WHEN 2 =>  G5_78	=  Release_CAMAC_Brake_DT.PulseOut;
+	WHEN 3 =>  G5_78	=  Synchro_0;
+	WHEN 4 =>  G5_78	=  Synchro_1;
+--	WHEN 5 =>  G5_78	=  Start_0;
+--	WHEN 6 =>  G5_78	=  Start_1;
+	WHEN 5 =>  G5_78	=  Start_CLBR_Links;
+	WHEN 6 =>  G5_78	=  Start_ORDINAR_Links;
+	WHEN 7 =>  G5_78	=  Comb_FOR ;
+	
+	WHEN Others  =>  G5_78	= GND ;
+End Case;	
+	
+-- Specific Logic Section End
+
+
+
+-------------------------------------- Registers connections Section Begin
+
+
+
+Control_Reg.(data[], clock, load)			=	(DataBusIn[], Bus_Clock, VCC );
+Sim_Period_Reg.(data[], clock, load)		=	(DataBusIn[], Bus_Clock, VCC );
+--Release_Period_Reg.(data[], clock, load)	=	(DataBusIn[], Bus_Clock, VCC );
+for i in 0 to SubEventNumber-1 generate SubEvent_Reg[i].(data[], clock, load)	=	(DataBusIn[], Bus_Clock, VCC);end generate;
+
+-- End of CAMAC_Brake, USB_Brake at end of event data reading 
+End_of_Command_List_Bus_Clk=DFF(.d=((AddrBusIn[7..0]==20) and Select), .clk=Bus_Clock);
+End_of_Reading.(clk, d)			=	(Cavity_Clock, End_of_Command_List_Bus_Clk);
+Case AddrBusIn[7..0] is 
+--for i in 0 to OldRegNumber-1 generate
+When 0  => DataBusOut_[]=Control_Reg.q[];			Control_Reg.enable		=( Select AND DirectIn AND DataBusStrobe );
+When 1  => DataBusOut_[]=Sim_Period_Reg.q[]; 		Sim_Period_Reg.enable	=( Select AND DirectIn AND DataBusStrobe );
+--When 2 => DataBusOut_[]=Release_Period_Reg.q[]; 	Release_Period_Reg.enable	=( Select AND DirectIn AND DataBusStrobe );
+When 8  => DataBusOut_[]=SubEvent_Reg[0].q[]; 	SubEvent_Reg[0].enable	=( Select AND DirectIn AND DataBusStrobe );
+When 9  => DataBusOut_[]=SubEvent_Reg[1].q[]; 	SubEvent_Reg[1].enable	=( Select AND DirectIn AND DataBusStrobe );
+When 10 => DataBusOut_[]=SubEvent_Reg[2].q[];	SubEvent_Reg[2].enable	=( Select AND DirectIn AND DataBusStrobe );
+When 11 => DataBusOut_[]=SubEvent_Reg[3].q[];	SubEvent_Reg[3].enable	=( Select AND DirectIn AND DataBusStrobe );
+When 12 => DataBusOut_[]=SubEvent_Reg[4].q[]; 	SubEvent_Reg[4].enable	=( Select AND DirectIn AND DataBusStrobe );
+When 13 => DataBusOut_[]=SubEvent_Reg[5].q[];	SubEvent_Reg[5].enable	=( Select AND DirectIn AND DataBusStrobe );
+When 14 => DataBusOut_[]=SubEvent_Reg[6].q[]; 	SubEvent_Reg[6].enable	=( Select AND DirectIn AND DataBusStrobe );
+When 15 => DataBusOut_[]=SubEvent_Reg[7].q[]; 	SubEvent_Reg[7].enable	=( Select AND DirectIn AND DataBusStrobe );
+When 16 => DataBusOut_[]=SubEvent_Reg[8].q[]; 	SubEvent_Reg[8].enable	=( Select AND DirectIn AND DataBusStrobe );
+When others =>DataBusOut_[]=GND;Control_Reg.enable=GND;Sim_Period_Reg.enable=GND;SubEvent_Reg[].enable=GND;
+end Case ;
+DataBusOut[]=DataBusOut_Reg[].q; DataBusOut_Reg[].clk=Bus_Clock; DataBusOut_Reg[].d=DataBusOut_[];
+
+--------------------------------------- Registers connections Section End
+
+------------------- Counters background connections Section Begin
+
+--------Simulation Scaler
+Sim_Time_cmp	=	DFF(.clk=Cavity_Clock, .d=(Sim_Period_Reg.q[] == Sim_Timer.q[] ));
+Sim_Timer.(clock, cnt_en, sclr)	 = (Cavity_Clock, Sim_Prescaler_cmp, Sim_Time_cmp); -- Toggles at prescaler freq, Self Reload
+Sim_Time_Request	=	Sim_Time_cmp;--DFF(.clk=Cavity_Clock, .d=Sim_Time_cmp);
+-------
+-- Prescaler --> It gives 1us or 1 ms Prescaler clock if RefClock in MHz
+Sim_Prescaler_cmp=	(Cavity_Refrensed_1us_period_Pulse_	and !Control_Reg.q[15])
+					OR 
+					(Cavity_Refrensed_1ms_period_Pulse_	and  Control_Reg.q[15]);
+
+----------System Scalers
+T_1us_Presc_CNT.(clock, sclr)	=	(Cavity_Clock, Cavity_Refrensed_1us_period_Pulse_);-- Prescaler 
+Cavity_Refrensed_1us_period_Pulse_=DFF(.clk=Cavity_Clock, .d=(T_1us_Presc_CNT.q[]==(RefClock - 2)));
+Cavity_Refrensed_1us_period_Pulse=Cavity_Refrensed_1us_period_Pulse_;
+
+T_1ms_Presc_CNT.(clock, sclr, cnt_en)	=	(Cavity_Clock, Cavity_Refrensed_1ms_period_Pulse_, Cavity_Refrensed_1us_period_Pulse_);-- Prescaler 
+Cavity_Refrensed_1ms_period_Pulse_=DFF(.clk=Cavity_Clock, .d=(T_1ms_Presc_CNT.q[]==999 AND Cavity_Refrensed_1us_period_Pulse_));
+Cavity_Refrensed_1ms_period_Pulse=Cavity_Refrensed_1ms_period_Pulse_;
+
+-------
+
+------------------------Watch_Dog section
+Watch_Dog_Time_cmp_1=DFF(.clk=Cavity_Clock, .d=(Watch_Dog_Timer.q[] == Watch_Dog_Value_Nova_only));
+Watch_Dog_Time_cmp_2=DFF(.clk=Cavity_Clock, .d=(Watch_Dog_Timer.q[] == Watch_Dog_Value_CAMAC_Brake));
+	CASE CAMAC_Brake_Ena	IS
+		When 0	=>	Watch_Dog_Time_cmp=Watch_Dog_Time_cmp_1;
+					Watch_Dog_Timer.sclr=! Triggering_Master.q;
+		When 1	=>	Watch_Dog_Time_cmp=Watch_Dog_Time_cmp_2;
+					Watch_Dog_Timer.sclr= (!CAMAC_Brake_Flag.q) OR Watch_Dog_Time_cmp_2;
+	END CASE;
+--Watch_Dog_Timer.( clock, sclr )		= (Cavity_Clock, ! Triggering_Master.q ) ;
+Watch_Dog_Timer.clock		= Cavity_Clock ;
+Watch_Dog_Timer.cnt_en		= (! Watch_Dog_Time_cmp) AND Cavity_Refrensed_1us_period_Pulse;
+
+Time_Out	=	DFF(.clk=Cavity_Clock, .d=Watch_Dog_Time_cmp);
+Test3	=	Time_Out;
+
+
+------------------- Counters background connections Section End
+
+
+END;

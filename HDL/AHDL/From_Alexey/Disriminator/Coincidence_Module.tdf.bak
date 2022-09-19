@@ -1,0 +1,49 @@
+Title "Coincidence Module";
+
+
+Include "matching_RAM.inc";
+
+
+Constant WORD_WIDTH	 = 16;
+Constant CHANNEL_NUM = 8;
+
+
+SUBDESIGN Coincidence_Module
+(
+	Clock						: input ; -- частота работы модуля 
+	Clock_x_2					: input ; -- частота работы модуля 
+	
+-- Skeleton BUS signals	
+	DataBusStrobe				: input ; -- строб приема/передачи данных наружу (высокий уровень, защелкиваем по заднему фронту)
+	DirectIn					: input ; -- направление передачи данных на шину КАМАК
+    AddrBusIn[3..0]	            : input ; -- шина адреса для доступа в пространство памяти
+	DataBusIn[WORD_WIDTH-1..0]  : input  ; -- 
+	DataBusOut[WORD_WIDTH-1..0] : output ; -- 
+	Select						: input  ; -- Module Select from External Address Comparator
+
+-- Function Specific Signals
+	Signal_In[CHANNEL_NUM-1..0]	: input;
+
+	Trigger_Out					: output;
+
+)
+
+Variable 
+   Coincidence_RAM				: matching_RAM;
+   
+BEGIN
+   Coincidence_RAM.clock_a     = Clock;
+   Coincidence_RAM.address_a[] = AddrBusIn[3..0];
+   Coincidence_RAM.data_a[]    = DataBusIn[];
+   Coincidence_RAM.wren_a      = DataBusStrobe and  DirectIn AND Select;  
+   
+   Coincidence_RAM.clock_b     = Clock_x_2;
+   Coincidence_RAM.address_b[] = Signal_In[CHANNEL_NUM-1..0];
+   Coincidence_RAM.data_b[]    = GND;
+   Coincidence_RAM.wren_b      = GND;  
+   
+ 
+   IF ((AddrBusIn[] >= 0) AND (AddrBusIn[] <= 15)) THEN DataBusOut[] = Coincidence_RAM.q_a[]; END IF;   
+   Trigger_Out = Coincidence_RAM.q_b[];
+
+END;

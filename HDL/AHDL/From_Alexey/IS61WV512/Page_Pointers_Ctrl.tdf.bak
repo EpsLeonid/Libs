@@ -1,0 +1,72 @@
+
+
+
+INCLUDE "Edge_Sensing_Sync.inc";
+INCLUDE "lpm_counter.inc";
+
+
+CONSTANT PAGE_SIZE = 9; -- число разрядов выделенных на страницы
+
+SUBDESIGN Page_Pointers_Ctrl
+(
+	Clock							: input;   -- Clock
+	WR_CNT_EN      					: input;
+	RD_CNT_EN						: input;
+	
+	Eth_Tx_Start					: output;
+	Pointer_WR[PAGE_SIZE-1..0]		: output;
+	Pointer_RD[PAGE_SIZE-1..0]		: output;	
+	
+--Standart BUS input output
+	DataBusStrobe					: input ; 
+	Direct_In						: input ; 
+    AddrBus_In[2..0]				: input ; 
+	DataBus_In[15..0]  				: input  ; -- 
+	DataBusOut[15..0] 				: output ; -- 
+	Select							: input  ; -- Module Select from External Address Comparator	
+)
+
+VARIABLE
+	PageCounter_WR					:	lpm_counter WITH (LPM_WIDTH = PAGE_SIZE); -- MASS RAM page counter (1024 word = 1 page)
+	PageCounter_WR_CS				:	node;
+	PageCounter_RD					:	lpm_counter WITH (LPM_WIDTH = PAGE_SIZE); -- MASS RAM page counter (1024 word = 1 page)
+	PageCounter_RD_CS				:	node;
+	
+	MASS_RAM_DATA_Tx_En				:	node;
+	MASS_RAM_DATA_Tx_En_SRFF        :	SRFF;
+   
+    RAM_Pointer_Reset				:	node; 
+
+BEGIN
+
+    PageCounter_WR.(clock, sclr, cnt_en)   = 	(Clock, RAM_Pointer_Reset AND Select AND DataBusStrobe, WR_CNT_EN);
+	PageCounter_WR.data[] 				   =	DataBus_In[PAGE_SIZE-1..0];
+	PageCounter_WR.sload 				   =	PageCounter_WR_CS AND Direct_In AND Select AND DataBusStrobe; 
+	
+	PageCounter_RD.(clock, sclr, cnt_en)   = 	(Clock, RAM_Pointer_Reset AND Select AND DataBusStrobe, RD_CNT_EN);
+ 	PageCounter_RD.data[] 				   =	DataBus_In[PAGE_SIZE-1..0];
+	PageCounter_RD.sload 				   =	PageCounter_RD_CS AND Direct_In AND Select AND DataBusStrobe; 
+
+ -- триггер на запуск отправки данных по Ethernet из MASS RAM
+    IF(PageCounter_RD.q[] != PageCounter_WR.q[]) THEN MASS_RAM_DATA_Tx_En = VCC; 
+												 ELSE MASS_RAM_DATA_Tx_En = GND;
+	END IF;
+	MASS_RAM_DATA_Tx_En_SRFF.(S,clk,R)	   =	(MASS_RAM_DATA_Tx_En AND (!MASS_RAM_DATA_Tx_En_SRFF.q), Clock, RD_CNT_EN);
+	
+	
+	--Eth_Tx_Start	 					   =	Edge_Sensing_Sync(.d=MASS_RAM_DATA_Tx_En_SRFF.q,.clk=Clock); 
+	Eth_Tx_Start	 					   =	MASS_RAM_DATA_Tx_En_SRFF.q;--DFF(.d=MASS_RAM_DATA_Tx_En_SRFF.q,.clk=Clock);
+    Pointer_WR[PAGE_SIZE-1..0]			   =	PageCounter_WR.q[];
+    Pointer_RD[PAGE_SIZE-1..0]			   =	PageCounter_RD.q[];	
+    
+    IF (AddrBus_In[2..0]==0) THEN DataBusOut[5..0] = PageCounter_WR.q[5..0]; DataBusOut[15..6] = GND; PageCounter_WR_CS = VCC;
+                             ELSE PageCounter_WR_CS = GND;
+    END IF;
+    IF (AddrBus_In[2..0]==1) THEN DataBusOut[5..0] = PageCounter_RD.q[5..0]; DataBusOut[15..6] = GND; PageCounter_RD_CS = VCC;
+							 ELSE PageCounter_RD_CS = GND;
+    END IF;
+    IF (AddrBus_In[2..0]==2) THEN RAM_Pointer_Reset = VCC; ELSE RAM_Pointer_Reset = GND; END IF;
+
+    
+    
+END;

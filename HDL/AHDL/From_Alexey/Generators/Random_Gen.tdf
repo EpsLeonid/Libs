@@ -1,0 +1,270 @@
+Title "Random_Gen";
+-- This file is hardware description for Pseudo-Random Code Generator. 
+-- This is implementation of LFSR 32bit Ethernet Generating Polynom. 
+
+include "Edge_Sensing_Sync.inc";
+include "FIFO_of_Random_Gen.inc";
+Include "LPM_Counter.inc";
+
+
+
+PARAMETERS
+(
+	PolinomPower	= 32,
+	PolinomValue	= B"00000100110000010001110110110111",
+	Seed			= H"FFFFFFFF",
+	Threshold		= H"EF000000"
+);
+Constant WORD_WIDTH	=	16;
+Constant RefClock	=	100; --MHz
+Constant RunningFreq=	25;  --MHz
+constant PrescalerModule = RefClock div RunningFreq ;
+
+
+SUBDESIGN Random_Gen
+(-- Standard Bus Signals
+	Clock						: input ; -- частота работы модуля (25..125МГц). Main clock, assumed F_link x 4 = 100MHz
+	DataBusStrobe				: input ; -- строб приема/передачи данных наружу (высокий уровень, защелкиваем по заднему фронту)
+	Direct						: input ; -- направление передачи данных на шину КАМАК
+    AddrBusExt[7..0]			: input ; -- шина адреса для доступа в пространство памяти
+	DataBusIn[WORD_WIDTH-1..0]  : input  ; -- 
+	DataBusOut[WORD_WIDTH-1..0] : output ; -- 
+	Select						: input  ; -- Module Select from External Address Comparator
+ 	Reset						: input=gnd ; -- Common FPGA signal Reset (Active HIGH)
+
+
+----------------  Function Specific Signals
+	Start_Seed_Load						: input = GND ;
+--	Bit_Sample_Enable		: input ;
+
+	Random_Period_Output				: output;
+	Det_Period_Output					: output;
+	
+	CRC_Parallel_Out[PolinomPower-1..0]	: OUTPUT;
+	CRC_Serial_Out						: OUTPUT;
+	WORKING                             : output;
+	--Residue_OK						: OUTPUT;
+	Test1, Test2, Test3					: OUTPUT;
+	Test4, Test5, Test6					: OUTPUT;
+	-- Common Project Bus Signal
+	
+)
+
+Variable 
+	Polinom_Value[PolinomPower-1..0]	: node ;
+	Reg_Inputs[PolinomPower-1..0]		: node ;
+	Reg_Outputs[PolinomPower-1..0]		: node ;
+	Feedback							: node ;
+	
+	RegDFF[PolinomPower-1..0]			: DFFE ;
+	Seed_Load							: Edge_Sensing_Sync;
+
+	FIFO								: FIFO_of_Random_Gen ;
+	TimeCNT								: LPM_COUNTER with ( LPM_WIDTH=PolinomPower, LPM_DIRECTION="DOWN");
+	Reloading_Code_to_TimeCNT			: node;
+	HT_OK								: node;
+	LT_OK								: node;
+	outdeglitch_R						: DFFE;
+	Prescaler							: LPM_COUNTER with ( LPM_WIDTH= ceil( log2 (PrescalerModule+1)));
+	Bit_Sample_Enable					: node;
+	Sampling_Code_OK					: node;
+	
+	LOW_Threshold[PolinomPower-1..0]	: node ;
+	HIGH_Threshold[PolinomPower-1..0]   : node ;
+	
+	DetermenisticCNT					: LPM_COUNTER with ( LPM_WIDTH=PolinomPower);
+	DC_End								: node;
+	DetermenisticCNT_End_Value[PolinomPower-1..0]	:node;
+	outdeglitch_D						:DFFE;
+	
+	HT_REG_LW[WORD_WIDTH-1..0]			: DFFE;  -- Registers for storing Thresholds
+	HT_REG_UW[WORD_WIDTH-1..0]			: DFFE;
+	LT_REG_LW[WORD_WIDTH-1..0]			: DFFE;
+	LT_REG_UW[WORD_WIDTH-1..0]			: DFFE;
+	DC_REG_LW[WORD_WIDTH-1..0]			: DFFE;
+	DC_REG_UW[WORD_WIDTH-1..0]			: DFFE;
+	HT_REG_LW_wren						: node;
+	HT_REG_UW_wren						: node;
+	LT_REG_LW_wren						: node;
+	LT_REG_UW_wren						: node;
+	DC_REG_LW_wren						: node;
+	DC_REG_UW_wren						: node;
+	Random_Out_En						: DFFE;
+	Random_Out_Push						: SRFF;
+	Determ_Out_En						: DFFE;
+	Determ_Out_Push						: SRFF;
+	
+	Seed_Preload						: node ;
+	
+	DataBusOut_[WORD_WIDTH-1..0]		: node ;
+	DataBusOut_Reg[WORD_WIDTH-1..0]		: DFF ;
+
+BEGIN
+--------------------------------------- Random Generator Section Begin
+
+Polinom_Value[PolinomPower-1..0]	=	PolinomValue ;
+Reg_Outputs[PolinomPower-1..0]		=	RegDFF[PolinomPower-1..0].q ;
+RegDFF[PolinomPower-1..0].d			=	Reg_Inputs[PolinomPower-1..0] ;
+RegDFF[PolinomPower-1..0].clk		=	Clock ;
+RegDFF[PolinomPower-1..0].ena		=	Bit_Sample_Enable or Seed_Load.q  ;
+RegDFF[PolinomPower-1..0].clrn		=	! Reset;
+CRC_Parallel_Out[PolinomPower-1..0]	=	RegDFF[PolinomPower-1..0].q ; -- XOR H"FFFF";
+
+Feedback	=	Reg_Outputs[PolinomPower-1] ;
+--Test1	=	Clock ;
+--Test2	=	Bit_Sample_Enable or Seed_Load.q  ;
+IF  ( Seed_Load.q == VCC )
+then	Reg_Inputs[]	=	Seed ;
+else    Reg_Inputs[0]	=	Feedback;
+FOR i IN 0 to (PolinomPower-2) Generate
+		Reg_Inputs[i+1] = Reg_Outputs[i] XOR (Feedback AND Polinom_Value[i+1]);
+END Generate;
+END IF;
+
+Seed_Load.d	=	(Start_Seed_Load AND Bit_Sample_Enable) OR Seed_Preload ;
+Seed_Load.(clr, clk)	=	(Reset, Clock);
+
+CRC_Serial_Out	=	Reg_Outputs[PolinomPower-1]; -- Here we have Random Code
+
+--------------------------------------- Random Generator Section End
+
+
+--------------------------------------- Random Timer Section Begin
+LOW_Threshold[PolinomPower-1..WORD_WIDTH]	=	LT_REG_UW[WORD_WIDTH-1..0].q ;
+LOW_Threshold[WORD_WIDTH-1..0]				=	LT_REG_LW[WORD_WIDTH-1..0].q ;
+-- Now we will define a WINDOW for code selection
+IF (CRC_Parallel_Out[PolinomPower-1..0] >= LOW_Threshold[] )
+Then LT_OK = VCC ;
+Else LT_OK = GND ;
+End If;
+
+HIGH_Threshold[PolinomPower-1..WORD_WIDTH]	=	HT_REG_UW[].q ;
+HIGH_Threshold[WORD_WIDTH-1..0]				=	HT_REG_LW[].q ;
+IF (CRC_Parallel_Out[PolinomPower-1..0] <= HIGH_Threshold[PolinomPower-1..0] )
+Then HT_OK = VCC ;
+Else HT_OK = GND ;
+End If;
+
+--Test1 = LT_OK;
+--Test2 = HT_OK;
+-- If we have good code, then accept it!
+-- FIFO will store codes to isolate Code generation from Code Counting
+Sampling_Code_OK	=	HT_OK	AND	LT_OK	AND	Bit_Sample_Enable;  --	AND !FIFO.full ;
+Test1	=	FIFO.full;
+Test2	=	Sampling_Code_OK ;
+FIFO.data[]	=	CRC_Parallel_Out[]	;
+FIFO.clock	=	Clock ;
+FIFO.wrreq	=	Sampling_Code_OK	;
+
+FIFO.rdreq	=	Reloading_Code_to_TimeCNT  and !FIFO.empty ; -- acknowlege that code is used
+Test3	=	Reloading_Code_to_TimeCNT  ; -- and !FIFO.empty ;
+Test4	=	FIFO.empty ;
+TimeCNT.clock	=	Clock;
+
+TimeCNT.data[PolinomPower-1..0]		=	FIFO.q[PolinomPower-1..0];
+
+Test5	=	Bit_Sample_Enable ;
+Test6	=	TimeCNT.q[8];
+
+
+TimeCNT.sload	=	Reloading_Code_to_TimeCNT and !FIFO.empty ;
+TimeCNT.sclr	=	Seed_Preload;
+TimeCNT.cnt_en	=	Bit_Sample_Enable  and !Reloading_Code_to_TimeCNT	;
+IF (TimeCNT.q[PolinomPower-1..0] == GND )
+THEN Reloading_Code_to_TimeCNT	=	VCC ;
+ELSE Reloading_Code_to_TimeCNT	=	GND ;
+END IF;
+outdeglitch_R.d		=	Reloading_Code_to_TimeCNT;
+outdeglitch_R.clk	=	Clock;
+--outdeglitch_R.ena	=	Bit_Sample_Enable ;
+Random_Period_Output	=	(outdeglitch_R.q AND Random_Out_En.q) OR Random_Out_Push.q ;
+
+--------------------------------------- Random Timer Section End
+
+Prescaler.clock	=	Clock;
+Prescaler.sclr	=	Bit_Sample_Enable;
+IF ( Prescaler.q[] == PrescalerModule-1 )
+then Bit_Sample_Enable = VCC;
+else Bit_Sample_Enable = GND;
+end if;
+
+--------------------------------------- Determenistic Timer Section Begin
+
+DetermenisticCNT.clock	=	Clock;
+DetermenisticCNT.sclr	=	DC_End OR !Determ_Out_En.q ;
+DetermenisticCNT.cnt_en	=	Bit_Sample_Enable ;
+DetermenisticCNT_End_Value[PolinomPower-1..WORD_WIDTH]	=	DC_REG_UW[].q ;
+DetermenisticCNT_End_Value[WORD_WIDTH-1..0]				=	DC_REG_LW[].q ;
+IF (DetermenisticCNT.q[] >= DetermenisticCNT_End_Value[] )
+then DC_End = VCC ;
+else DC_End = GND ;
+end if;
+
+outdeglitch_D.d		=	DC_End;
+outdeglitch_D.clk	=	Clock;
+--outdeglitch_D.ena	=	Bit_Sample_Enable ;
+
+Det_Period_Output	=	(outdeglitch_D.q AND Determ_Out_En.q) OR Determ_Out_Push.q ;
+
+--------------------------------------- Determenistic Timer Section End
+
+
+-------------------------------------- Registers connections Section Begin
+-- Prepare to Write
+	HT_REG_LW[].clk	=	Clock;
+	HT_REG_UW[].clk	=	Clock;
+	LT_REG_LW[].clk	=	Clock;
+	LT_REG_UW[].clk	=	Clock;
+		DC_REG_LW[].clk	=	Clock;
+		DC_REG_UW[].clk	=	Clock;
+		Random_Out_En.clk	=	Clock;
+		Random_Out_Push.clk	=	Clock;
+		Determ_Out_En.clk	=	Clock;
+		Determ_Out_Push.clk	=	Clock;
+	HT_REG_LW[].d	=	DataBusIn[];	
+	HT_REG_UW[].d	=	DataBusIn[];	
+	LT_REG_LW[].d	=	DataBusIn[];	
+	LT_REG_UW[].d	=	DataBusIn[];	
+		DC_REG_LW[].d	=	DataBusIn[];	
+		DC_REG_UW[].d	=	DataBusIn[];	
+	HT_REG_LW[].ena	=	HT_REG_LW_wren;	
+	HT_REG_UW[].ena	=	HT_REG_UW_wren;	
+	LT_REG_LW[].ena	=	LT_REG_LW_wren;	
+	LT_REG_UW[].ena	=	LT_REG_UW_wren;	
+		DC_REG_LW[].ena	=	DC_REG_LW_wren;	
+		DC_REG_UW[].ena	=	DC_REG_UW_wren;	
+		
+		Random_Out_Push.R	=	Random_Out_Push.q ; -- One Clock pulse output
+		Determ_Out_Push.R	=	Determ_Out_Push.q ;
+		Random_Out_En.d=DataBusIn[0];
+		Determ_Out_En.d=DataBusIn[0];
+-- Prepare Wren signals
+Case AddrBusExt[7..0] is 
+    WHEN 0	=> DataBusOut_[]     = B"1010101010101010";
+	WHEN 1	=> HT_REG_LW_wren	 = ( Select AND Direct AND DataBusStrobe );	DataBusOut_[] = HT_REG_LW[].q ;
+	WHEN 2	=> HT_REG_UW_wren	 = ( Select AND Direct AND DataBusStrobe );	DataBusOut_[] = HT_REG_UW[].q ;
+	WHEN 3	=> LT_REG_LW_wren	 = ( Select AND Direct AND DataBusStrobe );	DataBusOut_[] = LT_REG_LW[].q ;
+	WHEN 4	=> LT_REG_UW_wren	 = ( Select AND Direct AND DataBusStrobe );	DataBusOut_[] = LT_REG_UW[].q ;
+
+	WHEN 5	=> Random_Out_En.ena = ( Select AND Direct AND DataBusStrobe );	DataBusOut_[0] = Random_Out_En.q ; DataBusOut[15..1] = GND;
+			   Seed_Preload	     = ( Select AND Direct AND DataBusStrobe );
+	WHEN 6	=> Random_Out_Push.S = ( Select AND DataBusStrobe );	DataBusOut_[]  = GND ;
+
+
+	WHEN 7	=> DC_REG_LW_wren	 = ( Select AND Direct AND DataBusStrobe );	DataBusOut_[] = DC_REG_LW[].q ;
+	WHEN 8	=> DC_REG_UW_wren	 = ( Select AND Direct AND DataBusStrobe );	DataBusOut_[] = DC_REG_UW[].q ;
+
+	WHEN 9	=> Determ_Out_En.ena = ( Select AND Direct AND DataBusStrobe ); DataBusOut_[0] = Determ_Out_En.q ; DataBusOut[15..1] = GND;
+	WHEN 10	=> Determ_Out_Push.S = ( Select AND DataBusStrobe );	DataBusOut_[]  = GND ;
+	
+	WHEN OTHERS => HT_REG_LW_wren=GND; HT_REG_UW_wren=GND; LT_REG_LW_wren=GND; LT_REG_UW_wren=GND; Random_Out_En.ena=GND; Seed_Preload=GND;
+				Random_Out_Push.S=GND; DC_REG_LW_wren=GND; DC_REG_UW_wren=GND; Determ_Out_En.ena=GND; Determ_Out_Push.S=GND;
+end Case ;
+
+
+DataBusOut[]=DataBusOut_Reg[].q; DataBusOut_Reg[].clk=Clock; DataBusOut_Reg[].d=DataBusOut_[];
+--------------------------------------- Registers connections Section End
+WORKING = Determ_Out_En.q OR Random_Out_En.q;
+
+
+END;

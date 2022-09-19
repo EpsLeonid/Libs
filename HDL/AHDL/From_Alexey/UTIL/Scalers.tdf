@@ -1,0 +1,95 @@
+Title "Scalers module";
+
+
+Include "LPM_Counter.inc";
+Include "LPM_shiftreg.inc";
+INCLUDE "Edge_Sensing.inc";
+INCLUDE "Pulse_Width_Shaper.inc" ;
+
+PARAMETERS
+(
+  CHANNEL_NUM = 32   -- Number of measurement channels
+);
+
+
+Constant WORD_WIDTH	 = 16;
+
+CONSTANT Input_Freq = 100000000; -- project input clock
+CONSTANT PRESCALER_RATIO = Input_Freq DIV 1;    -- 1 sec period
+CONSTANT PRESCALER_SIZE = FLOOR(LOG2(PRESCALER_RATIO))+1; -- prescaler counter size
+
+CONSTANT ADDR_WIDTH = FLOOR(LOG2(CHANNEL_NUM*2))+1; -- 
+
+
+SUBDESIGN Scalers
+(
+	Clock						   	 : input ; -- input clock
+
+	
+-- Skeleton BUS signals	
+	DataBusStrobe				    : input ; -- 
+	DirectIn					       : input ; -- 
+   AddrBusIn[ADDR_WIDTH-1..0]	 : input ; -- 
+	DataBusIn[WORD_WIDTH-1..0]  : input  ; -- 
+	DataBusOut[WORD_WIDTH-1..0] : output ; -- 
+	Select						 	 : input  ; -- Module Select from External Address Comparator
+ 	Reset								 : input=gnd ; -- Common FPGA signal Reset (Active HIGH)
+
+
+-- Function Specific Signals
+	M_signal[CHANNEL_NUM-1..0]	 : input;
+
+)
+
+Variable 
+  
+   Prescaler_1s									  	: LPM_COUNTER with (lpm_width=PRESCALER_SIZE, lpm_direction="UNUSED");
+   Prescaler_1s_Rst								  	: node; 
+	
+	In_ES[CHANNEL_NUM-1..0]							: Edge_Sensing;					
+	
+   Scaler_CNT[CHANNEL_NUM-1..0]		  		   : LPM_COUNTER  with ( LPM_WIDTH = WORD_WIDTH*2, lpm_direction="up" );
+   Scaler_CNT_Reg[CHANNEL_NUM-1..0]	 	      : lpm_shiftreg with ( LPM_WIDTH = WORD_WIDTH*2);
+	
+	M_signal_Shaper[CHANNEL_NUM-1..0]         : Pulse_Width_Shaper with ( Duration = 40, RefClock=100);
+
+ 
+ BEGIN
+ 
+ 
+   Prescaler_1s.(clock,sclr) = (Clock, Prescaler_1s_Rst);
+   IF (Prescaler_1s.q[] == PRESCALER_RATIO-1) THEN Prescaler_1s_Rst = VCC;
+                                              ELSE Prescaler_1s_Rst = GND;
+   END IF;
+	
+	
+	
+   FOR i IN 0 TO CHANNEL_NUM-1 GENERATE
+	   M_signal_Shaper[i].Clock = Clock;
+		M_signal_Shaper[i].Event = M_signal[i];
+		M_signal_Shaper[i].Reset = GND;
+		
+		
+ 		In_ES[i].d   = M_signal_Shaper[i].PulseOut;--M_signal[i];
+		In_ES[i].clk = Clock;
+		
+		Scaler_CNT[i].clock  = Clock;
+		Scaler_CNT[i].cnt_en = In_Es[i].q and (Scaler_CNT[i].q[]<4294967295);
+		Scaler_CNT[i].sclr   = Prescaler_1s_Rst;
+		
+		Scaler_CNT_Reg[i].clock = Clock;
+		Scaler_CNT_Reg[i].data[] = Scaler_CNT[i].q[];
+		Scaler_CNT_Reg[i].enable = Prescaler_1s_Rst;
+		Scaler_CNT_Reg[i].load   = VCC;
+   END GENERATE;
+	
+	FOR i IN 0 TO CHANNEL_NUM-1 GENERATE
+		FOR j IN 0 TO 1 GENERATE
+			IF (Select == VCC) THEN
+				IF (AddrBusIn[] == i*2+j) THEN DataBusOut[] = Scaler_CNT_Reg[i].q[16*j+15..16*j]; END IF;
+									 ELSE DataBusOut[] = GND;
+			END IF;
+		END GENERATE;
+   END GENERATE;
+  
+END;

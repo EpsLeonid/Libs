@@ -1,0 +1,32 @@
+-- Версия 27.11.2008
+Title "Ref_frequency_generator";
+
+INCLUDE "lpm_counter.inc" ;
+
+PARAMETERS
+(
+  GlobalClockFreq = 100, -- MHz
+  RefClockOut     = 1    -- kHz
+);
+CONSTANT Timer_Module = (GlobalClockFreq DIV RefClockOut) * 1000;
+CONSTANT OrderOfBitNumber = CEIL (LOG2(Timer_Module));
+
+SUBDESIGN Ref_Freq_Gen
+(
+    Global_Clock	 : input;
+    Ref_Clock_Out    : output;
+)
+
+VARIABLE
+
+    Prescaler        : lpm_counter with ( LPM_WIDTH = OrderOfBitNumber);
+    End_Clk_Gen      : node;
+
+BEGIN
+    Prescaler.(clock,sclr) = (Global_Clock, End_Clk_Gen);
+    IF (Prescaler.q[] == Timer_Module) THEN End_Clk_Gen = VCC; 
+									   ELSE End_Clk_Gen = GND;
+	END IF;
+	
+	Ref_Clock_Out = DFF(.clk=Global_Clock, .d=End_Clk_Gen);
+END; --конец модуля 

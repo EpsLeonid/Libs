@@ -1,0 +1,28 @@
+TITLE "Edge_Sensing";
+--This file contain function for Positive Edge Sensing, T2Q project
+-- It produce one output positive pulse for input positive transition
+Subdesign Edge_Sensing
+(
+		clk	: input;   -- Clock
+		clr	: input = gnd ;   -- Common FPGA Reset
+		d	: input;   -- External signal to be synchronized
+		ena	: input = VCC;
+		q	: output;  -- Synchronized out
+)
+
+Variable
+
+     StartSensing_trg1, StartSensing_trg2  : DFFE;  --trg1,trg2 is edge sensitive  
+  -- one clock pulse shaper
+
+Begin
+    StartSensing_trg1.d=d;
+         StartSensing_trg1.clk=clk;
+         StartSensing_trg1.(clrn, ena)	=	(!clr, ena);
+    StartSensing_trg2.d=StartSensing_trg1.q;
+         StartSensing_trg2.clk=clk;
+         StartSensing_trg2.(prn, ena)	=	(!clr, ena);
+ 
+-- One pulse sync output
+    q=(StartSensing_trg1.q AND !StartSensing_trg2.q);
+end;

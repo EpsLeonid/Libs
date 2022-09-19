@@ -1,0 +1,152 @@
+TITLE "POSS";
+-- Power On Self Set
+-- Начальный загрузчик для Модулей КМД-3.
+
+Include "POSS_ROM.inc";
+INCLUDE "lpm_shiftreg.inc" ;
+INCLUDE "lpm_counter.inc" ;
+INCLUDE "Pulse_Width_Shaper.inc";
+Include "CMD3_DAQ_LINK.inc";
+
+PARAMETERS
+(
+RefClock=100   -- Пользователь здесь указывает частоту в МГц-ах (целых), которую он подал на вход "Clock" 
+);
+
+Constant PrescalerModule = RefClock * 1000 ; -- Number of clk per 1ms
+
+Constant Reset_Time	=	100	; -- Time in ms
+--Constant Words_Number	=	32; -- Number of words to initialize.
+--Constant Step			=	16; -- 
+
+SUBDESIGN POSS
+(
+-- Module specific signals
+		-- Сигналы со стороны параллельного канала (Интерфейс Пользователя)
+			Reset				: output; --  
+			Dummy_In			: input;
+-- Standard Bus signaling for Master/Slave connection
+			-- General Signals
+			Clock					: input; -- Global FPGA Clock, assumed 100MHz for T2Q project 
+--			Reset					: input ;  -- Common FPGA Reset
+--			DataBus_In[15..0]		: input;  -- отправляемые с Внутренней Шины в Линк данные
+			DataBusOut[15..0]       : output; -- выдаваемые на Внутреннюю Шину из POSS данные
+			DataBusStrobe           : input;  -- строб приема/передачи данных наружу (высокий уровень, используя его как Enable, "защелкиваем" по заднему фронту
+--			Error                   : output; -- сигнал ошибки (неверная команда)
+	-- Master Mode Signals -- используется при работе данного Модуля в режиме Master)
+	AccessRequest           : output; -- запрос к Арбитру на доступ к шине для чтения/записи данных Пользователя в режиме Master	
+	AccessGranted			: input;  -- Разрешение Арбитра выставить Адрес и направление обмена (захват шины)
+	DirectOut				: output; -- направление передачи данных, на внутреннюю шину или с нее, по умолчанию =GND, передача от внутренних ресурсов платы Модуль,
+	AddrBusOut[15..0]       : output; -- адрес при операциях доступа ко внутренним ресурсам Оцифровщика (чтения/записи по Командному Листу).
+		-- Slave Mode Signals	-- используется при работе данного Модуля в режиме Slave
+		Select					: input;  -- Выбор Модуля для работы с памятью Командного Листа в режиме Slave (с КАМАК-ом)
+		DirectIn				: input;  -- направление передачи данных, Если =GND, то данный Модуль читается, если =VCC, то пишется.
+		AddrBus_In[15..0]		: input;  -- адрес при операциях доступа чтения/записи Командного Листа с КАМАК-а
+
+	
+	
+    Test[4..1]		      : output ; -- to be conected to test output of main Project 
+)
+
+VARIABLE
+%
+Prescaler			:	LPM_COUNTER with ( lpm_width=20, lpm_direction="up" );
+PrescalerOut		: node;
+
+Reset_Time_CNT		:	LPM_COUNTER with ( lpm_width=10, lpm_direction="up" );
+Reset_Time_Flag		:	SRFF ;
+Int_Reset			: node;
+%
+-- Flow Control
+LinkBitCounter		: LPM_COUNTER with ( lpm_width=OrderOfBitNumber, lpm_direction="up" ); -- счетчик числа принятых/переданных бит из/в линк
+--CycleActiveFlag		: SRFF; -- флаг начала цикла приема/передачи данных из/в линк
+--StartCycle			: node; -- сигнал начала цикла приема/передачи данных из/в линк
+EndPOSSCycle			: node; -- флаг окончания цикла приема/передачи из/в линк
+
+POSS_ActiveFlag, Finished		: SRFFE ;
+Primary_Reset		: node;
+Dead_Time_Flag		:Pulse_Width_Shaper with ( Duration = Dead_Time, RefClock = RefClock ); -- Флаг мертвого времени - защитного промежутка
+
+TxWordReload		: node; -- высоким уровнем разрешает перезагрузку слова из TxDataReg в TxShifter
+-- LockTxWord[32..0]	: node ;-- выходы компараторов-формирователей
+
+WordCounter                : LPM_COUNTER with ( lpm_width=6, lpm_direction="up" ); -- счетчик числа принятых/переданных слов
+PROM                   		: POSS_ROM;
+Addr_Page_offset[6..0], Data_Page_offset[6..0]		: node ;
+	AccessRequest			: SRFF; 
+
+--**********************************************************************************************
+
+
+
+BEGIN
+
+DEFAULTS
+	TxWordReload = GND;
+END DEFAULTS;
+
+------------------- Section Main Loop  "Начало и конец работы POSS" Begin
+			POSS_ActiveFlag.(S,R,clk) = (Dummy_In AND !Finished.q, EndPOSSCycle, Clock );
+			Finished.(R,S,clk, clrn)	=	(POSS_ActiveFlag.q, EndPOSSCycle, Clock, VCC );
+Test1	=	POSS_ActiveFlag.q;
+Test2	=	Finished.q;
+-- In begin of Work Primary Reset generated 
+IF ((LinkBitCounter.q[OrderOfBitNumber-1..0] > (HeaderSize)) and (LinkBitCounter.q[OrderOfBitNumber-1..0] <= (BitOfReverse)) ) 	
+THEN Primary_Reset = VCC; ELSE Primary_Reset = GND; END IF;
+
+				-- По концу работы  запускаем формировку защитного промежутка	
+IF ((LinkBitCounter.q[OrderOfBitNumber-1..0] == (MaxNumberOfBit+1))) 	
+THEN Dead_Time_Flag.Event = VCC; ELSE Dead_Time_Flag.Event = GND; END IF;
+	LinkBitCounter.(clock, sclr, cnt_en) = (Clock,  EndPOSSCycle, (POSS_ActiveFlag.q and !AccessRequest.q)); -- paused on AccessReq.
+
+Dead_Time_Flag.(Clock, Reset)	=	(Clock, Primary_Reset) ;
+Test3	=	EndPOSSCycle;
+EndPOSSCycle	=	Dead_Time_Flag.PulseOut ; 
+
+Reset = (DFF(.d=Primary_Reset, .clk=Clock)) OR EndPOSSCycle ; -- Connection to User Interface, one clock later,
+
+------------------- Section Main Loop  "Начало и конец работы POSS" End
+
+---------------------------------------
+-- Section "Redirector connection"
+-- Section "Bus Connections" Begin
+
+Addr_Page_offset[5..0] = WordCounter.q[5..0]; -- перемещение внутри страницы адресов
+Addr_Page_offset[6]    = GND;
+PROM.address_a[6..0] = Addr_Page_offset[];
+AddrBusOut[15..0] 	=	PROM.q_a[15..0];
+PROM.inclock = Clock;
+PROM.inclocken = VCC;
+PROM.outclock = Clock;
+Data_Page_offset[5..0] = WordCounter.q[5..0]; -- перемещение внутри страницы данных
+Data_Page_offset[6]    = VCC;
+DataBusOut[15..0] 	=	PROM.q_b[15..0];
+PROM.outclocken	=	TxWordReload OR (Select AND !DirectIn);
+
+if POSS_ActiveFlag.q
+then PROM.address_b[6..0] = Data_Page_offset[]; else PROM.address_b[6..0] = AddrBus_In[6..0];
+end if;
+
+WordCounter.(clock, cnt_en, sclr) = (Clock, TxWordReload, Primary_Reset OR EndPOSSCycle) ;  -- счетчик-указатель адреса страницы ОЗУ Редиректора
+
+
+-- Гененерим схемы совпадения на моменты перезагрузки данных в 
+   FOR i IN 1 TO (WordsToGoUp) GENERATE
+    	IF LinkBitCounter.q[(OrderOfBitNumber-1)..0] == ((BitOfAnswerStart+COMMAND_SIZE+PAUSE)+(WORD_WIDTH+PAUSE)*i) 
+		THEN	TxWordReload = VCC; -- формируем импульс для защелкивания данных в регистр Tx shifter
+		ELSE	TxWordReload = GND;
+      	END IF;
+   END GENERATE;
+
+Test4	=	TxWordReload;
+
+-- Master Access Control
+DirectOut=VCC;
+AccessRequest.S  =TxWordReload ;
+AccessRequest.clk = Clock ;
+AccessRequest.R  = (DataBusStrobe AND AccessGranted) ;
+-- Section "User Interface Control" End
+
+
+
+END;

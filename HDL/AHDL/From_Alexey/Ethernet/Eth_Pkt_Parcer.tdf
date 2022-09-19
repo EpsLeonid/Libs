@@ -1,0 +1,128 @@
+INCLUDE "Edge_Sensing_Sync.inc";
+INCLUDE "lpm_shiftreg.inc";
+INCLUDE "lpm_counter.inc";
+INCLUDE "Eth_MAC_Decoder_v1.inc";
+INCLUDE "Eth_ARP_Decoder_v1.inc";
+INCLUDE "Eth_IPv4_Decoder_v1.inc";
+INCLUDE "Eth_Raw_Decoder.inc";
+INCLUDE "Eth_CCCD_Decoder.inc";
+INCLUDE "IPv4_checkSum.inc";
+
+
+CONSTANT PacketLenghts_at_signaling_layer  = 2048;-- maximum length value in bytes
+CONSTANT RxByte_Cnt_Width = Ceil( LOG2(PacketLenghts_at_signaling_layer));
+
+
+SUBDESIGN Eth_Pkt_Parcer
+(
+   Clock                        : input; -- System Clock, really Bus_Clock
+   
+   Rx_Data[15..0]  				: input;
+   Rx_Addr_o[10..0]				: output;
+   Rx_Parcer_RQ					: input;
+   Rx_NUM_Data[10..0]  			: input;
+   
+   Tx_Addr[10..0]  				: output;
+   Tx_Data[15..0]  				: output;
+   Tx_Word_Strobe      			: output;
+   
+		
+   Reset						: input;
+   Progress_Flag				: output;
+   Tx_Start						: output;
+   CycleEndErr					: output;
+	
+   Module_MAC [8*6-1..0]		: input; -- MAC address
+   Module_IP  [8*4-1..0]		: input; -- IP address
+   Module_Port[8*2-1..0]		: input; -- Port number
+   
+   Identification[15..0]		: output;
+   MAC_recognized				: output;
+   
+  
+   -- Skeleton bus control signals  
+   AccessRequest			   	: output;
+   AccessGranted			   	: input; 
+   DirectOut				   	: output;
+   AddrBusOut[15..0]	    	: output;
+   DataBus_In[15..0]			: input; 
+   DataBusOut[15..0]     	  	: output; 
+   DataBusStrobe 			 	: input; 
+ 
+)
+VARIABLE
+   ParcerCycle_SRFF                         : SRFF;
+   ParcerCycleEnd                           : node;
+   ParcerCycleERR							: node;
+   
+   MAC_Decoder                              : Eth_MAC_Decoder_v1;
+   ARP_Decoder                              : Eth_ARP_Decoder_v1;
+   IPv4_Decoder                             : Eth_IPv4_Decoder_v1;
+   IPv4_CheckSum_Ctrl						: IPv4_checkSum;
+   
+BEGIN
+	------------------- data parcer 
+   ParcerCycle_SRFF.(S,clk,R) = (Rx_Parcer_RQ,Clock,ParcerCycleEnd);   -- parcer work cycle 
+   ParcerCycleEnd = Edge_Sensing_Sync(.d=(MAC_Decoder.Rx_Error_MAC OR ARP_Decoder.Rx_IP_Error OR ARP_Decoder.Rx_TRUE_RQ OR IPv4_Decoder.Rx_Error_IP OR IPv4_CheckSum_Ctrl.IPv4_CheckSum_Complete OR IPv4_Decoder.Rx_NOT_RQ),.clk=Clock);
+   ParcerCycleERR = Edge_Sensing_Sync(.d=(MAC_Decoder.Rx_Error_MAC OR ARP_Decoder.Rx_IP_Error OR IPv4_Decoder.Rx_Error_IP OR IPv4_Decoder.Rx_NOT_RQ),.clk=Clock);
+   
+   Tx_Start = Edge_Sensing_Sync(.d=ARP_Decoder.Tx_Start OR IPv4_CheckSum_Ctrl.IPv4_CheckSum_Complete,.clk=Clock);
+   CycleEndErr = ParcerCycleERR;
+   
+   Progress_Flag = ParcerCycle_SRFF.q;														   
+
+  
+   -- MAC address decoder
+   MAC_Decoder.Clock = Clock;
+   MAC_Decoder.(Rx_Data[], Rx_Parcer_RQ, Reset) 	 = (Rx_Data[]		  , Rx_Parcer_RQ , Reset   );
+   MAC_Decoder.(MAC_Addr0_[15..8], MAC_Addr0_[7..0]) = (Module_MAC[7..0]  , Module_MAC[15..8] );
+   MAC_Decoder.(MAC_Addr1_[15..8], MAC_Addr1_[7..0]) = (Module_MAC[23..16], Module_MAC[31..24]);
+   MAC_Decoder.(MAC_Addr2_[15..8], MAC_Addr2_[7..0]) = (Module_MAC[39..32], Module_MAC[47..40]);
+   -- ARP decoder
+   ARP_Decoder.Clock = Clock;
+   ARP_Decoder.(Rx_Data[], Rx_Parcer_RQ, Reset) = (Rx_Data[],  MAC_Decoder.Next_Parcer, Reset);
+   ARP_Decoder.(MAC_Addr0_[15..8], MAC_Addr0_[7..0]) = (Module_MAC[7..0]  , Module_MAC[15..8] );
+   ARP_Decoder.(MAC_Addr1_[15..8], MAC_Addr1_[7..0]) = (Module_MAC[23..16], Module_MAC[31..24]);
+   ARP_Decoder.(MAC_Addr2_[15..8], MAC_Addr2_[7..0]) = (Module_MAC[39..32], Module_MAC[47..40]);
+   ARP_Decoder.(IP_Addr0_[15..8] , IP_Addr0_[7..0] ) = (Module_IP[7..0]   , Module_IP[15..8]  );
+   ARP_Decoder.(IP_Addr1_[15..8] , IP_Addr1_[7..0] ) = (Module_IP[23..16] , Module_IP[31..24] );
+   -- IPv4 decoder
+   IPv4_Decoder.Clock = Clock;
+   IPv4_Decoder.Rx_NUM_Data[] = Rx_NUM_Data[];
+   IPv4_Decoder.(Rx_Data[], Rx_Parcer_RQ, Reset)     = (Rx_Data[],  ARP_Decoder.Rx_NOT_RQ, Reset);
+   IPv4_Decoder.(IP_Addr0_[15..8], IP_Addr0_[7..0])  = (Module_IP[7..0]   , Module_IP[15..8]  );
+   IPv4_Decoder.(IP_Addr1_[15..8], IP_Addr1_[7..0])  = (Module_IP[23..16] , Module_IP[31..24] );
+   IPv4_Decoder.(Port[15..8], Port[7..0]) 			 = (Module_Port[7..0] , Module_Port[15..8]);
+   IPv4_Decoder.DataBus_In[] = DataBus_In[];
+   IPv4_Decoder.(AccessGranted, DataBusStrobe) = (AccessGranted, DataBusStrobe);
+   
+   IPv4_CheckSum_Ctrl.Clock = Clock;
+   IPv4_CheckSum_Ctrl.(Rx_Data[], Rx_Parcer_RQ, Reset)    = (Rx_Data[], IPv4_Decoder.Tx_Start, Reset);
+   IPv4_CheckSum_Ctrl.IP_ID[] = IPv4_Decoder.Identification[];
+   
+   
+   AccessRequest = IPv4_Decoder.AccessRequest;
+   DirectOut     = IPv4_Decoder.DirectOut 	 ;
+   AddrBusOut[]  = IPv4_Decoder.AddrBusOut[] ;
+   DataBusOut[]  = IPv4_Decoder.DataBusOut[];
+
+
+
+   FOR i IN 0 TO 10 GENERATE
+		Tx_Addr[i] = DFF(.d=MAC_Decoder.Tx_Addr[i] OR ARP_Decoder.Tx_Addr[i] OR IPv4_Decoder.Tx_Addr[i] OR IPv4_CheckSum_Ctrl.Tx_Addr[i],.clk=Clock);
+   END GENERATE;
+   Rx_Addr_o[] = MAC_Decoder.Rx_Addr[] 		 OR 
+			     ARP_Decoder.Rx_Addr[] 		 OR 
+			     IPv4_Decoder.Rx_Addr[] 	 OR 
+  			     IPv4_CheckSum_Ctrl.Rx_Addr[];
+   FOR i IN 0 TO 15 GENERATE 
+		Tx_Data[i] = DFF(.d=MAC_Decoder.Tx_Data[i] OR ARP_Decoder.Tx_Data[i] OR IPv4_Decoder.Tx_Data[i] OR IPv4_CheckSum_Ctrl.Tx_Data[i],.clk=Clock);
+   END GENERATE;
+   Tx_Word_Strobe = DFF(.d=MAC_Decoder.Tx_Word_Strobe OR ARP_Decoder.Tx_Word_Strobe OR IPv4_Decoder.Tx_Word_Strobe OR IPv4_CheckSum_Ctrl.Tx_Word_Strobe,.clk=Clock);
+
+   Identification[] = IPv4_Decoder.Identification[]; -- packet number field
+   MAC_recognized   = MAC_Decoder.Next_Parcer;
+   
+   
+
+END;

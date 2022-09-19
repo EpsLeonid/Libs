@@ -1,0 +1,120 @@
+-- Copyright (C) 1991-2008 Altera Corporation
+-- Your use of Altera Corporation's design tools, logic functions 
+-- and other software and tools, and its AMPP partner logic 
+-- functions, and any output files from any of the foregoing 
+-- (including device programming or simulation files), and any 
+-- associated documentation or information are expressly subject 
+-- to the terms and conditions of the Altera Program License 
+-- Subscription Agreement, Altera MegaCore Function License 
+-- Agreement, or other applicable license agreement, including, 
+-- without limitation, that your use is for the sole purpose of 
+-- programming logic devices manufactured by Altera and sold by 
+-- Altera or its authorized distributors.  Please refer to the 
+-- applicable agreement for further details.
+
+-- Quartus II generated Memory Initialization File (.mif)
+
+WIDTH=16;
+DEPTH=128;
+
+ADDRESS_RADIX=UNS;
+DATA_RADIX=UNS;
+
+CONTENT BEGIN
+	0    :   24576;
+	1    :   24577;
+	2    :   24578;
+	3    :   24579;
+	4    :   24580;
+	5    :   24581;
+	6    :   24582;
+	7    :   24583;
+	8    :   24584;
+	9    :   24585;
+	10   :   24586;
+	11   :   24587;
+	12   :   24588;
+	13   :   24589;
+	14   :   24590;
+	15   :   24591;
+	16   :   24592;
+	17   :   24593;
+	18   :   24594;
+	19   :   24595;
+	20   :   24596;
+	21   :   24597;
+	22   :   24598;
+	23   :   24599;
+	24   :   8217;
+	25   :   8218;
+	26   :   8219;
+	27   :   8220;
+	28   :   8221;
+	29   :   8222;
+	30   :   8223;
+	31   :   8224;
+	32   :   8225;
+	33   :   8226;
+	34   :   8227;
+	35   :   8228;
+	36   :   8229;
+	37   :   8230;
+	38   :   8231;
+	39   :   8232;
+	40   :   8233;
+	41   :   8234;
+	42   :   8235;
+	43   :   8236;
+	44   :   8237;
+	45   :   8238;
+	46   :   8239;
+	47   :   8240;
+	48   :   8241;
+	49   :   8242;
+	50   :   8243;
+	[51..62]  :   8193;
+	63   :   70;
+	64   :   4;
+	65   :   30;
+	[66..67]  :   100;
+	68   :   5;
+	69   :   50;
+	[70..71]  :   100;
+	72   :   6;
+	73   :   30;
+	[74..75]  :   100;
+	76   :   7;
+	77   :   30;
+	[78..79]  :   100;
+	80   :   8;
+	81   :   30;
+	[82..83]  :   100;
+	84   :   9;
+	85   :   30;
+	[86..87]  :   100;
+	88   :   10;
+	89   :   30;
+	90   :   0;
+	91   :   100;
+	92   :   11;
+	93   :   30;
+	94   :   0;
+	95   :   100;
+	96   :   70;
+	97   :   110;
+	98   :   130;
+	99   :   5;
+	100  :   30;
+	101  :   255;
+	102  :   204;
+	103  :   1;
+	104  :   70;
+	105  :   110;
+	106  :   130;
+	107  :   5;
+	108  :   30;
+	109  :   65534;
+	[110..112]  :   4;
+	[113..124]  :   555;
+	[125..127]  :   0;
+END;

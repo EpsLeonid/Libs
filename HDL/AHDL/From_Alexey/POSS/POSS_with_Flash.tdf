@@ -1,0 +1,206 @@
+TITLE "Copy 64 words from 96LC56BT to Altera RAM";
+
+INCLUDE "Edge_Sensing.inc";
+INCLUDE "lpm_counter.inc";
+INCLUDE "lpm_shiftreg.inc";
+INCLUDE "96LC56BT.inc";
+INCLUDE "2PortRAM256.inc";
+
+CONSTANT WORD_WIDTH           = 16;
+
+CONSTANT OP_CODE_WRITE  	  = B"01";
+CONSTANT OP_CODE_READ  	 	  = B"10";
+
+
+--CONSTANT NUM_DATA_FLASH_COPY  = 3;
+PARAMETERS
+(
+	NUM_DATA_FLASH_COPY = 3   
+);
+
+SUBDESIGN POSS_with_Flash
+(
+  	RAM_DO							: INPUT;
+    RAM_Clock						: OUTPUT ;
+    RAM_CS							: OUTPUT ;
+    RAM_DI							: OUTPUT ;
+    
+    RAM_Direct                      : OUTPUT;
+    
+    POWER_GOOD                      : INPUT;
+    
+    BUSY 		                    : output;
+   
+  -- Standard Bus signaling for Master/Slave connection
+	-- General Signals
+	Bus_Clock						: input;  
+	DataBusStrobe					: input ; 
+    DataBus_In[WORD_WIDTH-1..0]		: input ; -- 
+    DataBusOut[WORD_WIDTH-1..0]		: output; -- 
+	-- Slave Mode Signals	-- используется при работе данного Модуля в режиме Slave
+	--Select							: input ;
+	--Direct_In						: input; 
+	AddrBus_In[7..0]				: input ; 
+	-- Master Mode Signals -- используется при работе данного Модуля в режиме Master)
+	AccessRequest           		: output; -- запрос к Арбитру на доступ к шине для чтения/записи данных Пользователя в режиме Master	
+	AccessGranted					: input;  -- Разрешение Арбитра выставить Адрес и направление обмена (захват шины)
+	DirectOut						: output; -- направление передачи данных, на внутреннюю шину или с нее, по умолчанию =GND, передача от внутренних ресурсов платы Модуль,
+	AddrBusOut[15..0]      			: output; -- адрес при операциях доступа ко внутренним ресурсам Оцифровщика (чтения/записи по Командному Листу).
+	
+)
+
+VARIABLE
+    
+    Ext_RAM 						: 96LC56BT;
+    
+    StartCycle                      : node;
+    Next_Cycle		                : Edge_Sensing;
+    
+    Alt_RAM                         : 2PortRAM256;
+    WordCounter                     : lpm_counter with (lpm_width=8, lpm_direction="up" );
+    AddrCounter                     : lpm_counter with (lpm_width=8, lpm_direction="up" );
+    Start_Copy_ES                   : Edge_Sensing;
+    Cycle_Copy_SRFF                 : SRFF;
+    End_Copy                        : node;
+    
+    OpCode_BUS[1..0] 				: node;
+    Address_BUS[7..0]				: node;
+    Data_BUS[15..0]					: node;
+    Address_BUS_RAM[7..0] 			: node;
+
+    
+    WC                              : lpm_counter with (lpm_width=16, lpm_direction="up" );
+    
+    LinkBitCounter					: LPM_COUNTER with ( lpm_width=16, lpm_direction="up" ); -- счетчик числа принятых/переданных бит из/в линк
+	EndPOSSCycle					: node; -- флаг окончания цикла приема/передачи из/в линк
+
+    --POSS_Active_ES                  : Edge_Sensing;
+	POSS_ActiveFlag					: SRFF;
+	TxWordReload					: node; 
+	Addr_VS_Data                    : node;
+	--Addr_VS_Data_SRFF               : SRFF;
+
+
+	PointerCounter               	: LPM_COUNTER with ( lpm_width=7, lpm_direction="up" ); -- счетчик числа принятых/переданных слов
+    Addr_Page_offset[7..0]			: node ;
+    Data_Page_offset[7..0]			: node ;
+	AccessRequest					: SRFF; 
+
+    POSS_Cycle						: SRFFE; 
+    Finished						: SRFFE ;
+    
+BEGIN
+
+
+    Ext_RAM.Clock 		 	 = Bus_Clock;
+    Ext_RAM.OpCode[1..0] 	 = OpCode_BUS[1..0];
+    Ext_RAM.Address_In[7..0] = Address_BUS[7..0];			
+    Ext_RAM.Data_In[15..0]	 = Data_BUS[15..0];			
+    Ext_RAM.Exchange         = StartCycle;
+	Ext_RAM.RAM_DO       	 = RAM_DO;
+	
+	RAM_Direct 				 = Ext_RAM.DirectOut;
+	RAM_Clock				 = Ext_RAM.RAM_Clock;
+	RAM_CS					 = Ext_RAM.RAM_CS;
+	RAM_DI					 = Ext_RAM.RAM_DI;
+	
+	OpCode_BUS[1..0]  = B"10";
+    Address_BUS[5..0] = AddrCounter.q[5..0];
+    Address_BUS[7]    = GND;
+    Data_BUS[15..0]   = GND; 
+    Address_BUS_RAM[6]= VCC;  -- задаем половину памяти загрузчика в котору копируем данные из флеш 
+                              --(0..63  /128..191 адреса/данные - это GND)
+                              --(64..127/192..255 адреса/данные - это VCC)
+	Address_BUS_RAM[5..0] = AddrCounter.q[5..0];
+    
+    Start_Copy_ES.(d,clk)                         = (POSS_Cycle.q, Bus_Clock);
+    Cycle_Copy_SRFF.(S,clk,R)					  = (Start_Copy_ES.q, Bus_Clock, End_Copy AND Next_Cycle.q);
+
+    WordCounter.(clock,cnt_en,clk_en,sclr) = (Bus_Clock, Next_Cycle.q, VCC, !Cycle_Copy_SRFF.q);
+    AddrCounter.(clock,cnt_en,clk_en,sclr) = (Bus_Clock, Next_Cycle.q, VCC, (Addr_VS_Data AND Next_Cycle.q) OR !Cycle_Copy_SRFF.q);
+    
+    IF (WordCounter.q[]==NUM_DATA_FLASH_COPY*2-1)   THEN End_Copy = VCC;
+											        ELSE End_Copy = GND;
+    END IF;
+    
+    IF (WordCounter.q[]< NUM_DATA_FLASH_COPY) THEN Address_BUS[6] = GND; Address_BUS_RAM[7]= GND;
+											  ELSE Address_BUS[6] = VCC; Address_BUS_RAM[7]= VCC;
+	END IF;
+	
+	IF (WordCounter.q[]==NUM_DATA_FLASH_COPY-1) THEN Addr_VS_Data = VCC;
+											    ELSE Addr_VS_Data = GND;
+    END IF;
+	
+	
+    
+    
+    StartCycle = (Next_Cycle.q OR Start_Copy_ES.q) AND !End_Copy;
+    
+    WC.(clock,cnt_en,clk_en,sclr) = (Bus_Clock, Cycle_Copy_SRFF.q, VCC, !Cycle_Copy_SRFF.q OR Next_Cycle.q);
+    Next_Cycle.(d,clk) = ((WC.q[]==3000), Bus_Clock);
+    
+    Alt_RAM.clock           = Bus_Clock;
+    Alt_RAM.data_a[15..0]   = Ext_RAM.Data_Out[];
+    Alt_RAM.wren_a          = Next_Cycle.q AND Cycle_Copy_SRFF.q;
+ --------------------------------------------------   
+
+
+
+     
+-----------------------------------------------------------------------------------------------------------
+    --POSS_Active_ES.(d,clk)      = (!Cycle_Copy_SRFF.q, Bus_Clock);
+    --POSS_ActiveFlag.(S,R,clk)	= (POSS_Active_ES.q, EndPOSSCycle, Bus_Clock );
+    POSS_ActiveFlag.(S,R,clk)	= (End_Copy AND Next_Cycle.q, EndPOSSCycle, Bus_Clock );
+	
+	Addr_Page_offset[6..0] = PointerCounter.q[6..0]; -- перемещение внутри страницы адресов
+	Addr_Page_offset[7]    = GND;
+	Data_Page_offset[6..0] = PointerCounter.q[6..0]; -- перемещение внутри страницы данных
+	Data_Page_offset[7]    = VCC;
+	
+
+    Alt_RAM.data_b[15..0]   = DataBus_In[];
+    Alt_RAM.wren_b			= GND;
+    
+    AddrBusOut[]		 	= Alt_RAM.q_a[];
+    DataBusOut[]            = Alt_RAM.q_b[]; 
+    
+    IF Cycle_Copy_SRFF.q == VCC
+		then Alt_RAM.address_a[7..0] = Address_BUS_RAM[7..0]; else Alt_RAM.address_a[7..0] = Addr_Page_offset[7..0];
+	end if;
+    IF POSS_ActiveFlag.q == VCC
+		then Alt_RAM.address_b[7..0] = Data_Page_offset[]; else Alt_RAM.address_b[7..0] = AddrBus_In[7..0];
+	end if;
+	
+	
+	PointerCounter.(clock, cnt_en, sclr) = (Bus_Clock, TxWordReload AND POSS_ActiveFlag.q, Cycle_Copy_SRFF.q OR EndPOSSCycle) ;  -- счетчик-указатель адреса страницы ОЗУ Редиректора
+    LinkBitCounter.(clock, cnt_en, sclr) = (Bus_Clock, (POSS_ActiveFlag.q AND !AccessRequest.q),EndPOSSCycle);                   -- paused on AccessReq.
+
+-- Гененерим схемы совпадения на моменты перезагрузки данных в 
+   FOR i IN 0 TO 255 GENERATE
+    	--IF LinkBitCounter.q[] == (1+20*i) 
+    	IF LinkBitCounter.q[] == (1+127*i) 
+		   THEN	TxWordReload = VCC; -- формируем импульс для отправки данных на внутреннюю шину
+		   ELSE	TxWordReload = GND;
+      	END IF;
+   END GENERATE;
+   --IF (LinkBitCounter.q[] == 1+20*127+100) THEN EndPOSSCycle=VCC;
+   IF (LinkBitCounter.q[] == 1+127*127) THEN EndPOSSCycle=VCC;
+										ELSE EndPOSSCycle=GND;
+   END IF;
+
+
+
+-- Master Access Control
+	DirectOut         = VCC;
+	AccessRequest.S   = TxWordReload ;
+	AccessRequest.clk = Bus_Clock ;
+	AccessRequest.R   = (DataBusStrobe AND AccessGranted) ;
+	
+	
+	POSS_Cycle.(S,R,clk)	 =	(POWER_GOOD AND !Finished.q, EndPOSSCycle, Bus_Clock );
+	Finished.(R,S,clk, clrn) =	(POSS_Cycle.q, EndPOSSCycle, Bus_Clock, VCC );
+	--POSS_Cycle.(S,R,clk)	 =	(POWER_GOOD, EndPOSSCycle, Bus_Clock );
+	BUSY = POSS_Cycle.q;
+	
+	    
+END;

@@ -1,0 +1,447 @@
+TITLE "CMD3_DOWN_Link " ;
+-- Файл содержит описание протокола медленного линка КМД-3 и его
+-- унифицированную реализацию - Модуль Down_Link для вышестоящего узла ССД.
+-- Рубан, Козырев, 4592.
+-- Данная часть должна встраиваться в платы МЧС и обеспечивать связь с нижестоящим
+-- по дереву блоком - ГИБДД (он же - селивановская коробка)
+% Данная версия расширена узлами :
+"Пресэмплер" - автоматическая подстройка фазы, компенсирующая
+возможную разность задержки фазы и данных в соединительных кабелях,
+Синхронный старт, индивидуальный старт, внешнее подключение констант
+Окно разрешения поиска ответа от Up_Link-а
+
+%
+INCLUDE "CMD3_DAQ_LINK.INC";
+INCLUDE "lpm_shiftreg.inc" ;
+INCLUDE "lpm_counter.inc" ;
+INCLUDE "Edge_Sensing.inc" ;
+INCLUDE "DP_RAM.inc" ;
+
+PARAMETERS
+(
+RefClock=175   -- Пользователь здесь указывает частоту в МГц-ах (целых), которую он подал на вход "Cavity_Clock" 
+--Link_Speed=25	-- Пользователь здесь указывает частоту в МГц-ах (целых), на которой работает Линк
+);
+ASSERT (RefClock>20 AND RefClock<196)
+REPORT "You enter RefClock (%) which is not suitable for Link function" RefClock
+SEVERITY ERROR;
+
+Constant PrescalerModule = RefClock div Link_Speed ;
+
+SUBDESIGN CMD3_DOWN_Link
+(
+-- Module specific signals
+		-- Сигналы со стороны последовательного канала
+
+			Link_Data_in            : input ; -- Данные для приема/передачи в/из линка
+			Link_Data_out           : output;
+			Link_TxRx               : OUTPUT; -- направление передачи, управляет приемо-передатчиком LVDS
+
+		-- Сигналы со стороны параллельного канала (Интерфейс Пользователя)
+
+		Cavity_Clock	: input ; -- Global FPGA Clock
+	   	Start_Enable	: input; --  to synchronize StartBit Rizing Edge
+	   	Sample_Enable	: input; --  to synchronize bit rate
+
+		
+		StartLink								: input = GND ;  -- Запуск цикла, для синхронного запуска нескольких линков
+		LinkMessage								: output;   -- уровень, сообщает о занятости линка
+		OpCodeData[COMMAND_SIZE+PAUSE-1..0]		: input; -- отправляемая команда при синхронном старте
+		FirstWordData[WORD_WIDTH-1..0]			: input; -- отправляемые данные  при синхронном старте
+--		Transaction_Status[WORD_WIDTH-1..0]		: output;
+		DL_Addr_In[7..0] 						: input;
+		DL_Data_Out[WORD_WIDTH-1..0] 			: output;
+		
+		EndCycle								: output;
+
+-- Standard Bus signaling for Master/Slave connection
+			-- General Signals
+	Bus_Clock	: input ;  -- Global FPGA Clock, assumed 100MHz for T2Q project 
+	Reset					: input=GND ;  -- Common FPGA Reset
+	DataBus_In[15..0]		: input;  -- отправляемые с Внутренней Шины в Линк данные
+	DataBusOut[15..0]       : output; -- выдаваемые на Внутреннюю Шину из Линка данные
+	DataBusStrobe           : input;  -- строб приема/передачи данных наружу (высокий уровень, защелкиваем по заднему фронту)
+	Error                   : output; -- сигнал ошибки (неверная команда)
+
+	-- Master Mode Signals -- используется при работе данного Модуля в режиме Master)
+--	AccessRequest           : output; -- запрос на доступ к шине для чтения/записи данных Пользователя 	
+--	AccessGranted			: input;  -- Разрешение Арбитра выставить Адрес и направление обмена (захват шины)
+--	DirectOut				: output; -- направление передачи данных, на внутреннюю шину или с нее, по умолчанию =GND, передача от внутренних ресурсов платы Модуль,
+--	AddrBusOut[15..0]       : output; -- адрес при операциях доступа ко внутренним ресурсам Оцифровщика (чтения/записи по Командному Листу).
+
+			-- Slave Mode Signals	-- используется при работе данного Модуля в режиме Slave
+		Select					: input;  -- Выбор Модуля для работы с памятью Командного Листа в режиме Slave (с КАМАК-ом)
+		DirectIn				: input;  -- направление передачи данных, Если =GND, то данный Модуль читается, если =VCC, то пишется.
+		AddrBus_In[7..0]		: input;  -- адрес при операциях доступа чтения/записи Командного Листа с КАМАК-а
+	
+    Test1,Test2,Test3,Test4,Test5,Test6,Test7      : output ; -- to be conected to test output of main Project 
+TestOutBus[15..0]				: output ;
+PresamplerStorageOut[PrescalerModule-1..0]		: output ;
+TimeOutError					: output;
+Rx_Start_Bit_Found				: output;
+
+Answer_Found_o					: output;
+)
+
+
+
+
+VARIABLE
+
+-- Flow Control
+AutoStart			: SRFFE ; -- Индивидуальный программный старт по обращению в Модуль
+SyncStart			: node ; -- Общий для нескольких линков старт (как в МЧС)
+SyncStart_Ena		: DFFE ; -- Разрешение на общий старт
+StartLinkCycle		: Edge_Sensing; -- сигнал начала цикла приема/передачи данных из/в линк
+EndLinkCycle		: node; -- флаг окончания цикла приема/передачи из/в линк
+LinkActiveFlag		: SRFF; -- флаг начала цикла приема/передачи данных из/в линк
+ChangeDirect		: node; -- сигнал о преключении направления передачи
+LinkDirectFlag		: SRFF; -- флаг передачи=LOW/приема=HIGH из/в линк
+LinkBitCounter		: LPM_COUNTER with ( lpm_width=OrderOfBitNumber); -- счетчик числа переданных бит в линк
+
+
+
+-- Transmitter Part
+%-- Bit-to-Clock-to-LinkSpeed Synchro
+Prescaler			:	LPM_COUNTER with ( lpm_width=4, lpm_direction="up" );
+PrescalerOut		:	node ;  -- counter cycling
+--Sample_Enable		:	node ; -- One FPGA Cavity_Clock pulse width which enables all data moving
+%
+
+-- Word-by-word organization
+TxShifter			: LPM_SHIFTREG with (lpm_width=WORD_WIDTH, lpm_direction="left"); -- регистр-передатчик выходных данных 
+Reg_OpCode			: LPM_SHIFTREG with (lpm_width=COMMAND_SIZE+PAUSE, lpm_direction="left");  -- регистр Команд
+TxOpCodeReload			: node;
+TxHeaderReload			: node; -- высоким уровнем разрешает перезагрузку команды и первого слова 
+TxWordReload			: node; -- высоким уровнем разрешает перезагрузку слова из TxDataReg в TxShifter
+Tx_Any_Reload			: node;
+--LockTxWord[WordsToGoDown+1..0] : node ;-- выходы компараторов-формирователей
+-- из Reg_OpCode и Reg_EventNumber в TxShifter
+
+
+-- Resiever Part
+-- Automatic bit-to-Phase Ajustment (Alignment) 
+Rx_Window_Flag		: SRFFE; -- Flag of answer search Time Window
+Rx_Window_Start		: node;
+Rx_Window_End		: node;
+Presampler_Desabler	:	SRFF; -- Flag of Phase-Dependent enable 
+Presampler			:	LPM_SHIFTREG with (lpm_width=(2 * PrescalerModule) , lpm_direction="left"); -- Sampling input data at high clock rate
+PresamplerStorage	:	LPM_SHIFTREG with (lpm_width=PrescalerModule, lpm_direction="left"); -- Sampling input data at high clock rate
+Rx_Start_Bit_Found	:node ;
+
+Answer_Found		: node ; -- обнаружение валидности ответа от UpLink-а
+Answer_Flag			: SRFF ; -- Флаг валидности ответа от UpLink-а
+HeaderError			: node ; --
+TimeOutError		: node;
+ 
+-- Word-by-word organization
+RxHeaderReload				: node;
+RxWordReload				: node; -- сигнал конца фрейма (о приеме одного слова), 
+Rx_Any_Reload				: node;
+--LockRxData[WordsToGoUp..0]	: node ; -- выходы компараторов-формирователей
+RxShifter			: LPM_SHIFTREG with (lpm_width=WORD_WIDTH+PAUSE+PAUSE, lpm_direction="left"); -- регистр входных данных, sampled at normal rate 
+AnswerBitCounter	: LPM_COUNTER with ( lpm_width=WORD_WIDTH ); -- счетчик числа принятых бит из линка
+
+
+
+-- ParityError		: node; --
+-- CRC_Error		: node; --
+
+RAM_Word_Counter	: LPM_COUNTER with ( lpm_width=8 ); -- счетчик числа принятых/переданных слов - указатель адреса памяти
+
+Buffer_RAM			: DP_RAM ; -- Dual-Port RAM 16x256W
+--Addr_Page_offset[9..0]		: node;
+--Data_Page_offset[9..0]		: node;
+--RAM_a_we					: node;
+--RAM_b_we					: node;
+
+Copy_To_MASS_RAM    : node;
+
+
+--**********************************************************************************************
+BEGIN
+DEFAULTS
+	TxWordReload = GND; -- Implicit OR declaration
+	RxWordReload = GND;
+END DEFAULTS;
+
+
+
+------------------- Section Data Sampling and Clock Adjustment Begin
+
+%------------------- Section Tx Clock Phase Adjustment Begin
+-- Bit-to-Clock-to-LinkSpeed Synchro
+-- Прескэйлер хранит фазу удвоенной частоты, назначенной для каждого конкретного Линка 
+ 
+-- делаем встроенный в каждый Модуль и ресинхронизуем по StartLinkCycle 
+IF (Prescaler.q[] == (PrescalerModule-1) ) 	THEN PrescalerOut = VCC; ELSE PrescalerOut = GND; END IF;
+Prescaler.clock	=	Clock;
+Prescaler.sclr	=	PrescalerOut OR Bunch_Crossing_Edge.q OR Reset ; -- Синхронизуем счетчик
+
+IF (Prescaler.q[] == Bunch_Crossing_to_Start_Bit_Shift )
+ 	THEN Sample_Enable = VCC;  -- Main Syncro Pulse
+	ELSE Sample_Enable = GND;  -- Задаем относительную фазу
+END IF;
+------------------- Section Tx Clock Phase Adjustment End
+%
+
+------------------- Section Rx Data-Delay to Clock Phase Adjustment Begin
+-- Automatic bit-to-Phase Ajustment (Alignment) 
+
+Presampler.shiftin			=	Link_Data_In	;	-- Data enters Presampler
+Presampler.clock			=	Cavity_Clock ;				-- Data sampled at High Rate
+PresamplerStorage.data[PrescalerModule-1..0]	=	Presampler.q[PrescalerModule-1..0];
+PresamplerStorage.( clock, load)	=	(Cavity_Clock, VCC) ;
+PresamplerStorage.sclr	=	Presampler_Desabler.q ;
+PresamplerStorage.enable	=	Sample_Enable AND !Rx_Start_Bit_Found;
+IF (PresamplerStorage.q[PrescalerModule-1..0] != GND)   -- Как только стартовый бит обнаружен, закрываем регистр,
+then Rx_Start_Bit_Found = VCC ;					-- который теперь хранит фазу пришедшего бита относительно Sample_Enable
+else Rx_Start_Bit_Found = GND ; 
+END IF;
+-- Схема фазировки разрешается по Rx_Window_Start и запрещается по любому другому событию
+Presampler_Desabler.clk	=	Cavity_Clock;
+Presampler_Desabler.R	=	Rx_Window_Start ; --ChangeDirect ; 
+Presampler_Desabler.S	=	EndLinkCycle OR Error OR Reset ;  -- 
+
+-- Так как относительная фаза теперь известна, остается только выбрать правильный отвод от линии задержки, 
+-- которую изображает из себя пресэмплер
+CASE PresamplerStorage.q[] IS
+		WHEN b"000001"	=>  RxShifter.shiftin	=	Presampler.q[0 + PrescalerModule-1]; -- вход шифтера Rx (Normal Rate) для приема данных из линка
+		WHEN b"000011"	=>	RxShifter.shiftin	=	Presampler.q[1 + PrescalerModule-1];
+		WHEN b"000111"	=>	RxShifter.shiftin	=	Presampler.q[2 + PrescalerModule-1];
+		WHEN b"001111"	=>	RxShifter.shiftin	=	Presampler.q[3 + PrescalerModule-1];
+		WHEN b"011111"	=>	RxShifter.shiftin	=	Presampler.q[4 + PrescalerModule-1];
+		WHEN b"111111"	=>	RxShifter.shiftin	=	Presampler.q[5 + PrescalerModule-1];
+		WHEN b"111111"	=>	RxShifter.shiftin	=	Presampler.q[6 + PrescalerModule-1];
+		WHEN b"111110"	=>	RxShifter.shiftin	=	Presampler.q[6 + PrescalerModule-1];
+		WHEN OTHERS		=>	RxShifter.shiftin	=	GND;
+END CASE;
+PresamplerStorageOut[]	=	PresamplerStorage.q[];
+TestOutBus[15..0]			=	RxShifter.q[];
+
+RxShifter.(clock, enable) = (Cavity_Clock, Sample_Enable); -- шифтер Rx синхронно продвигает данные из линка
+RxShifter.sclr	=	Reset ;
+------------------- Section Rx Data-Delay to Clock Phase Adjustment End
+
+------------------- Section Data Sampling and Clock Adjustment End
+
+
+
+
+
+------------------- Section Main Loop  "Начало и конец работы линка" Begin
+-- Здесь описаны основные события цикла работы линка  
+LinkMessage	=	LinkActiveFlag.q ;
+
+        StartLinkCycle.(d,clk,clr,ena) = ( (SyncStart AND SyncStart_Ena.q) OR AutoStart.q ,Cavity_Clock,GND,Start_Enable); -- EdgeSensing
+		LinkActiveFlag.(S,R,clk) = (StartLinkCycle.q, EndLinkCycle OR Reset OR Error, Cavity_Clock);
+SyncStart = StartLink ; -- 
+
+-- опознание конца цикла -> устанавливаем сигнал EndLinkCycle и тем самым сбрасываем счетчик тактов
+LinkBitCounter.(clock,cnt_en,sclr) = (Cavity_Clock, (LinkActiveFlag.q AND Sample_Enable), !LinkActiveFlag.q);
+IF (LinkBitCounter.q[OrderOfBitNumber-1..0] == MaxNumberOfBit)
+    THEN EndLinkCycle = VCC;-- конец цикла
+    ELSE EndLinkCycle = GND;
+END IF;
+
+-- запускаем механизм копирования в массовуйю память за 8 слов до конца приема данных DownLink-ом
+IF (LinkBitCounter.q[OrderOfBitNumber-1..0] == MaxNumberOfBit-8*WORD_WIDTH)
+    THEN Copy_To_MASS_RAM = VCC;
+    ELSE Copy_To_MASS_RAM = GND;
+END IF;
+EndCycle = Copy_To_MASS_RAM;
+
+------------------- "Direction control" Begin
+-- режим передачи по высокому уровню LinkDirectFlag.q, режим приема по низкому
+-- по концу цикла переключаемся на передачу (состояние по умолчанию)
+LinkDirectFlag.(R,clk,S) = (ChangeDirect,Cavity_Clock,(EndLinkCycle OR StartLinkCycle.q OR Error) );
+LinkDirectFlag.prn	=	!Reset;
+-- условие переключения с приема на передачу
+IF (LinkBitCounter.q[OrderOfBitNumber-1..0] == BitOfReverse) 
+THEN ChangeDirect = VCC;  -- переключаемся с передачи на прием
+ELSE ChangeDirect = GND;
+END IF;
+
+Link_TxRx = LinkDirectFlag.q; -- Connection to Link Interface
+
+-- Operation of Searching Answer Time Window 
+Rx_Window_Flag.(S,R,clk)	=	(Rx_Window_Start, Rx_Window_End, Cavity_Clock);
+IF (LinkBitCounter.q[OrderOfBitNumber-1..0] == BitOfAnswerWindowStart) 
+THEN Rx_Window_Start = VCC;  -- 
+ELSE Rx_Window_Start = GND;
+END IF;
+IF (LinkBitCounter.q[OrderOfBitNumber-1..0] == BitOfAnswerWindowEnd) 
+THEN Rx_Window_End = VCC;  -- 
+ELSE Rx_Window_End = GND;
+END IF;
+
+------------------- "Direction control" End
+
+
+-- Проверка валидности вернувшейся команды -> взводим флаг наличия ответа и начинаем счет тактов 
+	IF ( RxShifter.q[COMMAND_SIZE+PAUSE-1..0] == GND) -- Not an Empty Register!!!
+			THEN Answer_Found = GND; 
+			ELSE
+				IF ( RxShifter.q[COMMAND_SIZE+PAUSE-1..0] == Reg_OpCode.q[COMMAND_SIZE+PAUSE-1..0] )	
+					THEN Answer_Found = Rx_Window_Flag; -- Answer MUST be accepted during Window
+					ELSE Answer_Found = GND; 
+				END IF;
+	END IF;
+Answer_Flag.(S, clrn, R, clk)	=(Answer_Found, !Reset, EndLinkCycle,  Cavity_Clock  );
+Answer_Found_o = Answer_Found AND SyncStart_Ena.q;
+
+
+	TimeOutError	=	Rx_Window_End AND !Answer_Flag.q ;  -- No answer at all =>TimeOut!!!
+	HeaderError		=	Rx_Window_End AND !Rx_Start_Bit_Found; -- Code NOT Valide => HeaderError
+
+Error	=	HeaderError OR TimeOutError ; -- OR ParityError;%
+
+AnswerBitCounter.(clock,cnt_en,sclr) = (Cavity_Clock, (Answer_Flag.q AND Sample_Enable), !LinkActiveFlag.q);
+
+------------------- Section Main Loop  "Начало и конец работы линка" End
+
+
+
+
+
+
+
+-- Section "Bus Connections" Begin
+-- Здесь описана структура соединений шин данных
+		TxShifter.shiftin = GND; -- используется для создания паузы (сдвигаем на PAUSE тактов)
+		Link_Data_Out = TxShifter.shiftout; -- подключение выхола шифтера Tx на двунаправленный выход
+		
+--		Reg_OpCode.data[COMMAND_SIZE+PAUSE-1..0]		=	Buffer_RAM.q_a[(WORD_WIDTH-1)..(WORD_WIDTH-COMMAND_SIZE-PAUSE)] ;
+--		TxShifter.data[(WORD_WIDTH-1)..0]	=	Buffer_RAM.q_a[15..0];
+-- Управление защелкиванием Reg_OpCode: копируются данные из памяти, ячейка 0 или из внешней шины в момент запуска линка
+--Это для сравнения c пришедшим из Линка 
+
+		CASE (TxOpCodeReload,TxHeaderReload,SyncStart_Ena.q) IS
+	WHEN b"100"	=> TxShifter.data[(WORD_WIDTH-1)..(WORD_WIDTH-COMMAND_SIZE-PAUSE)]	=	Buffer_RAM.q_a[COMMAND_SIZE+PAUSE-1..0];
+	               TxShifter.data[(WORD_WIDTH-COMMAND_SIZE-PAUSE-1)..0]	= GND;
+			Reg_OpCode.data[COMMAND_SIZE+PAUSE-1..0]	=	Buffer_RAM.q_a[COMMAND_SIZE+PAUSE-1..0] ;
+	WHEN b"010" => 	TxShifter.data[(WORD_WIDTH-1)..0]	=	Buffer_RAM.q_a[15..0];
+			--Reg_OpCode.data[COMMAND_SIZE+PAUSE-1..0]	=	Buffer_RAM.q_a[(WORD_WIDTH-1)..(WORD_WIDTH-COMMAND_SIZE-PAUSE)] ;
+	
+	WHEN b"101" => 	TxShifter.data[(WORD_WIDTH-1)..(WORD_WIDTH-COMMAND_SIZE-PAUSE)]	=	OpCodeData[COMMAND_SIZE+PAUSE-1..0]	;
+					TxShifter.data[(WORD_WIDTH-COMMAND_SIZE-PAUSE-1)..0]	= GND;
+					Reg_OpCode.data[COMMAND_SIZE+PAUSE-1..0]	=	OpCodeData[COMMAND_SIZE+PAUSE-1..0]	;
+	WHEN b"011" =>	TxShifter.data[(WORD_WIDTH-1)..0]	=	FirstWordData[WORD_WIDTH-1..0]  ;
+					Reg_OpCode.data[COMMAND_SIZE+PAUSE-1..0]	=	OpCodeData[COMMAND_SIZE+PAUSE-1..0]	;
+					
+	WHEN OTHERS => 	TxShifter.data[(WORD_WIDTH-1)..0]	=	Buffer_RAM.q_a[15..0];
+					Reg_OpCode.data[COMMAND_SIZE+PAUSE-1..0]	=	Buffer_RAM.q_a[(WORD_WIDTH-1)..(WORD_WIDTH-COMMAND_SIZE-PAUSE)] ;
+		END CASE;
+					
+		Buffer_RAM.data_a[15..0]		=	RxShifter.q[(WORD_WIDTH+PAUSE-1)..PAUSE];  -- записывать данные в порт А может только Линк
+		Buffer_RAM.clock_a = Cavity_Clock;
+		Buffer_RAM.address_a[7..0]		=	RAM_Word_Counter.q[7..0];
+
+
+		Buffer_RAM.wren_a = Rx_Any_Reload AND Sample_Enable AND Answer_Flag.q ;
+		
+
+
+Buffer_RAM.clock_b = Bus_Clock;
+Buffer_RAM.data_b[15..0]		=	DataBus_In[];
+--Buffer_RAM.address_b[7..0]		=	AddrBus_In[7..0];
+IF(Select == VCC) THEN Buffer_RAM.address_b[7..0] =	AddrBus_In[7..0];
+					   DL_Data_Out[] = H"FF";
+				  ELSE Buffer_RAM.address_b[7..0] = DL_Addr_In[];
+					   DL_Data_Out[] = Buffer_RAM.q_b[];
+END IF;
+DataBusOut[]					=	Buffer_RAM.q_b[15..0];
+Buffer_RAM.wren_b = DataBusStrobe and  DirectIn AND Select;
+
+
+--TestOutBus[]	=	Buffer_RAM.q_a[15..0];
+-- Section "Bus Connections" End
+--------------------------------------------------------------------
+
+-- счетчик-указатель адреса Буферного ОЗУ
+RAM_Word_Counter.clock = Cavity_Clock; -- считаем на реальной частоте приема/передачи данных
+RAM_Word_Counter.cnt_en         = (Tx_Any_Reload OR Rx_Any_Reload) AND Sample_Enable ; -- счетчик-указатель считает номера слов на приемо/передачу данных
+RAM_Word_Counter.sclr           = ! LinkActiveFlag.q OR Reset;  -- обнуление счета происходит  при неактивности линка
+RAM_Word_Counter.sload	=	ChangeDirect;
+RAM_Word_Counter.data[]	=	16 ;  -- отступаем в область, начинающуюся с 16-ого адреса.
+
+----------------------------------------------------------------------
+
+Test1 = LinkActiveFlag.q;
+Test2 = Sample_Enable ;
+Test3 = Bus_Clock ;
+Test4 = Presampler.q[0];
+Test5 = Answer_Flag.q;
+Test6 = Rx_Window_Start;
+--Test7 =  Sample_Enable AND !(PresamplerStorage.q[0] OR PresamplerStorage.q[1] OR PresamplerStorage.q[2] OR PresamplerStorage.q[3] ) ;
+Test7	=	Rx_Window_End;
+ 
+--------------------------------------------------------------------
+-- Дальше идет собственно управление продвижением данных, организация пословной разбивки  
+
+-- Section "Tx Flow Control" Begin
+TxShifter.(clock,enable) = (Cavity_Clock, Sample_Enable); -- сдвигаем данные для передачи в линк
+TxShifter.load = (Tx_Any_Reload) AND LinkDirectFlag.q ; -- защелкиваем данные для передачи в линк
+		Tx_Any_Reload	=	TxWordReload OR TxHeaderReload OR TxOpCodeReload; -- Used for Tx load and RAM addr increment
+Reg_OpCode.(clock, enable, load)	=	(Cavity_Clock, TxOpCodeReload AND Sample_Enable, VCC); --Это для сравнения пришедшего из Линка 
+
+
+    	IF (LinkBitCounter.q[(OrderOfBitNumber-1)..0] == 1 ) 
+		    THEN	TxOpCodeReload = VCC; -- формируем импульс для защелкивания OpCode из RAM(0)или из внеш.шины в регистр Tx shifter
+		    ELSE	TxOpCodeReload = GND;
+      	END IF;
+    	IF (LinkBitCounter.q[(OrderOfBitNumber-1)..0] == Bit_of_Header_DOWN_Reload ) 
+		    THEN	TxHeaderReload = VCC; -- формируем импульс для защелкивания Header в регистр Tx shifter
+		    ELSE	TxHeaderReload = GND;
+      	END IF;
+
+-- Гененерим схемы совпадения на моменты перезагрузки данных в Tx shifter
+   FOR i IN 1 TO (WordsToGoDown) GENERATE
+    	IF (LinkBitCounter.q[(OrderOfBitNumber-1)..0] == ((Bit_of_Header_DOWN_Reload)+(WORD_WIDTH+PAUSE)*i)) 
+		    THEN	TxWordReload = VCC; -- формируем импульс для защелкивания данных в регистр Tx shifter
+		    ELSE	TxWordReload = GND;
+      	END IF;
+   END GENERATE;
+
+-- Section "Tx Flow Control" End
+
+
+
+-- Section "Rx Flow Control" Begin
+Rx_Any_Reload	=	RxHeaderReload OR RxWordReload ;
+-- Управление защелкиванием данных в буферное ОЗУ
+			IF (AnswerBitCounter.q[(OrderOfBitNumber-1)..0] ==  WORD_WIDTH+PAUSE) 
+				THEN  RxHeaderReload = VCC;
+			    ELSE  RxHeaderReload = GND;
+			END IF;
+
+-- Генерим схемы совпадения на моменты заполнения Rx shiftera и используем их для записи в память 
+			FOR i IN 1 TO WordsToGoUp-1 GENERATE
+			   IF (AnswerBitCounter.q[OrderOfBitNumber-1..0] == ((WORD_WIDTH+PAUSE)*(i+1)))
+			          THEN RxWordReload = VCC; -- формируем импульс для защелкивания данных в ОЗУ
+					  ELSE RxWordReload = GND;
+			   END IF;
+			END GENERATE;
+
+-- Section "Rx Flow Control" End
+
+
+
+
+-- Section "User Interface Control" Begin
+IF ( (AddrBus_In[7..0] == 10) AND DataBusStrobe and  DirectIn AND Select )
+THEN AutoStart.S = (!SyncStart_Ena.q); ELSE AutoStart.S = GND; END IF;
+AutoStart.(clk, R)	=	(Bus_Clock, LinkActiveFlag.q);
+
+IF ( (AddrBus_In[7..0] == 11) AND DataBusStrobe and  DirectIn AND Select )
+THEN SyncStart_Ena.ena = VCC; ELSE SyncStart_Ena.ena = GND; END IF;
+
+--AutoStart.S = (!SyncStart_Ena.q) AND (AddrBus_In[7..0] == 10) AND DataBusStrobe and  DirectIn AND Select;
+
+--SyncStart_Ena.ena   =  (AddrBus_In[7..0] == 11) AND DataBusStrobe and  DirectIn AND Select;
+SyncStart_Ena.d		=	DataBus_In[0];
+SyncStart_Ena.(clk, clrn)	=	(Bus_Clock, !Reset);
+
+-- Section "User Interface Control" End
+
+END;

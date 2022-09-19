@@ -1,0 +1,401 @@
+TITLE "UFO32_10";
+-- Ver. UFO32_8e: Feature added: by "CommdList_Rd000" command, the AttCodes
+--                  and MaskCodes are read out from Loader's RAM to Link, 
+--                  then a "Loading" cycle is started by "reading" from 
+--                  a special Addr (see CommdList_Rd000 command
+--                  in "Control Unit" section)
+-- Ver. UFO32_8g: Set of Link' commands changed, fit to comply with recently 
+--                  re-arranged COMMON command set of MALINKA; 2 commands added.
+--                  Modules: UpLink, Arbiter, CAMAC_ufo are slightly renewed. 
+-- Ver. UFO32_8i: Execution of Link' commands is enabled/disabled by means of 
+--                  setting the mode via CAMAC ( F25A** / F30A0 commands);
+--                  Starting of operations by CAMAC and by Link unificated
+-- Ver. UFO32_8j: Multiplexing of the AddrBus and DataBus re-written; 
+--                  with Processor2g the Fclk=105MHz (reported by Quartus) !
+-- Ver. UFO32_8k: ErrorCounters added.  Multiplexing of the AddrBus and DataBus  
+--                  between register-like objects implemented by means of 
+--                  2nd stage of multiplexing.
+-- Ver. UFO32_8n: Compiled with RAMprog10.mif, has 4 Operations of direct R/W:
+--                  Read62/Write8 and Read/Write; BaseAddr-s of Programs changed.
+-- Ver. UFO32_10b:"Quick-Start" mode added;  "GATE_Pre-Open" mode added.
+--                  4 triggers which handle the modes are groupped in one regis-
+--                  ter R/W-accessible at addr=#2055
+
+         
+--============================================================================
+-- Map of Objects' addresses in the UFO32 Module
+
+
+Constant GateDur_offset = H"0800";  -- #2048 адрес кода длит-cти GATE, default =600 => 6 мксек
+Constant GateDel_offset = H"0801";  -- #2049 адрес кода задержки начала GATE, default =4
+Constant CtrlStat_offset= 2048+7;   -- #2055 "Control-Status Reg", composed of named Triggers
+
+Constant Servo_offset   = 2048+ 8;  --\(#2056..#2061) addresses of servo Regs and Cnts :
+Constant Servo_size     =       8;  --/ ErrCounters,  Reg_BaseAddr(#2061)
+
+Constant Link_IFace_Offset  = 2048+32;  -- #2080 - Link's InData_Port
+                                        -- #2081 - Link's Data_Port
+Constant OpCode_offset      = 2048+34;  -- #2082 - OpCode (read-only register)
+
+
+SUBDESIGN  UFO32
+(
+
+-- 5. UpLink signals 
+LinkClk         : input;    -- внешняя частота из Линка (25 МГц), Pin3
+LinkData        : bidir;    -- последовательный вход/выход данных линка  Pin1
+LinkTxRx        : output;   -- направление передачи в "DataLine" , Pin2
+
+
+test[10..1]          : output;   --
+)
+
+VARIABLE
+--============================================================================
+--******** Power-up self-Reset and self-Set pulses ***************************
+PowerUp0,               --\   Circuit 
+PowerUp1, PowerUp2,     -- \  which generates 
+PowerUp3, PowerUp4,     --  \ a pulse 
+PowerUp5, PowerUp6,     --  / for power-up Reset  \  many milliseconds apart 
+PwrUpReset,             -- /  and then few pulses  > from each other
+PwrUpSet1,PwrUpSet2: node;--/ for power-up Set    /  
+
+
+Link_InData_cs,         -- select for Rd/(Wr) from/(to) InData_word 
+Link_DataBus_cs : node; -- select for Rd/Wr from/to Link's Data port
+
+Digitizer_cs    : node;
+GateDur_cs      : node;
+GateDel_cs      : node;
+CtrlStat_cs     : node; -- CS for "Control-Status Reg" (consisting of named triggers)
+Servo_cs        : node; -- common CS for servo_objects
+OpCode_cs       : node;
+
+Loader_cs       : node;
+
+ZERO_cs         : node; 
+	
+--============================================================================
+-- 6. Processor, RAM blocks
+CPU             : Processor ;
+BaseAd[7..0]    : node; -- address of the beginning of selected Program
+BaseAddr[7..0]  : node; -- address of the beginning of selected Program, reg-ed
+
+--LoadRAM belongs to "Loader_ufo" unit, and is defined there
+--ADC_RAM belongs to "Digitizer_ufo" unit, and is defined there
+MainRAM         : MainRAM_ufo;  -- RAM  256words * 16bits, 1-port
+--ProgRAM belongs to "Processor" unit, and is defined there
+CommandRAM      : CommdRAM_ufo; -- RAM 1024words * 16bits, 1-port
+
+-- Register contains Base Address of Program to be started
+Reg_BaseAddr    : LPM_SHIFTREG with (lpm_width=8, lpm_direction="left");
+                                    -- lpm_avalue=240); --BaseAddr of test prog
+
+--============================================================================
+BEGIN
+
+--============================================================================
+-- 6. Processor **************************************************************
+CPU.Clock   = Clk100;   CPU.Sync    = Synchro25; 
+CPU.ProgInit        = StartProc ; 
+CPU.BaseAddr[7..0]  = BaseAddr[7..0];
+--CPU.Int[4..1]       = 
+CPU.int1            = Link_IFace.IORq;
+CPU.int4            = TestCt.q[25];
+
+CPU.DataIn[]        = DataBus[];   -- Data Bus - input
+--    = CPU.AddrOut[15..0] -- \ connected in Bus Management Description,
+--    = CPU.DataOut[15..0] -- /    in "Arbiter" section
+
+--Bus_Arbiter.BARQ[0] = CPU.AccessReq ; -- connected at "Arbiter" section
+--                    = CPU.RdWr;       -- connected at "Arbiter" section
+CPU.AccessGranted   = Bus_Arbiter.BAGD[0] ;
+CPU.DataStrobe      = Data_Strobe ;
+
+--    Working         : output;   -- connected below, in "Control Unit" section
+--    Error           : output;   -- connected below, in "Control Unit" section
+CPU.Reset   = RESET OR Reset2;  -- reset by MainRESET/PartialReset
+
+-- Direct access to ProgRAM as to a part of common RAM
+CPU.(ProgRAM_addr[ 7..0],ProgRAM_data[15..0]) = (AddrBus[7..0], DataBus[]);
+CPU.ProgRAM_we  = Data_Strobe & DevSel[4] & RW;
+--    CPU.ProgRAM_q[] : output;   -- connected in "Arbiter" section
+
+
+--============================================================================
+-- RAM blocks, Registers
+
+MainRAM.(address[7..0], data[],    clock,    wren                     ) =
+        (AddrBus[7..0], DataBus[], Clk100,(Data_Strobe & DevSel[3] & RW)); 
+--ProgRAM belongs to "Processor"unit, and is defined there
+CommandRAM.(address[9..0], data[], clock,    wren                     ) =
+        (AddrBus[9..0], DataBus[], Clk100,(Data_Strobe & DevSel[5] & RW)); 
+
+Reg_BaseAddr.data[7..0]     = DataBus[7..0];
+Reg_BaseAddr.(clock,enable) = (Clk100,   -- selected when DevSel10 & Addr = 2056+7
+        ((DevSel[10] & AddrBus[2] & AddrBus[1] & AddrBus[0])AND(Data_Strobe & RW)) );
+Reg_BaseAddr.(load, aclr)   = (VCC, RESET);
+
+--============================================================================
+-- 7. Control Unit  
+
+---- Start an Action by Link command  (4-clock pulse)
+--Start_Link.(D, clk, reset)  = (Link_IFace.LinkMessage, Clk100, RESET);--PulseShaper
+
+IF (Link_IFace.LinkMessage == VCC)  then -- If VALID command received, 
+    CASE  Link_IFace.OpCode_out[(CommandSize+Pause-1)..0] is -- recognizing the particular Operation :
+        WHEN  Read     => BaseAddr[]    = 80;   --#145-"Read" (=<8words) from Objects 
+                        St_Proc_Link    = VCC;
+        WHEN  Write    => BaseAddr[]      =192; --#154-"Write"(=<4words) to Objects
+                        St_Proc_Link    = VCC;
+        WHEN  Read62 => BaseAd[]        =  2;   --#130-"Read62": Read 62words from Object(s)
+                        St_Proc_Link    = VCC;
+        WHEN  Write8 => BaseAd[]        =160;   --#137-"Write8": Write 8 words  to Object(s)
+                        St_Proc_Link    = VCC;
+
+        WHEN  StartRegul     =>     -- #193-"START_Regular"        (+Єхэшх Lst0)
+                        BaseAd[]        = 24;           --Program: CommdList_Rd000
+                        St_Proc_Link    = VCC;          --Start up the Program
+                        St_ADC_Link     = !QuickStart;  --IF QuickStart=0 => Start up ADC
+        WHEN  CommdLst_Wr001 =>     -- #202-"Blocking_Begin"       (¦ряшё№ Lst1)
+                        BaseAd[]        =100;           --Program: CommdList_Wr001
+                        St_Proc_Link    = VCC;          --Start up the Program
+                        IF (AddrBus[15..0] == 574)      -- Special Addr..
+                            Then  St_Load_Link = VCC;   -- ..to initiate "Loading" Cycle
+                            Else  St_Load_Link = GND;
+                        End IF ;
+
+        WHEN  StartAlter     =>     -- #210-"START_Alternative"    (+Єхэшх Lst2)
+                        BaseAd[]        = 28;           --Program: CommdList_Rd010
+                        St_Proc_Link    = VCC;          --Start up the Program
+                        --StartADC_Link   = !QuickStart;  --
+        WHEN  CommdLst_Wr011 =>     -- #217-"Blocking_End"         (¦ряшё№ Lst3)
+                        BaseAd[]        =106;           --Program: CommdList_Wr011
+                        St_Proc_Link    = VCC;          --Start up the Program
+                        IF (AddrBus[15..0] == 574)      -- Special Addr..
+                            Then  St_Load_Link = VCC;   -- ..to initiate "Loading" Cycle
+                            Else  St_Load_Link = GND;
+                        End IF ;
+
+        WHEN  CommdLst_Rd100 =>     -- #226-"Read  by CommdLst100" (+Єхэшх Lst4)
+                        BaseAd[]        = 32;           --Program: CommdList_Rd100
+                        St_Proc_Link    = VCC;          --Start up the Program
+                        IF (AddrBus[15..0] == 574)      -- Special Addr..
+                            Then  St_Load_Link = VCC;   -- ..to initiate "Loading" Cycle
+                            Else  St_Load_Link = GND;
+                        End IF ;
+        WHEN  CommdLst_Wr101 =>     -- #233-"Write by CommdLst101" (¦ряшё№ Lst5)
+                        BaseAd[]        =112;           --Program: CommdList_Wr101
+                        St_Proc_Link    = VCC;          --Start up the Program
+                        IF (AddrBus[15..0] == 574)      -- Special Addr..
+                            Then  St_Load_Link = VCC;   -- ..to initiate "Loading" Cycle
+                            Else  St_Load_Link = GND;
+                        End IF ;
+
+        WHEN  CommdLst_Rd110 =>     -- #241-"Read  by CommdLst110" (+Єхэшх3)
+                        BaseAd[]        = 36;           --Program: CommdList_Rd110;
+                        St_Proc_Link    = VCC;          --Start up the Program
+        WHEN  CommdLst_Wr111 =>     -- #250-"Write by CommdLst111" (¦ряшё№3)
+                        BaseAd[]        =118;           --Program: CommdList_Wr111
+                        St_Proc_Link    = VCC;          --Start up the Program
+
+        WHEN  Rd_SelCommdLst =>     -- #198-"Read  by CommdLst_selected_by_InData"
+                        BaseAd[]        = 72;           --Program: Rd_SelCommdList
+                        St_Proc_Link    = VCC;          --Start up the Program
+        WHEN  Wr_SelCommdLst =>     -- #205-"Write by CommdLst_selected_by_InData"
+                        BaseAd[]        =153;           --Program: Wr_SelCommdList
+                        St_Proc_Link    = VCC;          --Start up the Program
+
+        WHEN OTHERS            => St_Proc_Link = GND;
+                                  St_ADC_Link  = GND;
+                                  St_Load_Link = GND;
+    End CASE;
+End IF ;
+
+For i in 0 to 7  GENERATE
+BaseAddr[i] = DFF(.D=BaseAd[i], .clk=Clk100);
+End GENERATE;
+--StartProc_Link  = DFF(.D=St_Proc_Link, .clk=Clk100);
+StartProc_Link.(D,clk,reset)= (St_Proc_Link, Clk100, RESET);    --PulseShaper
+--StartADC_Link   = DFF(.D=St_ADC_Link,  .clk=Clk100);
+StartADC_Link.(D,clk,reset) = (St_ADC_Link,  Clk100, RESET);    --PulseShaper
+StartADC_Quick.(D,clk,reset)= ((Link_IFace.test6 & QuickStart),Clk100,RESET); --PulseShaper
+                                        --  ^^^^^^ for Quick-START by StartBit
+
+
+--******************************************************************************
+-- 3. Internal Bus of Project ; Arbiter 
+%       HHHHHH   H     H   HHHHH
+        H     H  H     H  H
+        H     H  H     H  H     
+        HHHHHH   H     H   HHHHH
+        H     H  H     H        H
+        H     H  H     H        H
+        HHHHHH    HHHHH    HHHHH 
+%
+-- When Address from Master is set on the Address Bus, ...
+-- DEVICE SELECTION - the Slave-device is identified by its Address 
+
+-- 1) ADC Unit
+IF ((AddrBus[15..0] >= ADC_RAM_Offset) AND 
+    (AddrBus[15..0] <= (ADC_RAM_Offset + ADC_RAM_Size -1)) ) 
+    Then Digitizer_CS   = VCC ;         -- Address belongs to ADC Unit
+    Else Digitizer_CS   = GND ;
+End IF ;
+IF (AddrBus[15..0] == GateDur_Offset) 
+    Then GateDur_CS = VCC;
+    Else GateDur_CS = GND ;
+End IF ;
+IF (AddrBus[15..0] == GateDel_Offset) 
+    Then GateDel_CS = VCC;
+    Else GateDel_CS = GND ;
+End IF ;
+IF (AddrBus[15..0] == CtrlStat_Offset) 
+    Then CtrlStat_CS = VCC;
+    Else CtrlStat_CS = GND ;
+End IF ;
+
+-- 2) LOADER Unit
+IF ( (AddrBus[15..0] >= Att_Msk_Offset) AND 
+     (AddrBus[15..0] <= (Att_Msk_Offset + Att_Msk_Size -1)) ) 
+    Then Loader_CS  = VCC ;             -- Address belongs to LOADER Unit
+    Else Loader_CS  = GND ;
+End IF ;
+
+-- 3) Main RAM, Program RAM, Command_List RAM
+IF ((AddrBus[15..0] >=  MainRAM_Offset ) AND 
+    (AddrBus[15..0] <= (MainRAM_Offset + MainRAM_Size - 1))) 
+    then  MainRAM_CS    = VCC;          -- Address belongs to MainRAM
+    else  MainRAM_CS    = GND;
+End IF;
+IF ((AddrBus[15..0] >=  ProgRAM_Offset ) AND 
+    (AddrBus[15..0] <= (ProgRAM_Offset + ProgRAM_Size - 1))) 
+    Then  ProgRAM_CS    = VCC;          -- Address belongs to ProgRAM
+    Else  ProgRAM_CS    = GND;
+End IF;
+IF ((AddrBus[15..0] >=  CommdList_Offset ) AND 
+    (AddrBus[15..0] <= (CommdList_Offset + CommdList_Size - 1))) 
+    then  CommandRAM_CS = VCC;          -- Address belongs to CommandRAM
+    else  CommandRAM_CS = GND;
+End IF;
+
+IF ((AddrBus[15..0] >= Servo_offset) AND            --\_(#2056..#(2056+7)
+    (AddrBus[15..0] <= Servo_offset+Servo_size-1 )) --/ addr range for servo objects
+    Then Servo_CS    = VCC;
+    Else Servo_CS    = GND ;
+End IF ;
+
+-- 4) Link: InData, DataBus_in / DataBus_out
+IF ( AddrBus[15..0] == Link_IFace_Offset ) 
+    Then Link_InData_CS = VCC ;         -- Address of Link's InData register
+    Else Link_InData_CS = GND ;
+End IF ;
+IF ( AddrBus[15..0] == (Link_IFace_Offset +1) ) 
+    Then Link_DataBus_CS= VCC ;         -- Address of Link's In/Out port
+    Else Link_DataBus_CS= GND ;
+End IF ;
+IF ( AddrBus[15..0] == OpCode_Offset ) 
+    Then OpCode_CS      = VCC ;         -- Address of Reg_OpCode's outputs
+    Else OpCode_CS      = GND ;
+End IF ;
+
+-- 5) ZERO: fictive object, always replies B"0000000000000000" word
+IF ( AddrBus[15..0] == B"1111111111111111" ) 
+    Then ZERO_cs = VCC ;         -- Address of ZERO word
+    Else ZERO_cs = GND ;
+End IF ;
+
+DevSel[ 1].d    = Digitizer_cs ;        -- Digitizer
+DevSel[ 2].d    = Loader_cs ;           -- Loader
+DevSel[ 3].d    = MainRAM_cs ;
+DevSel[ 4].d    = ProgRAM_cs ;
+DevSel[ 5].d    = CommandRAM_cs;
+DevSel[ 6].d    = GateDur_cs ;
+DevSel[ 7].d    = GateDel_cs ;
+DevSel[ 8].d    = CtrlStat_cs ;         -- CtrlStat_reg
+DevSel[ 9].d    = CtrlStat_cs ;         --   RESERVED for possible use in future
+DevSel[10].d    = Servo_cs ;            -- Servo_MUX
+DevSel[11].d    = Link_InData_cs ;      -- Link's InData port (now ReadOnly*)
+DevSel[12].d    = Link_DataBus_cs ;     -- Link's Data port
+DevSel[13].d    = OpCode_cs ;           -- Reg_OpCode
+DevSel[14].d    = ZERO_cs ;             -- Something?? :  ZERO word
+
+FOR i in 1 to 14 GENERATE
+   DevSel[i].clrn = AddrSettled;   -- Dev_Select is enabled while AddrSettled=VCC
+   DevSel[i].clk  = Clk100;
+END GENERATE; 
+
+AddrSettled = Bus_Arbiter.AddressSettled;  --In 1clock after "AccessGranted"..
+    -- ..address is expected to be set on the Addr.bus, and Arbiter produces 
+    -- "AddressSettled" signal, which enables DevSel[] triggers 
+AddrValid       = DevSel[ 1].q OR  -- Digitizer
+                  DevSel[ 2].q OR  -- Loader
+                  DevSel[ 3].q OR  -- MainRAM
+                  DevSel[ 4].q OR  -- ProgRAM
+                  DevSel[ 5].q OR  -- CommandRAM
+                  DevSel[ 6].q OR  -- GateDur_reg
+                  DevSel[ 7].q OR  -- GateDel_reg
+                  DevSel[ 8].q OR  -- "CtrlStat_Reg"
+                  DevSel[ 9].q OR  --   RESERVED for possible use in future
+                  DevSel[10].q OR  -- Servo_MUX
+                  DevSel[11].q OR  -- Link_IFace - Reg_InData's outs
+                  DevSel[12].q OR  -- Link_IFace - DataBus I/O
+                  DevSel[13].q OR  -- Reg_OpCode
+                  DevSel[14].q ;   -- Something?? :  ZERO word
+Bus_Arbiter.AddressValid = AddrValid;   -- Address recognized, and correspondent device selected
+Data_Strobe  = Bus_Arbiter.DataStrobe ; --in 3clocks after "AddrValid"
+
+-- After the selected Master had asserted the Address and RW signal 
+-- and the Address has been recognized, the DataBus is multiplexed as follows :
+--  If the selected Master is going to WRITE data (RW = VCC) =>
+--                  => DataBus is connected to this Master's data out;
+--  If the selected Master is going to READ data (RW = GND ) => 
+--                  => DataBus is connected to data out of the Slave selected by Addr
+
+-- Multiplexer of Data Bus sources when Master READS data :
+FOR i in 0 to 15  GENERATE
+Data[i] = ( (DevSel[ 1] & Digitizer.ADC_RAM_q[i])
+          OR(DevSel[ 2] & Loader.LoadRAM_q[i])
+          OR(DevSel[ 3] & MainRAM.q[i])
+          OR(DevSel[ 4] & CPU.ProgRAM_q[i])
+          OR(DevSel[ 5] & CommandRAM.q[i])
+          --OR(DevSel[ 6] & GateDur_reg.q  see below
+          --OR(DevSel[ 7] & GateDel_reg.q  see below
+          --OR(DevSel[ 8] & "CtrlStat_Reg".q  see below
+--          OR(DevSel[ 9] & "RESERVED for possible use in future" 
+          OR(DevSel[10] & Servo_MUX[i])
+          OR(DevSel[11] & Link_IFace.InData_out[i])
+          OR(DevSel[12] & Link_IFace.DataBus_out[i])
+          --(DevSel[13] & Reg_OpCode.q  see below
+          OR(DevSel[14] & GND) );
+End GENERATE;
+Data[9..0]  = DevSel[ 6] & GateDur_reg.q[9..0]; --
+Data[7..0]  = DevSel[ 7] & GateDel_reg.q[7..0]; -- 
+Data[3..0]  = ( DevSel[8] & GateOpenM,  DevSel[8] & QuickStart, --\_"CtrlStat_Reg"'s
+                DevSel[8] & StartMulti, DevSel[8] & StartOne ); --/     outputs
+--Data[7..0]  = DevSel[10] & Reg_BaseAddr.q[7..0];-- 
+Data[(CommandSize+Pause-1)..0] = DevSel[13] & Reg_OpCode.q[]; 
+
+-- Multiplexer of Data Bus among Servo_Objects 
+CASE  AddrBus[2..0] is
+    --When 0  => Servo_Mux[15..0]= PLLerr_Ct.q[];
+    When 1  => Servo_Mux[]= PhSwErr_Ct.q[];
+    When 2  => Servo_Mux[]= LinkErr_Ct.q[];
+    When 7  => Servo_Mux[]= (B"00000000",Reg_BaseAddr.q[]);
+    When OTHERS => Servo_MUX[15..0] = 65535; -- indication of a wrong address
+END CASE;
+
+-- Final Multiplexer of Data Bus sources when Master READS or WRITES :
+FOR i in 0 to 15  GENERATE
+DataBus[i]  =( (( RW &  Bus_Arbiter.BAGD[1] & !Bus_Arbiter.BAGD[0] ) 
+                AND DFF(.D=CAMAC_IFace.DataBusOut[i],.clk=Clk100)) 
+            OR (( RW & !Bus_Arbiter.BAGD[1] &  Bus_Arbiter.BAGD[0] ) 
+                AND DFF(.D=CPU.DataOut[i], .clk=Clk100))  
+            OR ((!RW & AddrSettled) & DFF(.D=Data[i], .clk=Clk100)) );
+End GENERATE;
+--For i in 0 to 15 GENERATE
+--  DataBus[i] = DFF(.D=Data[i], .clk=Clk100);
+--End GENERATE;
+
+
+END;

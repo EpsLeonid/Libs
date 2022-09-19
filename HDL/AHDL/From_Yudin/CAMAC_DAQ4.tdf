@@ -1,0 +1,537 @@
+TITLE "CAMAC interface for DAQ modules, v.4" ;
+-- Данный КАМАК-интерфейс предназначен для использования в проектах, 
+-- написанных на основе общего "скелета" проектов модулей, входящих 
+-- в состав ССД детектора КМД-3. 
+%
+Данный Модуль устанавливает и реализует правила доступа CAMAC-командами 
+к внутренним объектам проектов, включающим:
+1. адресуемое пространство памяти и регистров
+2. запуски различных Операций
+Используя данный модуль в проектах, предполагается достичь единообразия спосо-
+бов управления блоками, что, в свою  очередь, должно облегчить написание 
+тестового и пользовательского программного обеспечения.
+
+Предлагается принять за "стандарт" следующее распределение команд/данных : 
+
+Основные команды (КАМАК - функции)
+F(0)A(0..15) - чтение данных из регистров самого КАМАК-интерфейса (Модуля) (номер реги-
+    стра указывается в субадресе), в т.ч. регистра статуса, дескриптора, промежуточных 
+    регистров, сообщающихся с шиной пользователя (назначеие субадресов см. ниже).
+f0a0  - чтение Регистра-Дескриптрора ( DescriptorWord0 )
+f0a1  -   -#-     -#-     -#-        ( DescriptorWord1 )
+f0a2  - чтение читаемой части Регистра Статуса (содержит флаги текущих операций, состояний)
+f0a3  - чтение писАемой части Регистра Статуса (содержит флаги текущих операций, состояний)
+f0a4  - чтение Регистра Адреса, используется для адресации доступа в области памяти/регистров проекта
+f0a8  - чтение регистра промежуточного хранения данных, принятых от шины проекта пользователя 
+		и предназначенных для передачи на КАМАК-шину "R"
+f0a9  - чтение регистра промежуточного хранения данных, принятых от КАМАК-шины "W" 
+		и предназначенных для передачи на шину пользователя
+
+F(1)A(0.. 1) - чтение из ячейки, находящейся в адресуемом пространстве проекта 
+    пользователя, адрес ячейки был ранее прописан в Регистре_адреса Модуля. Субадрес опреде- 
+    ляет, из пространства регистров (А=0) или пространства памяти (А=1) идет чтение.
+F(2)A(0.. 1) - чтение из адресуемого пространства проекта пользователя (то же, 
+    что F1), с автоинкрементом адреса. 
+
+F(16)A(0..15) - запись данных в регистры самого КАМАК-интерфейса (Модуля).
+f16a3  - запись в загружаемую часть Регистра Статуса (содержит флаги текущих операций, состояний)
+f16a4  - запись в Регистр Адреса, используется для адресации доступа в области памяти/регистров проекта
+f16a9  - запись в регистр промежуточного хранения данных, принятых от КАМАК-шины "W" 
+		и предназначенных для передачи на шину пользователя
+F(17)A(0.. 1) - запись в ячейку, находящуюся в адресуемом пространстве проекта 
+    пользователя, адрес которой был ранее прописан в Регистре_адреса Модуля. 
+    Субадрес определяет, в пространство регистров (А=0) или пространство памяти 
+    (А=1) идет запись.
+F(18)A(0..1) - запись в адресуемое пространство проекта пользователя, с автоинкриментом 
+    адреса
+
+F( 8) - проверка LAM по Q
+F(24) - блокировка LAM
+F(26) - разблокировка LAM
+
+F(25)A(0.. 3) - команда "Пуск".  Для указания запускаемого устройства (оциф-
+    ровка, прописывание порогов) и типа запуска используется субадрес. 
+f25a0	- старт оцифровки от ЭВМ (программный)
+f25a1	- One-shot_Start Digitizing by a pulse of external generator 
+f25a2	- Multiple_Start Digitizing by a pulse of external generator 
+%
+
+%
+Назначение битов read-only части Регистра Статуса (subAddr = #2)
+В[0] -- Флаг захвата входящей частоты Линка местным PLL
+В[1] -- Флаг активности Линка
+В[2] -- Флаг ошибки Линка 
+B[3] -- Флаг текущей оцифровки
+В[4] -- Флаг мертвого времени  
+В[5] -- Флаг копирования порогов/коэффициентов
+B[6] -- Ошибка по КАМАК-у
+В[7] -- Флаг LAM
+В[8] -- Флаг клапанирования LAM 
+Остальные биты пользователь назначает по своему усмотрению
+Назначение битов write-read части Регистра Статуса (subAddr = #3)
+В[0] -- Разрешение захвата входящей частоты Линка местным PLL
+В[1] -- Разрешение ответов в Линк  ??????
+В[2] -- Сброс флага ошибки Линка  
+B[3] -- Разрешить оцифровку по асинхронному старту ??????
+В[4] -- Разрешить формирование мертвого времени  ??????
+В[5] -- 
+B[6] -- 
+В[7] -- 
+%
+
+%
+ Общий смысл сопряжения интерфейсов таков, что по каждому обращению от КАМАКа 
+модуль предпринимет следующие действия.
+Передача от шины КАМАК в проект пользователя:
+ 1. Выдает запрос "Bus Access ReQuiest" на доступ к шине. (предний фронт привязан к тактам модуля), 
+ 2. После появления сигнала "Bus Access GranteD" предоставления доступа 
+(т.к. доступ предоставляет арбитр шины пользователя, то сигнал привязан к тактам пользователя)
+немедленно (асинхронно) выдает на шину адрес (куда хочет попасть), слово данных и устанавливает сигнал 
+направления передачи.
+		Арбитр шины дожидается, когда ответит (распознает свой адрес) хотя бы одно устройство, и генерирует 
+		сигнал "DataStrobe". По этому сигналу данные записываются.
+ 3. Дождавшись строба, по его концу сбрасывает сигнал запроса немедленно (асинхронно).
+Куда именно будет записано слово, определяет пользователь.
+
+Передача из проекта пользователя на шину КАМАК :
+ 1. Выдает запрос "Bus Access ReQuiest" на доступ к шине. (предний фронт привязан к тактам модуля), 
+ 2. После появления сигнала "Bus Access GranteD" предоставления доступа 
+(т.к. доступ предоставляет арбитр шины пользователя, то сигнал привязан к тактам пользователя)
+немедленно (асинхронно) выдает на шину адрес (куда хочет попасть).
+		Арбитр шины дожидается, когда ответит (распознает свой адрес) хотя бы одно устройство, и генерирует 
+		сигнал "DataStrobe". 
+ 3. Дождавшись строба, по концу строба защелкивает данные в модуль и выдает их на шину R.
+ Откуда именно будет предоставлено слово, определяет Пользователь.
+
+От Пользователя требуется только обеспечить реакцию на запрос модуля,
+не превышающую 200нс (без предварительной выборки)-7 мкс(с предварительной выборкой).
+%
+
+INCLUDE "lpm_shiftreg.inc" ;
+INCLUDE "lpm_counter.inc"  ;
+INCLUDE "EdgeSensing.inc" ;
+INCLUDE "LevelSensing.inc";
+
+PARAMETERS
+(
+  RefClock  = 100  -- frequency (MHz) of the Clock applied at "Clock" input, default = 100(MHz)
+);
+ASSERT (RefClock>24 AND RefClock<126)
+REPORT "You enter RefClock (%) which is not suitable for CAMAC function" RefClock
+SEVERITY ERROR;
+CONSTANT HALFCYCLE = FLOOR(RefClock div 2);
+-------------------------------------------------------------------------------------------
+-- Константы - параметры, определяемые Пользователем данного модуля
+-------------------------------------------------------------------------------------------
+--                            e V   -- код-дескриптор модуля;  ASCII codes:
+CONSTANT DescriptorWord0 = H"6556"; --   A=41, B=42, .., X=58, Y=59, Z=5A,  
+--                            0 r   --   a=61, b=62, .., x=78, y=79, z=7A,
+CONSTANT DescriptorWord1 = H"3072"; --   0=30, 1=31, 2=32, .., 9=39
+
+CONSTANT F0 = B"00000";
+CONSTANT F1 = B"00001";
+CONSTANT F2 = B"00010";
+
+CONSTANT F16 = B"10000";
+CONSTANT F17 = B"10001";
+CONSTANT F18 = B"10010";
+
+CONSTANT F8  = B"01000";
+CONSTANT F10 = B"01010";
+CONSTANT F24 = B"11000";
+CONSTANT F26 = B"11010";
+
+CONSTANT F25 = B"11001";
+CONSTANT F30 = B"11110";
+
+CONSTANT WordSize = 16; -- размер слова данных
+
+--==========================================================================
+SUBDESIGN  CAMAC_DAQ
+(
+-- Выводы (пины) на шину КАМАК
+W[16..1]            : input;    -- 1 = High
+R[16..1]            : output;   -- 1 = High
+B%, I, C, Z%        : input;    -- 
+N, S1, S2           : input;    -- Active = High    
+A[4..1],F[5..1]     : input;    -- 1 = High 
+oX, oQ, oL          : bidir;    -- Active-LOW output !!!
+
+--******** Interface to user project ********
+Clock               : input ;   -- частота работы модуля (25..125МГц)
+CAMAC_Active        : output;   -- indicates that CAMAC-cycle is being performed
+Aout[4..1]          : output;   -- output of registered subaddress
+Start               : output;   -- flag: "Start" command received (F25Axx)
+Confirm             : input = GND;  -- Confirmation of Operation starting 
+LamSet, LamReset    : input = GND;  -- Set/Reset of LAM by user's decision 
+LAM                 : output;   -- State of LAM 
+Reset               : output;   -- Main RESET - here and in user project 
+
+-- Connections to Addr/Data bus of user project
+  AccessRequest     : output;   -- запрос на доступ к шине для чтения/записи данных Пользователя 
+  AccessGranted     : input;    -- Разрешение Арбитра выставить Адрес, направление 
+  DataBusStrobe     : input;    -- строб приема/передачи данных наружу (высокий уровень, защелкиваем по заднему фронту)
+  RdWr              : output;   -- передача данных ( UserProj => CAMAC или UserProj <= CAMAC )
+                                --       по умолчанию ^^^^^^^^^^^^^^^ 
+AddrBusOut[WordSize-1..0] : output; -- шина адреса для доступа в пространства памяти/регистров
+DataBusIn [WordSize-1..0] : input;  -- Data: UserProject => CAMAC
+DataBusOut[WordSize-1..0] : output; -- Data: UserProject <= CAMAC
+R_OE, W_OE          : output; -- purposed for enabling buffers which drive "R"-bus   
+ 
+  -- "Стандартные" (обязательные) флаги проекта пользователя, доступные через Регистр Статуса
+LinkClockCaptured   : input;    --входит в регистр из проекта пользователя
+LinkActive          : input;
+LinkError           : input; 
+Busy_on_Digitizing  : input;
+Busy_on_Copy        : input;
+DeadTime            : input;
+Error               : output;
+  --  Additional flags of user project  
+StatusR_d[15..8]    : input;    --inputs for additional flags 
+StatusRW_q[15..0]   : output; -- writable StatusRegister - outputs to user project
+
+test[4..1]          : output;
+)
+VARIABLE
+  F_Reg             : LPM_SHIFTREG with (lpm_width=5, lpm_direction="UNUSED");  -- регистр функции
+  A_Reg             : LPM_SHIFTREG with (lpm_width=4, lpm_direction="UNUSED");  -- регистр субадреса, стробов
+
+-- регистр промежуточного хранения данных, принятых от КАМАК-шины "W" и предназначенных
+-- для передачи на шину пользователя 
+  W_Reg             : LPM_SHIFTREG with (lpm_width=16, lpm_direction="UNUSED"); 
+  WReg_we           : node; 
+-- регистр промежуточного хранения данных, принятых от шины пользователя и предназначенных
+-- для передачи на КАМАК-шину "R"
+  R_Reg             : LPM_SHIFTREG with (lpm_width=16, lpm_direction="UNUSED");
+-- счетчик-указатель адреса 
+  Addr_Reg          : LPM_COUNTER with ( lpm_width=16, lpm_direction="up" ); 
+  AddrReg_we        : node; 
+  Address_Increment_Request  : EdgeSensing; -- сигнал запроса инкрементации Addr_Reg  по F2, F18
+  Address_Increment_Wait   : SRFF ;  -- Разрешает инкрементацию ПОСЛЕ DataStrobe.
+MemOrReg            : node;
+
+  StatusR_Reg       : LPM_SHIFTREG with (lpm_width=16, lpm_direction="UNUSED"); -- регистр статуса содержит информацию для "User Interface" 
+  StatusRW_Reg      : LPM_SHIFTREG with (lpm_width=16, lpm_direction="UNUSED"); -- регистр статуса содержит информацию от  "User Interface"
+  StatusRW_we       : node; 
+
+  W_WE              : node; -- строб записи с КАМАК-а, демультиплексором раздается по регистрам
+
+  IntQ              : node;      -- internal "Q" 
+
+-- Флаги команд
+CAMACRead           : node;     -- Combinatorial node, Use Carefully !!!!!
+CAMACWrite          : node;
+CAMAC_Read_Edge     : EdgeSensing;  -- Signal - "tag" of 
+CAMAC_Write_Edge    : EdgeSensing;  -- Signal - "tag" of
+
+Nactive[6..1]       : node; -- Circuit to detect RELIABLY the beginning of CAMAC-cycle
+CAMACCycleBegin     : EdgeSensing;  -- Signal - "tag" of CAMAC-cycle beginning
+CAMACCycleEnd       : EdgeSensing;  -- Signal - "tag" of CAMAC-cycle end
+CAMACactive[2..1]   : node;         -- Флаг отработки CAMAC-цикла
+TimeOutCt           : LPM_COUNTER with (lpm_width=(FLOOR(LOG2(RefClock)))+1, 
+                                        lpm_direction="up" ); 
+TimeOut             : node;     -- Сигнал аварийного завершения КАМАК-цикла
+S1Flag              : SRFF;
+
+  AccessRequest     : SRFF; 
+
+LAM_Trig            : SRFF ;
+EnableLAM_Trig      : SRFF ;
+EnableLAM           : node;
+DisableLAM          : node;
+LamResetInt         : node;     -- Pulse for LAM resetting by any CAMAC call of THIS module
+
+--**********************************************************************************************
+BEGIN
+
+DEFAULTS
+IntQ        = GND;
+R_OE        = GND;  W_OE        = GND; -- signals to enable external buffers
+CAMACRead   = GND;  CAMACWrite  = GND; -- internally used
+MemOrReg    = GND;
+Address_Increment_Request.d    = GND;
+TimeOut     = GND;
+EnableLAM   = GND;  DisableLAM  = GND;
+test[1] = GND;  test[2] = GND;  test[3] = GND;  test[4] = GND; 
+END DEFAULTS;
+
+-------------------------------------------------------
+-- Section "Начало и конец КАМАК-цикла" begin 
+Nactive1    = DFF(.d=(N & B),  .clk=clock);     --\  Waiting for N & B 
+Nactive2    = DFF(.d=Nactive1, .clk=clock);     -- \ signals to settle,
+Nactive3    = DFF(.d=Nactive1, .clk=clock);     -- \ signals to settle,
+Nactive4    = DFF(.d=Nactive2, .clk=clock);     -- / to begin CAMAC-cycle
+Nactive5    = DFF(.d=Nactive2, .clk=clock);     -- / to begin CAMAC-cycle
+Nactive6    = DFF(.d=Nactive3, .clk=clock);     --/ 
+
+CAMACCycleBegin.d   = Nactive1 & Nactive2 & Nactive3    --\  Tag 
+                    AND Nactive6 ;                      -- > of
+CAMACCycleBegin.(clk,reset) =(Clock, GND);              --/ Cycle_beginning
+CAMACactive1= SRFF(.S=CAMACCycleBegin.q, .clk=Clock,    -- Flag: =1 during ..
+                .R=CAMACCycleEnd.q);                    -- .. all CAMAC-cycle
+CAMACactive2= DFF (.D=CAMACactive1,  .clk=clock,  
+                .Clrn=!CAMACCycleEnd.q);-- RELIABLE: _/ by 1clk after CAMACactive1, \_ by 1clk before CAMACactive1
+CAMACCycleEnd.(d,clk,reset) = ((S2 OR TimeOut),Clock, GND); -- Конец цикла, по стробу S2 или по таймауту
+
+CAMAC_Active    = CAMACactive1 ; 
+
+-- Контроль работы КАМАКа
+TimeOutCt.(clock, clk_en, cnt_en, sclr) =       -- счетчик времени КАМАК-цикла 
+        (Clock,VCC,CAMACactive1,CAMACCycleEnd.q); -- reset by End_of_CAMAC-Cycle
+
+-- Проверка:  пришел ли стороб S1 в первой половине цикла ?
+S1Flag.(S,R,clk)=(S1,CAMACCycleEnd.q,Clock);--Флаг наличия "S1" в данном КАМАК-цикле
+IF ((TimeOutCt.q[] == (HALFCYCLE-1)) AND (S1Flag.q != VCC) ) 
+    Then  TimeOut = VCC;-- если за S1 не пришел до середины CAMAC-цикла,                      
+    Else  TimeOut = GND;-- .. то сбрасываем флаг CAMACactive1 и сообщаем об ошибке                                                    
+End IF;
+
+-- Проверка: пришел ли стороб S2 до окончания CAMAC-цикла ?
+if(TimeOutCt.q[] == (RefClock-2)) 
+    Then  TimeOut = VCC;-- если за 1мкс S2 не инициировал "CAMACCycleEnd.q", 
+    Else  TimeOut = GND;-- .. то сбрасываем флаг CAMACactive1 и сообщаем об ошибке
+End IF;
+
+Error   = TimeOut; -- Вывод аварийного завершения цикла на лампочку и синхронизацию осциллографа
+-- Section "Начало и конец КАМАК-цикла" end 
+
+-- ответы на шину КАМАК 
+oX  = OPNDRN(!CAMACactive1);    -- Ответ X всегда   
+oQ  = OPNDRN(!IntQ);            -- Q=1 when Command Recognized
+
+test[1] = CAMACactive1 ;
+test[2] = W_WE ;
+test[3] = F_reg.q3 ;
+test[4] = F_reg.q4 ;
+
+--============================================================================
+--************ Execution of CAMAC-command ************************************
+-- Защелкиваем функцию и субадрес после установления с-лов : 
+F_Reg.(data[],clock,enable,load) = (F[],Clock,CAMACCycleBegin.q,VCC);
+A_Reg.(data[],clock,enable,load) = (A[],Clock,CAMACCycleBegin.q,VCC);
+
+W_WE = CAMACactive2 AND S1; -- сигнал защелкивания данных в регистры адреса, статуса или данных ???????????
+
+--************ Section "Таблица команд" **************************************
+IF (!(Busy_on_Digitizing        -- если НЕ идет процесс 
+        OR Busy_on_Copy)        --   LOADING или DIGITIZING
+        %AND !DeadTime% )       -- или воще какой-нибудь процесс
+    Then   
+    CASE F_Reg.q[] IS
+        WHEN F0  => CASE A_Reg.q[] IS   -- чтение из регистров КАМАК-интерфейса
+            WHEN 0 => R[] = DescriptorWord0;-- 
+            WHEN 1 => R[] = DescriptorWord1;-- 
+            WHEN 2 => R[] = StatusR_Reg.q[];-- Data: из "read-only" Cтатус. регистра -> CAMAC_bus
+            WHEN 3 => R[] =StatusRW_Reg.q[];-- Data: из "read-write" Cтатус. регистра -> CAMAC_bus
+            WHEN 4 => R[] = Addr_Reg.q[];   -- Data: Reg_Addr -> CAMAC_bus 
+            WHEN 8 => R[] = R_Reg.q[];      --Данные, переданные MainProj -> R_Reg -> CAMAC_bus в предыдущем цикле
+            WHEN 9 => R[] = W_Reg.q[];      --Данные, переданные MainProj <- W_Reg <- CAMAC_bus в предыдущем цикле
+            END CASE;
+            R_OE = CAMACactive2;  -- enable external buffers on CAMAC's "R"-bus
+            IntQ = CAMACactive2;  -- F(1)A(0..15) - command is valid
+        WHEN F1  => CASE A_Reg.q[] IS   -- чт-е из адр.простр-ва User Project
+            WHEN 0 => IntQ      =CAMACactive2;-- command is valid
+                      CAMACRead =CAMACactive2;-- Request for reading data: MainProj -> R_Reg
+                      R[]       = R_Reg.q[];  -- Data:  R_reg -> CAMAC_bus
+            WHEN 1 => IntQ      =CAMACactive2;-- command is valid
+                      CAMACRead =CAMACactive2;-- Request for reading data: MainProj -> R_Reg
+                      --MemOrReg  =CAMACactive2;-- Read from MEMORY 
+                      R[]       = R_Reg.q[];  -- Data:  R_reg -> CAMAC_bus
+            WHEN OTHERS =>  IntQ = GND; -- command INvalid
+                      --MemOrReg   = GND; -- по умолчанию попадаем в пространство регистров проекта пользователя
+            END CASE;
+            R_OE = CAMACactive2;  -- enable external buffers on CAMAC's "R"-bus
+        WHEN F2  => CASE A_Reg.q[] IS   --READ from ADDR_space of MainProj, with auto-incr. of Addr
+            WHEN 0 => IntQ      =CAMACactive2;-- command is valid
+                      CAMACRead =CAMACactive2;-- Request for reading data: MainProj -> R_Reg
+                      R[]       = R_Reg.q[];  -- Data:  R_reg -> CAMAC_bus
+                      Address_Increment_Request.d = CAMACactive2; 
+            WHEN 1 => IntQ      =CAMACactive2;-- command is valid
+                      CAMACRead =CAMACactive2;-- Request for reading data: MainProj -> R_Reg
+                      --MemOrReg  =CAMACactive2;-- Read from MEMORY 
+                      R[]       = R_Reg.q[];        -- Data:  R_reg -> CAMAC_bus
+                      Address_Increment_Request.d = CAMACactive2;
+            WHEN OTHERS =>  IntQ = GND; -- command INvalid
+                      --MemOrReg   = GND;   -- по умолчанию попадаем в пространство регистров проекта пользователя
+            END CASE;                
+            R_OE = CAMACactive2;  -- enable external buffers on CAMAC's "R"-bus
+
+        WHEN F16 => CASE A_Reg.q[] IS   -- запись в регистры КАМАК-интерфейса
+%Attention!%WHEN 3 => StatusRW_we = W_WE;  
+            WHEN 4 => AddrReg_we  = W_WE;   -- write to Addr_Reg
+            WHEN 9 => WReg_we     = W_WE;   -- write to WriteRegister
+            WHEN OTHERS =>  StatusRW_we = GND;  
+                            AddrReg_we  = GND;
+                            WReg_we     = GND;
+            END CASE;
+            W_OE = CAMACactive2;  -- enable external buffers of CAMAC's "W"-bus
+            IntQ = CAMACactive2;  -- F(16)A(0..15) - command is valid
+        WHEN F17 => CASE A_Reg.q[] IS   -- WRITE to ADDR_space of MainProj
+            WHEN 0 => IntQ      =CAMACactive2;-- command is valid
+                      CAMACWrite=CAMACactive2;-- Request for writing data: W_Reg -> MainProject
+                      WReg_we   = W_WE;       -- LATCH data: CAMAC_bus -> W_Reg
+            WHEN 1 => IntQ      =CAMACactive2;-- command is valid
+                      CAMACWrite=CAMACactive2;-- Request for writing data: W_Reg -> MainProject
+                      --MemOrReg  =CAMACactive2;-- Write to MEMORY 
+                      WReg_we   = W_WE;       -- LATCH data: CAMAC_bus -> W_Reg
+            WHEN OTHERS =>  IntQ = GND; -- command INvalid
+                            --MemOrReg = GND; -- по умолчанию попадаем в пространство регистров проекта пользователя
+                            WReg_we = GND; 
+                            --CAMACWrite = GND;
+            END CASE;
+            W_OE  = CAMACactive2; -- enable external buffers of CAMAC's "W"-bus
+        WHEN F18 => CASE A_Reg.q[] IS   --WRITE to ADDR_space of MainProj, with auto-incr. of Addr
+            WHEN 0 => IntQ      =CAMACactive2;-- command is valid
+                      CAMACWrite=CAMACactive2;-- Request for writing data: W_Reg -> MainProject
+                      WReg_we   = W_WE;       -- LATCH data: CAMAC_bus -> W_Reg
+                      Address_Increment_Request.d  = CAMACactive2;
+            WHEN 1 => IntQ      =CAMACactive2;-- command is valid
+                      CAMACWrite=CAMACactive2;-- Request for writing data: W_Reg -> MainProject
+                      --MemOrReg  =CAMACactive2;-- Write to MEMORY 
+                      WReg_we   = W_WE;       -- LATCH data: CAMAC_bus -> W_Reg
+                      Address_Increment_Request.d  = CAMACactive2;
+            WHEN OTHERS =>  IntQ = GND; -- command INvalid
+                            --MemOrReg = GND; -- по умолчанию попадаем в пространство регистров проекта пользователя
+                            WReg_we = GND; 
+                            --CAMACWrite = GND;
+                            --Address_Increment_Request.d  = GND;
+            END CASE;
+            W_OE  = CAMACactive2; -- enable external buffers of CAMAC's "W"-bus
+
+        WHEN F8  => IntQ = LAM_Trig.q & CAMACactive2; -- F8Axx- проверка запроса LAM по Q
+                --WHEN 0 => IntQ = data_ready.q ;
+
+        WHEN F25 => Start   = CAMACactive2; -- Start of any Action
+                    IntQ    = Confirm;      -- Confirmation of command Accepted
+
+        WHEN F26 => EnableLAM_Trig.S = S1;  -- LAM enabling
+                    IntQ    = CAMACactive2; -- command is valid
+        WHEN F24 => EnableLAM_Trig.R = S1;  -- LAM disabling
+                    IntQ    = CAMACactive2; -- command is valid
+
+        WHEN F30 => Reset   = CAMACactive2; -- RESET ALL
+                    IntQ    = Confirm;      -- command is valid
+
+        WHEN OTHERS =>  IntQ         = GND;
+--                        CAMACRead    = GND; CAMACWrite   = GND;
+                        WReg_we      = GND;
+                        Start        = GND; 
+                        Reset        = GND;
+        END CASE;
+END IF; 
+-- КАМАК-операции, разрешенные во время LOADING и DIGITIZING :
+--  разрешено только чтение статусных регистров и регистров КАМАК-интерфейса 
+IF ( (Busy_on_Digitizing        -- если ИДЕТ процесс 
+        OR Busy_on_Copy)        --   LOADING или DIGITIZING
+        OR DeadTime )           -- или воще какой-нибудь процесс
+    Then   
+    CASE F_Reg.q[] IS
+        WHEN F0  => CASE A_Reg.q[] IS   -- чтение из регистров КАМАК-интерфейса
+            WHEN 0 => R[] = DescriptorWord0;-- 
+            WHEN 1 => R[] = DescriptorWord1;-- 
+            WHEN 2 => R[] = StatusR_Reg.q[];-- Data: из "read-only" Cтатус. регистра -> CAMAC_bus
+            WHEN 3 => R[] =StatusRW_Reg.q[];-- Data: из "read-write" Cтатус. регистра -> CAMAC_bus
+            WHEN 4 => R[] = Addr_Reg.q[];   -- Data: Reg_Addr -> CAMAC_bus 
+            WHEN 8 => R[] = R_Reg.q[];      --Данные, переданные MainProj -> R_Reg -> CAMAC_bus в предыдущем цикле
+            WHEN 9 => R[] = W_Reg.q[];      --Данные, переданные MainProj <- W_Reg <- CAMAC_bus в предыдущем цикле
+            END CASE;
+            R_OE = CAMACactive2;  -- enable external buffers on CAMAC's "R"-bus
+            IntQ = CAMACactive2;  -- F(1)A(0..15) - command is valid
+
+        WHEN F8  => IntQ = LAM_Trig.q & CAMACactive2; -- F8Axx - проверка запроса LAM по Q
+                --WHEN 0 => IntQ = data_ready.q ;
+
+        WHEN F26 => EnableLAM_Trig.S = S1;  -- LAM enabling
+                    IntQ    = CAMACactive2; -- command is valid
+        WHEN F24 => EnableLAM_Trig.R = S1;  -- LAM disabling
+                    IntQ    = CAMACactive2; -- command is valid
+
+        WHEN F30 => Reset   = CAMACactive2; -- RESET ALL
+                    IntQ    = Confirm;      -- command is valid
+
+        WHEN OTHERS =>  IntQ         = GND;
+--                        CAMACRead    = GND; CAMACWrite   = GND;
+                        WReg_we      = GND;
+                        Start        = GND; 
+                        Reset        = GND;
+        END CASE;
+END IF; 
+
+--============================================================================
+--************ Section "Bus Connections" *************************************
+-- Здесь описана структура соединений шин данных, не вошедших в описание мультиплексоров 
+-- по "Таблица команд",  IF, CASE и пр.
+
+-- данные для "Users Interface"
+StatusRW_Reg.(data[],clock,enable,load) = (W[],Clock, StatusRW_we,VCC); -- прогружаемая часть статусного регистра
+StatusRW_q[]= StatusRW_Reg.q[];
+
+W_Reg.(data[],clock,enable,load)= (W[],Clock,WReg_we,VCC);
+DataBusOut[]= W_Reg.q[];
+
+R_Reg.(data[],clock,enable,load)= (DataBusIn[],Clock,
+        (CAMACRead & DataBusStrobe & AccessGranted), VCC);
+
+Addr_Reg.(data[],clock,clk_en,sload) = ( W[], Clock, VCC, AddrReg_we);
+AddrBusOut[]= Addr_Reg.q[];
+
+Aout[] = A_Reg.q[];             -- Registered subaddress -> MainProject
+
+--============================================================================
+-- Autoincrement at END of bus access
+Addr_Reg.cnt_en				=	Address_Increment_Wait.q AND DataBusStrobe ; -- Enable increment at end of bus access
+Address_Increment_Request.(clk, reset)  = (Clock,GND);
+Address_Increment_Wait.clk	=	Clock;
+Address_Increment_Wait.S	=	Address_Increment_Request.q ; -- Set waiting for end of bus access
+Address_Increment_Wait.R	=	(DataBusStrobe AND AccessGranted); -- Reset at exactly end of access
+--------------------------------------------------------------------------------------------
+
+-- "Стандартное" значение битов Регистра Статуса (читаемая часть)
+StatusR_Reg.(clock,enable,load) = (Clock,!CAMACactive1,VCC); -- фиксируем по запросу КАМАК-а   
+StatusR_Reg.data[0] = LinkClockCaptured;    -- Есть захват входной частоты
+StatusR_Reg.data[1] = LinkActive;           -- Идет обмен по Линку
+StatusR_Reg.data[2] = LinkError;            -- Troubles in Links 
+StatusR_Reg.data[3] = Busy_on_Digitizing;   -- Флаг "Идет оцифровка" 
+StatusR_Reg.data[4] = Busy_on_Copy;         -- Флаг копирования порогов/коэффициентов
+StatusR_Reg.data[5] = DeadTime;             -- Отрабатывается мертвое время
+StatusR_Reg.data[6] = Error;                -- Troubles in CAMAC 
+--StatusR_Reg.data[7] = LAM_Trig.q ;          -- Есть LAM
+StatusR_Reg.data[7] = EnableLAM_Trig.q ;    -- Разрешен(VCC)/Запрещен  LAM
+StatusR_Reg.data[15..8] = StatusR_d[15..8]; -- Inputs connected to additional flags 
+
+-- LAM
+EnableLAM_Trig.(S,clk,R)= (EnableLAM, Clock,DisableLAM); 
+LamResetInt = CAMACCycleEnd.q AND CAMACactive1 ;
+LAM_Trig.(S, clk, R )   = (LamSet, Clock,   -- Set by user 
+          ( LamResetInt                     -- Reset by any CAMAC call 
+            OR LamReset OR Reset));         -- OR by user OR by RESET command 
+
+LAM     = LAM_Trig.q AND EnableLAM_Trig.q ;
+oL      = OPNDRN( !LAM ) ;
+
+----------------------------------------------------------------------
+--******** Section "User Interface Control" ********
+-- генерация запроса на предоставление/получение данных от/к юзер интерфейсу
+-- По чтению доступ запрашивается ДО строба S1, вырубка короткого импульса
+CAMAC_Read_Edge.(d, clk, reset) = (CAMACRead, Clock , GND ) ;
+
+-- По записи доступ запрашивается ПОСЛЕ начала S1 , вырубка короткого импульса
+CAMAC_Write_Edge.(d,clk, reset) = (!(CAMACWrite AND W_WE), Clock , GND ) ;
+
+AccessRequest.S  =  CAMAC_Read_Edge.q  OR CAMAC_Write_Edge.q  ;
+AccessRequest.clk = Clock ;
+--AccessRequest.clrn= !(DataBusStrobe AND AccessGranted) ;
+AccessRequest.R  = (DataBusStrobe AND AccessGranted) ;
+-- ( AR_ShW1.q AND !AR_ShW2.q ) 
+
+--**** SubSection "Direction control" ****
+RdWr= SRFF(.S=( CAMAC_Write_Edge.q), .clk=Clock,.R=(DataBusStrobe AND AccessGranted)); -- Выдача данных высоким уровнем в регистры или в память
+  -- SubSection "Direction control" End
+
+  -- Section "User Interface Control" End
+-- Warning!!! Assertion of these signals on Bus's wires is performed
+-- by external MUX.  This is because of the restrictions
+-- on Tri-state interchange between modules in Quartus software.
+----------------------------------------------------------------------
+
+END;

@@ -1,0 +1,31 @@
+title "median_bitstream";
+include "lpm_shiftreg.inc";
+subdesign median_bitstream
+(
+clock, in_stream	:	input ;
+out_stream, crr		:	output;
+
+)
+variable
+Presampler : lpm_shiftreg with (lpm_width=3);
+bitstream, correction	: node;
+
+begin
+Presampler.clock = Clock;
+Presampler.shiftin = in_stream;
+
+
+Table
+Presampler.q[]	=> bitstream, correction;
+b"000"			=> 0 ,			0;
+b"001"			=> 0 ,			0;
+b"010"			=> 0 ,			1;
+b"011"			=> 1 ,			0;
+b"100"			=> 0 ,			0;
+b"101"			=> 1 ,			1;
+b"110"			=> 1 ,			0;
+b"111"			=> 1 ,			0;
+end table;
+out_stream	=	DFF(.d=bitstream, .clk=clock);
+crr			=	DFF(.d=correction, .clk=clock);
+end;

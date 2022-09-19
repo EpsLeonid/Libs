@@ -1,0 +1,156 @@
+TITLE "Ethernet ARP decoder";
+
+INCLUDE "Edge_Sensing_Sync.inc";
+INCLUDE "lpm_shiftreg.inc";
+INCLUDE "lpm_counter.inc";
+
+Constant PARCER_CYLCLE_WIDTH = 2;--4
+Constant PARCER_CYLCLE_CNT_WIDTH = Ceil(log2(PARCER_CYLCLE_WIDTH))+1;
+Constant WORD_WIDTH	= 16; 
+
+Constant Eth_type_Pos        = 6;--6; --6
+
+Constant ARP_type    		 = H"0608";
+
+Constant ARP_Hardware_type   = H"0100";
+Constant ARP_Protocol_type   = H"0008";
+Constant ARP_HP_size 	     = H"0406"; -- длинна MAC(6) и IP(4) адресов в байтах
+Constant ARP_Opcode_Request  = H"0100"; -- пришел ARP запрос
+Constant ARP_Opcode_Answer   = H"0200"; -- пришел ARP ответ
+
+
+SUBDESIGN Eth_ARP_Decoder
+(
+  Clock                         : input; -- System Clock, really Bus_Clock
+
+  Rx_Data[WORD_WIDTH-1..0]  	: input;
+  Rx_Addr[10..0]  				: output;
+  Rx_Parcer_RQ					: input;
+   
+  Tx_Addr[10..0]  				: output;
+  Tx_Data[WORD_WIDTH-1..0]  	: output;
+  Tx_Word_Strobe      			: output;
+  
+  Reset                         : input;
+  
+  Rx_IP_Error                   : output;
+  Rx_NOT_RQ                 	: output;
+  Tx_Start				        : output;
+  Rx_Parcer_in_progress  		: output;
+  Rx_TRUE_RQ		            : output;
+  
+  MAC_Addr0_[WORD_WIDTH-1..0]	: input;
+  MAC_Addr1_[WORD_WIDTH-1..0]	: input;
+  MAC_Addr2_[WORD_WIDTH-1..0]	: input;
+  IP_Addr0_[WORD_WIDTH-1..0]	: input;
+  IP_Addr1_[WORD_WIDTH-1..0]	: input;
+  
+  Test                          : output;
+
+)
+VARIABLE
+  Rx_Parcer_RQ_ES               : Edge_Sensing_Sync;
+  RxParcerActive                : SRFF;
+  ARP_Request        		    : node; -- если опознан ARP запрос и OpСode==ARP_Opcode_Request то запускаем отправку данных из Tx буффера
+  Tx_Start_Pulse_Flag           : SRFFE;
+  Tx_Strobe                     : node;
+  
+  ParcerCnt						: LPM_COUNTER WITH (LPM_WIDTH = 5);
+  
+  Prescaler                     : LPM_COUNTER WITH (LPM_WIDTH = PARCER_CYLCLE_CNT_WIDTH);
+  Pascer_Sample_Enable 			: node;
+  
+  ARP_type_True					: node;
+  ARP_type_Flag					: SRFFE;
+
+  
+  ParcerEndCyle                 : node;
+  
+  IP0_True,IP1_True				: node; -- проверка в ARP-запросе IP-адреса блока.
+  IP0_Addr_Flag,IP1_Addr_Flag	: SRFFE; -- Отвечаем только если пришел IP-адрес блока
+  
+  Rx_Data_[WORD_WIDTH-1..0]     : node;
+
+BEGIN
+
+   Prescaler.(clock, sclr) = (Clock, Pascer_Sample_Enable OR Rx_Parcer_RQ_ES.q);
+   IF (Prescaler.q[] ==  PARCER_CYLCLE_WIDTH-1) THEN  Pascer_Sample_Enable = VCC;
+											    ELSE  Pascer_Sample_Enable = GND;
+   END IF;
+
+-------------------------------------------- Rx section --------------------------------------------
+   Rx_Data_[] = Rx_Data[];
+
+   Rx_Parcer_RQ_ES.(d,clk)  = (Rx_Parcer_RQ, Clock);
+   RxParcerActive.(S,clk,R) = (Rx_Parcer_RQ_ES.q, Clock, ParcerEndCyle OR Reset);
+   
+   ParcerCnt.(clock,sload,cnt_en) = (Clock, Rx_Parcer_RQ_ES.q, RxParcerActive.q AND Pascer_Sample_Enable);
+   ParcerCnt.data[] = Eth_type_Pos;
+   
+   IF(RxParcerActive.q == VCC) THEN
+        Tx_Addr[4..0] = ParcerCnt.q[]; Tx_Addr[10..5] = GND;
+ 
+        IF ((ParcerCnt.q[] >= Eth_type_Pos) AND (ParcerCnt.q[] <= Eth_type_Pos+7)) THEN  Rx_Addr[4..0] = ParcerCnt.q[4..0]; Rx_Addr[9..5] = GND; END IF;
+        
+        IF ((ParcerCnt.q[] == Eth_type_Pos) AND (Rx_Data_[] == ARP_type)) THEN  ARP_type_True = VCC; END IF;
+        
+        IF ((ParcerCnt.q[] == Eth_type_Pos+1) AND (ARP_type_Flag.q == GND)) THEN ParcerEndCyle = VCC; END IF;
+        IF (ParcerCnt.q[] == Eth_type_Pos+4) THEN IF(Rx_Data_[] == ARP_Opcode_Request) THEN ARP_Request = VCC; END IF;-- пришел ARP запрос, разрешаем запуск отправки данных из Tx буффера
+       	END IF;
+       
+       	
+       	IF (ParcerCnt.q[] == Eth_type_Pos+8)  THEN IF(Rx_Data_[] == IP_Addr0_[]) THEN IP0_True = VCC; END IF;-- проверяем LSB IP-адрес, разрешаем запуск отправки данных из Tx буффера
+       	END IF;
+       	IF (ParcerCnt.q[] == Eth_type_Pos+9)  THEN IF(Rx_Data_[] == IP_Addr1_[]) THEN IP1_True = VCC; END IF;-- проверяем MSB IP-адрес, разрешаем запуск отправки данных из Tx буффера
+       	END IF;
+       
+        IF (ParcerCnt.q[] == Eth_type_Pos)    THEN  Tx_Data[] = ARP_type; 		   Tx_Strobe = VCC; END IF;
+        IF (ParcerCnt.q[] == Eth_type_Pos+1)  THEN  Tx_Data[] = ARP_Hardware_type; Tx_Strobe = VCC; END IF;
+        IF (ParcerCnt.q[] == Eth_type_Pos+2)  THEN  Tx_Data[] = ARP_Protocol_type; Tx_Strobe = VCC; END IF;
+        IF (ParcerCnt.q[] == Eth_type_Pos+3)  THEN  Tx_Data[] = ARP_HP_size;       Tx_Strobe = VCC; END IF;
+        IF (ParcerCnt.q[] == Eth_type_Pos+4)  THEN  Tx_Data[] = ARP_Opcode_Answer; Tx_Strobe = VCC; END IF;
+        
+		IF (ParcerCnt.q[] == Eth_type_Pos+5)  THEN  Tx_Data[] = MAC_Addr0_[]; Tx_Strobe = VCC; END IF;
+		IF (ParcerCnt.q[] == Eth_type_Pos+6)  THEN  Tx_Data[] = MAC_Addr1_[]; Tx_Strobe = VCC; END IF;
+		IF (ParcerCnt.q[] == Eth_type_Pos+7)  THEN  Tx_Data[] = MAC_Addr2_[]; Tx_Strobe = VCC; END IF;
+		IF (ParcerCnt.q[] == Eth_type_Pos+8)  THEN  Rx_Addr[10..0] = 19; Tx_Data[] = IP_Addr0_[];  Tx_Strobe = VCC; END IF;
+		IF (ParcerCnt.q[] == Eth_type_Pos+9)  THEN  Rx_Addr[10..0] = 20; Tx_Data[] = IP_Addr1_[];  Tx_Strobe = VCC; END IF;
+		
+		IF (ParcerCnt.q[] == Eth_type_Pos+10) THEN  Rx_Addr[10..0] = 11; Tx_Data[] = Rx_Data_[]; Tx_Strobe = VCC; END IF;
+		IF (ParcerCnt.q[] == Eth_type_Pos+11) THEN  Rx_Addr[10..0] = 12; Tx_Data[] = Rx_Data_[]; Tx_Strobe = VCC; END IF;
+		IF (ParcerCnt.q[] == Eth_type_Pos+12) THEN  Rx_Addr[10..0] = 13; Tx_Data[] = Rx_Data_[]; Tx_Strobe = VCC; END IF;
+		IF (ParcerCnt.q[] == Eth_type_Pos+13) THEN  Rx_Addr[10..0] = 14; Tx_Data[] = Rx_Data_[]; Tx_Strobe = VCC; END IF;
+		IF (ParcerCnt.q[] == Eth_type_Pos+14) THEN  Rx_Addr[10..0] = 15; Tx_Data[] = Rx_Data_[]; Tx_Strobe = VCC; END IF;
+		IF (ParcerCnt.q[] == Eth_type_Pos+15) THEN  ParcerEndCyle = VCC; END IF;
+		
+                               ELSE
+   
+        ARP_type_True	 	 = GND;
+        Tx_Strobe   		 = GND;
+        ARP_Request			 = GND;
+        Rx_Addr[]        	 = GND;
+        Tx_Addr[]			 = GND;
+        Tx_Data[] 			 = GND; 
+        ParcerEndCyle        = GND;
+        IP0_True 			 = GND;
+        IP1_True			 = GND;
+   END IF;
+   
+   -- флаги
+   ARP_type_Flag.(S,clk,R,Ena)    	  = (ARP_type_True, Clock, Rx_Parcer_RQ_ES.q OR Reset,VCC);
+   IP0_Addr_Flag.(S,clk,R,Ena)        = (IP0_True, Clock, Rx_Parcer_RQ_ES.q OR Reset,VCC);
+   IP1_Addr_Flag.(S,clk,R,Ena)        = (IP1_True, Clock, Rx_Parcer_RQ_ES.q OR Reset,VCC);
+   Tx_Start_Pulse_Flag.(S,clk,R,Ena)  = (ARP_Request, Clock, Rx_Parcer_RQ_ES.q OR Reset,VCC);
+   
+   -- выходы
+   Rx_IP_Error		      = ARP_type_Flag.q AND !(IP0_Addr_Flag.q AND IP1_Addr_Flag.q) AND ParcerEndCyle;--ARP_Err_Flag.q;
+   Rx_NOT_RQ              = (!ARP_type_Flag.q) AND ParcerEndCyle;
+   Tx_Start				  = Tx_Start_Pulse_Flag.q AND IP0_Addr_Flag.q AND IP1_Addr_Flag.q AND ParcerEndCyle;
+   Rx_Parcer_in_progress  = RxParcerActive.q;
+   --Tx_Word_Strobe 		  = (RxParcerActive.q AND Tx_Strobe AND Pascer_Sample_Enable); -- строб защелкивания в Tx буффер
+   Tx_Word_Strobe 		  = (Tx_Strobe AND Pascer_Sample_Enable); -- строб защелкивания в Tx буффер
+   Rx_TRUE_RQ             = ARP_type_Flag.q AND ParcerEndCyle;
+   
+   Test                   = ARP_type_Flag.q;
+   
+END;

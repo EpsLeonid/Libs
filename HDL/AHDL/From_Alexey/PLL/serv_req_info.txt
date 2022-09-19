@@ -1,0 +1,15 @@
+<internal_error>
+	<executable>mega_altclklock.exe</executable>
+	<sub_system>unknown</sub_system>
+	<file>unknown</file>
+	<line>0</line>
+	<callstack>
+	0x004c340c: mega_mwizc + 0x2340c (?check_for_device_family_validity@CRWIZARD_BASE@@UAI_NXZ + 0xdc)
+	</callstack>
+	<error>Access Violation at 0X004C340C</error>
+	<date>Tue Aug 16 17:22:29 2022</date>
+	<version>Quartus II Version 8.1 Build 163 10/28/2008 SJ Full Version</version>
+	<full_error>Access Violation at 0X004C340C
+Quartus II Version 8.1 Build 163 10/28/2008 SJ Full Version </full_error>
+</internal_error>
+

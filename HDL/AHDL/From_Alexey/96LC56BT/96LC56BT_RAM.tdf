@@ -1,0 +1,109 @@
+TITLE "96LC56BT_RAM_RW";
+
+INCLUDE "Edge_Sensing.inc";
+INCLUDE "lpm_counter.inc";
+INCLUDE "lpm_shiftreg.inc";
+INCLUDE "96LC56BT.inc";
+
+CONSTANT WORD_WIDTH           = 16;
+
+CONSTANT OP_CODE_WRITE  	  = B"01";
+CONSTANT OP_CODE_READ  	 	  = B"10";
+
+SUBDESIGN 96LC56BT_RAM
+(
+  	RAM_DO							: INPUT;
+    RAM_Clock						: OUTPUT ;
+    RAM_CS							: OUTPUT ;
+    RAM_DI							: OUTPUT ;
+    
+    DirectOut                       : OUTPUT;
+   
+  -- Standard Bus signaling for Master/Slave connection
+	-- General Signals
+	Bus_Clock						: input;  
+	DataBusStrobe					: input ; 
+    AddrBus_In[7..0]				: input ; 
+    DataBus_In[WORD_WIDTH-1..0]		: input ; -- 
+    DataBusOut[WORD_WIDTH-1..0]		: output; -- 
+	-- Master Mode Signals 
+	Select							: input ;
+	Direct_In						: input; 
+	
+	Test1,Test2                     : output;
+    
+)
+
+VARIABLE
+    
+    Ext_RAM 						: 96LC56BT;
+    
+    OpCode_Reg 						: LPM_SHIFTREG with (lpm_width=WORD_WIDTH);
+    Address_Reg						: LPM_SHIFTREG with (lpm_width=WORD_WIDTH);
+    Data_Reg						: LPM_SHIFTREG with (lpm_width=WORD_WIDTH);
+    
+    OpCode_Reg_CS                   : node;
+    Address_Reg_CS                  : node;
+    Data_Reg_CS                     : node;
+    StartCycle                      : node;
+    
+    Return_Data_Reg					: LPM_SHIFTREG with (lpm_width=WORD_WIDTH);
+    
+    --OpCode_BUS[1..0]                : node;
+   
+BEGIN
+
+    Ext_RAM.Clock 		 	 = Bus_Clock;
+    Ext_RAM.OpCode[1..0] 	 = OpCode_Reg.q[1..0];
+    Ext_RAM.Address_In[7..0] = Address_Reg.q[7..0];			
+    Ext_RAM.Data_In[15..0]	 = Data_Reg.q[15..0];			
+    Ext_RAM.Exchange         = StartCycle;
+	Ext_RAM.RAM_DO       	 = RAM_DO;
+	
+	DirectOut 				 = Ext_RAM.DirectOut;
+	RAM_Clock				 = Ext_RAM.RAM_Clock;
+	RAM_CS					 = Ext_RAM.RAM_CS;
+	RAM_DI					 = Ext_RAM.RAM_DI;
+	
+
+    OpCode_Reg.(clock , load, enable, data[])	  =	(Bus_Clock, VCC, OpCode_Reg_CS         , DataBus_In[]);
+    Address_Reg.(clock, load, enable, data[])	  =	(Bus_Clock, VCC, Address_Reg_CS        , DataBus_In[]);
+    Data_Reg.(clock   , load, enable, data[])	  =	(Bus_Clock, VCC, Data_Reg_CS   		   , DataBus_In[]);
+    
+    Return_Data_Reg.(clock, load, enable, data[]) = (Bus_Clock, VCC, Ext_RAM.Data_Out_Ready, Ext_RAM.Data_Out[]);
+
+    
+    CASE AddrBus_In[7..0]	IS
+		WHEN 0		=>	DataBusOut[]						=	OpCode_Reg.q[]; 
+						OpCode_Reg_CS						=	Select AND Direct_In AND DataBusStrobe;
+		WHEN 1		=>	DataBusOut[]						=	Address_Reg.q[]; 
+						Address_Reg_CS						=	Select AND Direct_In AND DataBusStrobe;
+		WHEN 2		=>	DataBusOut[]						=	Data_Reg.q[]; 
+	                    Data_Reg_CS							=	Select AND Direct_In AND DataBusStrobe;
+        WHEN 3		=>	DataBusOut[]						=	Return_Data_Reg.q[]; 	                    
+        WHEN 4		=>	StartCycle							=	Select AND Direct_In AND DataBusStrobe;  
+        
+ %    -- разрешение на запись и стирание   
+        WHEN 5		=>	StartCycle							=	Select AND Direct_In AND DataBusStrobe;
+                        OpCode_BUS[1..0]                    =   OP_CODE_ERA_EN;
+                        Address_BUS[7..0]                   =   192
+     -- запись слова из Data_Reg(2) по заданному в Address_Reg(1) адресу               
+        WHEN 6		=>	StartCycle							=	Select AND Direct_In AND DataBusStrobe;
+                        OpCode_BUS[1..0]                    =   OP_CODE_WRITE;
+     -- чтение слова в Return_Data_Reg(3) из заданного в Address_Reg(1) адреса 
+        WHEN 7		=>	StartCycle							=	Select AND Direct_In AND DataBusStrobe;
+                        OpCode_BUS[1..0]                    =   OP_CODE_READ; 
+     -- стереть всю память (установить значения в ячейках все 1)
+        WHEN 8		=>	StartCycle							=	Select AND Direct_In AND DataBusStrobe;
+                        OpCode_BUS[1..0]                    =   OP_CODE_ERA_EN;   
+                        Address_BUS[7..0]                   =   128;    %                     
+		WHEN OTHERS	=>	DataBusOut[]						=	GND;
+		               -- OpCode_BUS[1..0]                    =   GND;
+                       -- Address_BUS[7..0] 					=   GND;
+	END CASE;
+ 
+ 
+    Test1 =  StartCycle;
+    Test2 =  Ext_RAM.Test;
+    
+END;

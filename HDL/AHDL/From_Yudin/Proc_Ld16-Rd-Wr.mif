@@ -1,0 +1,53 @@
+-- Since  Quartus refused to generate the .mif-file autmatically, 
+-- I had to make it by hand from a .mif-file generated before.
+-- Hand-made Memory Initialization File (.mif)
+
+-- Command Word bits' meaning: 
+--     [ 16 15 14 13|12 11 10  9  8  7  6  5  4  3  2  1 ]
+-- Halt   0  0  0  0|                                   |
+-- NOP    0  0  0  1|                                   |
+-- Incr   0  0  1  0| Destn  |                          |
+-- Decr   0  0  1  1| Destn  |                          |
+--JumpUnc 0  1  0  0|           | Address of Program    |Jump_Unconditional
+--JumpCnd 0  1  0  1| Condition | Address of Program    |Jump_Conditional
+--EndLoop 0  1  1  0|           | Address of Program    |End_of_Loop
+-- Wait   0  1  1  1| Condition |                       |
+-- Load   1  0  0  0| Destn  |  | 8-bit word to load    |Load 8-bit word from ProgRAM
+-- Load16 1  0  0  1| Destn  |                          |Load 16-bit word from ProgRAM
+---- Move   0  1  1  0| Destn  | Source |                 |
+-- Read   1  1  0  0|Data_Dst|Addr_Src|                 |Read from Extern.Object
+-- Write  1  1  0  1|Data_Src|Addr_Src|                 |Write to Extern.Object
+-- END    1  1  1  1|                                   |End_of_Prog 
+
+WIDTH=16;
+DEPTH=256;
+
+ADDRESS_RADIX = Dec;
+DATA_RADIX    = Bin;
+
+CONTENT  BEGIN
+
+ 00         : 1111000000000000; -- ENDofProg - for PowerUp
+ 01         : 1111000000000000; -- ENDofProg - for PowerUp
+[  2.. 15]  : 0000000000000000;
+ 16         : 0001000000000000; -- NOP; BEGINNING of Prog
+ 17         : 0001000000000000; -- NOP
+ 18         : 1001010000000000; -- Load16  into Reg2
+ 19         :   GateDel_offset; --   #2049                   Reg2=2049
+ 20         : 1100001010000000; -- Read:  Ddst=Reg1 A=Reg2,  @#2049 => Reg1
+ 21         : 0010001000000000; -- Incr   Reg1
+ 22         : 0010001000000000; -- Incr   Reg1
+ 23         : 1101001010000000; -- Write: Dsrc=Reg1 A=Reg2, #(N+2) => @#2051
+ 24         : 0001000000000000; -- NOP
+ 25         : 1111000000000000; -- ENDofProg
+
+[ 26.. 63]  : 0000000000000000;
+
+
+FOR i in 64 to 127  GENERATE
+    i   :   6400 + (i-64);
+END  GENERATE;
+
+[128..255]  :   0;
+
+END;

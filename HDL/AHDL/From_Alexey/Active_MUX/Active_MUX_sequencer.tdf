@@ -1,0 +1,173 @@
+TITLE "Active_MUX_sequencer" ;
+-- This file include functions for sequence control of analog Multiplexer
+-- of CAMAC_POWER Digitizer.
+-- Command List contains Analog_Mux_Control commands and Data_Distribution commands.
+-- Low halve of PROM is used for Target_Addresses, which must be supplied with a data.
+-- Contents of this part will be asserted at AddrBusOut lines while master mode of data transfer is used.
+-- High halve of PROM is used for Mux control words. This words will be asserted at mux control lines.
+-- ADC data will be received with bypass way and asserted to DataBusOut lines.
+% Until "Digitizer_Ready" Mux is switched to default connection - Uref, for example.
+When "Mux_Next" pulse are coming, MUX is switched to next poition, as specified in RAM table. 
+At the end of Table signal "Stop_Digitizer" issued to terminate ADC conversions.
+RAM Table is initiated at PowerUp from "MUX_Sequencer.mif" and can be changed by End_User.
+RAM organised as 16bit x 256 Words. Bites 0..6 - mux control of Down Line, 8..14 - Upper Line.
+Bit 15 - Stop Bit.
+%
+INCLUDE "lpm_counter.inc"  ;
+INCLUDE "lpm_shiftreg.inc";
+INCLUDE "Active_MUX_Seq_PROM.inc" ;
+INCLUDE "Edge_Sensing_Sync.inc";
+CONSTANT WORD_WIDTH          = 16 ; -- размер слова данных
+
+CONSTANT MUX_NUMBER_DEVICE   = 8 ;
+CONSTANT ADC_DATA_WIDTH		 = 32; --18 -- размер данных, приходящих с АЦП (бит)
+
+CONSTANT MUX_ADDR_CNT_SIZE   = Ceil( LOG2(MUX_NUMBER_DEVICE*2));--+1;
+
+SUBDESIGN Active_MUX_sequencer
+(
+-- Standard Bus signaling for Master/Slave connection
+	-- General Signals
+	Bus_Clock							 : input;  -- частота работы модуля 
+	DataBusStrobe						 : input ; -- строб приема/передачи данных наружу (высокий уровень, защелкиваем по заднему фронту)
+    AddrBus_In[8..0]					 : input ; -- шина адреса для доступа в пространство памяти
+ 
+ 	Reset								 : input=gnd ; -- Common FPGA signal Reset (Active HIGH)
+    DataBus_In[WORD_WIDTH-1..0]			 : input ; -- 
+    DataBusOut[WORD_WIDTH-1..0]			 : output; -- 
+    
+	-- Master Mode Signals -- eniieucoaony i?e ?aaioa aaiiiai Iiaoey a ?a?eia Master)
+	AccessRequest			    		 : output; -- cai?in e A?aeo?o ia ainooi e oeia aey ?oaiey/caiene aaiiuo Iieuciaaoaey a ?a?eia Master	
+	AccessGranted			    		 : input;  -- ?ac?aoaiea A?aeo?a aunoaaeou Aa?an e iai?aaeaiea iaiaia (caoaao oeiu)
+	DirectOut				    		 : output; -- iai?aaeaiea ia?aaa?e aaiiuo, ia aioo?aii?? oeio eee n iaa, ii oiie?aie? =GND, ia?aaa?a io aioo?aiieo ?ano?nia ieaou Iiaoeu,
+	AddrBusOut[15..0]		    		 : output; -- aa?an i?e iia?aoeyo ainooia ei aioo?aiiei ?ano?nai Ioeo?iaueea (?oaiey/caiene ii Eiiaiaiiio Eenoo).
+	Direct_In				    		 : input; 
+		-- Slave Mode Signals	-- eniieucoaony i?e ?aaioa aaiiiai Iiaoey a ?a?eia Slave
+	Select					   		 	 : input ;
+
+
+
+---------------- Digitizer Specific Signals
+	Conv_Clock		   	        		 : Input ; 
+  	MUX_Next				    		 : Input ;    -- T/H closed, let's analog MUX go
+	ADC_Data[ADC_DATA_WIDTH-1..0]   	 : Input;	-- Registered data
+--	Error					    		 : output ; -- Digitizing cycle stop if infinit cycle
+---------------- MUX Specific Signals
+	MX_A[15..0]  		 : OUTPUT ; -- Output to Pin226
+	
+)
+
+VARIABLE
+----------- Event Measurement Cycle Control 
+	MUX_Next_Edge		:	Edge_Sensing_Sync ;
+	WordCounter			:	lpm_counter WITH (LPM_WIDTH = 8); -- Counter of conversions, RAM Address control
+	WordCounter_Increment:	node; 
+	End_of_Command_List	:	node; -- End of command List
+	Data_Sent_OK	:	node; 
+	Requiest_Enable	:	node; 
+
+		
+-- RAM 
+	PROM_Table						: Active_MUX_Seq_PROM ;
+    Target_Address_Reg				: LPM_SHIFTREG with (lpm_width=16); 
+    ADC_Data_Reg 					: LPM_SHIFTREG with (lpm_width=ADC_DATA_WIDTH);
+    Target_Addr_Page_offset[7..0]	: node;
+    MUX_Page_offset[7..0]			: node;
+    Access_Request			        : SRFF;
+
+    Delay_Reg						: LPM_SHIFTREG with (lpm_width=32);
+    ADC_Data_Num                    : lpm_counter WITH (LPM_WIDTH = 2);
+    MUX_Addr_Cnt                    : lpm_counter WITH (LPM_WIDTH = MUX_ADDR_CNT_SIZE);
+   
+    Mux_Control_Word_Reg            : LPM_SHIFTREG with (lpm_width=16); 
+    MUX_User_Reg                    : LPM_SHIFTREG with (lpm_width=16); 
+    MUX_User_Reg_CS                 : node;
+    MUX_CSR_Reg                     : LPM_SHIFTREG with (lpm_width=16); 
+    MUX_CSR_Reg_CS                  : node;
+
+BEGIN
+
+	MUX_Next_Edge.(clk, d)	=	(Conv_Clock, MUX_Next);-- normalize it
+
+-- Conversion Counter Control
+	WordCounter.clock		=	Conv_Clock ;
+	WordCounter.sclr		=	End_of_Command_List OR Reset;
+	WordCounter.cnt_en		=	WordCounter_Increment;
+	WordCounter_Increment	=	Requiest_Enable;--Delay_Reg.q[1] OR Delay_Reg.q[20];
+	
+-- Check for infinity
+--If (WordCounter.q[6..0] == 127) Then Error = VCC;	Else Error = GND; End if;
+	
+	-- Master Access Control
+	Access_Request.S  	=	Requiest_Enable; 
+	Access_Request.clk 	=  	Bus_Clock;
+	Access_Request.R  	=	Data_Sent_OK; 
+	AccessRequest		=	Access_Request.q;
+	DirectOut=VCC;
+
+	Data_Sent_OK	=			DataBusStrobe AND AccessGranted;
+	
+	Requiest_Enable	=			Delay_Reg.q[1] OR Delay_Reg.q[25];
+    Delay_Reg.(clock, enable, shiftin) = (Bus_Clock, VCC, MUX_Next_Edge.q);
+
+
+----------------- MEMORY_Control supersection BEGIN -----------------------
+-- Port A is read-only
+    Target_Addr_Page_offset[6..0] = WordCounter.q[6..0]; Target_Addr_Page_offset[7] = GND; -- Low side is used for target addresses storage 
+    MUX_Page_offset[6..0]         = WordCounter.q[6..0]; MUX_Page_offset[7]         = VCC;
+    
+	PROM_Table.clock_a          = Conv_Clock ;
+	PROM_Table.address_a[7..0]	=	Target_Addr_Page_offset[7..0] ;
+
+    Mux_Control_Word_Reg.(clock, enable, load, data[])	    =	(Conv_Clock, (MUX_Next_Edge.q)      , VCC, PROM_Table.q_b[]);
+	Target_Address_Reg.(clock, enable, load, data[15..0])	=	(Conv_Clock, (WordCounter_Increment), VCC, PROM_Table.q_a[]);
+	ADC_Data_Reg.(clock, enable, load, data[])			    =	(Conv_Clock, Delay_Reg.q[1]         , VCC, ADC_Data[]      );
+	
+
+	MUX_Addr_Cnt.clock		=	Conv_Clock ;
+	MUX_Addr_Cnt.sclr		=	End_of_Command_List OR Reset;
+	MUX_Addr_Cnt.cnt_en		=	Delay_Reg.q[1];
+	
+	IF MUX_CSR_Reg.q[0] == GND THEN MX_A[] = Mux_Control_Word_Reg.q[];
+                               ELSE MX_A[] = MUX_User_Reg.q[];
+    END IF;
+	
+    
+
+	IF PROM_Table.q_a[]==65535 THEN End_of_Command_List=VCC;
+                               ELSE End_of_Command_List=GND;
+    END IF;
+    
+	PROM_Table.clock_b          = Bus_Clock ;
+    --PROM_Table.address_b[7..0]	= AddrBus_In[7..0]  ;
+----------------- MEMORY_Control supersection END -----------------------
+---------------------------------------
+
+-- Section "Bus Connections" Begin
+        
+    IF (Select == VCC) THEN
+         IF (AddrBus_In[] < 256)       THEN DataBusOut[15..0]          = PROM_Table.q_b[15..0];
+                                            PROM_Table.address_b[7..0] = AddrBus_In[7..0]     ; 
+                                       ELSE PROM_Table.address_b[7..0] = MUX_Page_offset[7..0];     
+         END IF ;             
+         IF (AddrBus_In[] == 256)      THEN DataBusOut[15..0]  		   = MUX_User_Reg.q[];
+                                            MUX_User_Reg_CS    		   = DataBusStrobe and Direct_In;
+                                       ELSE MUX_User_Reg_CS    		   = GND;
+         END IF;
+         IF (AddrBus_In[] == 257)      THEN DataBusOut[15..0]   	   = MUX_CSR_Reg.q[];
+                                            MUX_CSR_Reg_CS    		   = DataBusStrobe and Direct_In;
+                                       ELSE MUX_CSR_Reg_CS    		   = GND;
+         END IF;        
+    ELSE PROM_Table.address_b[7..0] = MUX_Page_offset[7..0];
+	     IF (ADC_Data_Num.q[0] == VCC) THEN DataBusOut[15..0] 	  	   = ADC_Data_Reg.q[31..16];
+		                               ELSE DataBusOut[15..0] 	  	   = ADC_Data_Reg.q[15..0];
+		 END IF;
+	END IF;
+    AddrBusOut[15..0]			=	Target_Address_Reg.q[];
+
+
+    ADC_Data_Num.(clock, cnt_en) = (Bus_Clock, DFF(.d=Data_Sent_OK,.clk=Bus_Clock));
+    MUX_User_Reg.(data[],clock, load, enable) = (DataBus_In[],Bus_Clock,VCC,MUX_User_Reg_CS);
+    MUX_CSR_Reg.(data[],clock, load, enable) = (DataBus_In[],Bus_Clock,VCC,MUX_CSR_Reg_CS);
+
+END;

@@ -1,0 +1,77 @@
+-- Advanced Shift Register, With N_IN - inputs and N_OUT - outputs.
+-- _WARNING_ !!! N_IN div N_OUT must be 0(zero).
+-- _WARNING_ !!! N_IN must be > or == N_OUT.
+--             N_OUT     
+--            ^ ^ ^ ^
+--            | | | |
+-- +-+-+-+-+--+-+-+-+
+-- | | | | | 
+-- ^ ^ ^ ^ ^  
+--   N_IN
+-- (c) by Andrey V. Ovchar 2000
+
+INCLUDE "lpm_shiftreg.inc";		-- Using standart Shift Regs.
+
+
+PARAMETERS
+(
+	N_IN 		= 8,
+	N_OUT		= 4,
+	DIRECTION	= "RIGHT",	-- Or "LEFT"
+	INVERT		= "OFF"	-- Or "ON"
+	-- _MAX_IN		= N_IN - 1,
+	-- _MAX_OUT	= N_OUT - 1,
+	-- _WIDTH		= N_IN DIV N_OUT
+);
+
+SUBDESIGN uni_shift_gt				-- Universal Shift Register, Inputs > than Outputs.
+(
+	data[N_IN-1..0]: INPUT;
+	clock 			: INPUT; 		-- \
+	enable 			: INPUT;    
+	load 			: INPUT; 	
+	sclr 			: INPUT = GND; 	-- See the I/O for lpm_shiftreg.
+	sset 			: INPUT = GND;
+	aclr 			: INPUT = GND;
+	aset			: INPUT = GND; 	-- /
+	
+	out[N_OUT-1..0]	: OUTPUT;
+)
+VARIABLE
+	sh_regs[N_OUT-1..0]	:	lpm_shiftreg 
+							WITH 
+							(
+								LPM_WIDTH		= N_IN DIV N_OUT,
+								LPM_DIRECTION 	= DIRECTION
+							);
+BEGIN
+
+	sh_regs[].(clock, shiftin, enable, load, sclr, sset, aclr, aset)=(clock, GND, enable, load, sclr, sset, aclr, aset);
+
+	ASSERT 		(N_IN >= N_OUT)
+	REPORT 		" N_IN must be > or == N_OUT." 
+	SEVERITY	ERROR;
+
+	ASSERT 		((N_IN MOD N_OUT) == 0)
+	REPORT 		" N_IN div N_OUT must be 0." 
+	SEVERITY	ERROR;
+		
+	FOR i IN N_OUT - 1 TO 0 GENERATE
+		FOR j IN (N_IN DIV N_OUT)-1 TO 0 GENERATE
+			sh_regs[i].data[j] = data[j * N_OUT + i];	
+		END GENERATE;
+	END GENERATE;
+
+	IF INVERT == "OFF" GENERATE
+		out[N_OUT-1..0] = sh_regs[N_OUT-1..0].shiftout;
+	ELSE GENERATE
+		IF INVERT == "ON" GENERATE
+			out[0..N_OUT-1] = sh_regs[N_OUT-1..0].shiftout;
+		ELSE GENERATE
+			ASSERT
+			REPORT 		"Parameter INVERT must be either ""ON"" or ""OFF""."
+			SEVERITY	ERROR;
+		END GENERATE;
+	END GENERATE;
+		
+END;

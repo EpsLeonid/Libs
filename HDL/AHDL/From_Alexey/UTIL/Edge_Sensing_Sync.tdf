@@ -1,0 +1,30 @@
+TITLE "Edge_Sensing_Sync";
+-- This file contain function for Positive Edge Sensing
+-- It produce one output positive pulse for input positive transition
+Subdesign Edge_Sensing_Sync
+(
+  clk		: input;         -- Clock
+  clr		: input = GND ;  -- Common FPGA Reset
+  d			: input;         -- External signal to be synchronized
+  ena		: input = VCC;
+  q			: output;        -- Synchronized out
+)
+
+Variable
+
+     StartSensing_trg1, StartSensing_trg2  : DFFEAS;  --trg1,trg2 is edge sensitive  
+  -- one clock pulse shaper
+
+BEGIN
+    StartSensing_trg1.(d, ASDATA)  = (d, d);
+    StartSensing_trg1.clk          = clk;
+    StartSensing_trg1.(ALOAD, ena) = (clr, ena);
+   
+    StartSensing_trg2.(d, ASDATA)  = (StartSensing_trg1.q,d);
+    StartSensing_trg2.clk          = clk;
+    StartSensing_trg2.(ALOAD, ena) = (clr, ena);
+ 
+-- One pulse sync output
+    q = (StartSensing_trg1.q AND !StartSensing_trg2.q);
+
+END;

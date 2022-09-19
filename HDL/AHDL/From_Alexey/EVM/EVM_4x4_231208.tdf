@@ -1,0 +1,297 @@
+Title "EVM_4x4_231208";
+-- These file describes subsystem for control how multiple event sourses
+-- will be combined in single output channel. 
+
+INCLUDE "CMD3_DAQ_LINK.INC";
+INCLUDE "lpm_counter.inc" ;
+INCLUDE "lpm_shiftreg.inc" ;
+INCLUDE "Edge_Sensing.inc" ;
+INCLUDE "Pulse_Width_Shaper.inc";
+INCLUDE "Edge_Sensing_Sync.inc";
+
+Subdesign EVM_4x4_231208
+(
+
+-- Module specific signals
+		-- Сигналы Запросов (Интерфейс Пользователя)
+		Cavity_Clock			: input;
+		Start_at_Edge[4..1]		: input = GND ;  -- Запрос на запуск цикла измерений, для синхронного запуска нескольких линков
+		Inhibit_for_Start_at_Edge	: input = GND ;  -- Inhibit of physical triggering
+
+		Start_at_Level[4..1]	: input = GND ;  -- Запрос на запуск цикла системных сообщений и измерений, допускающих ожидание
+		
+		-- Сигналы Решений 
+		Transaction_Command[COMMAND_SIZE-1..0]	: output; -- отправляемая команда при синхронном старте
+		Time_Set_Command[7..0]					: output; -- выход - модификатор, отправляется в Контроллер Событий
+	-- Time_Set_Command[0] Modifier for CLBR link's Start
+	-- Time_Set_Command[1] Modifier for Ordinar link's Start
+	-- Time_Set_Command[2] Modifier for CAMAC Brake
+	-- Time_Set_Command[3] Modifier for Klukwa Brake
+	-- Time_Set_Command[4] Modifier for Synchro_0 - synchro output desabled if bit=VCC
+	-- Time_Set_Command[5] Modifier for Synchro_1 - synchro output desabled if bit=VCC
+
+ 		FirstWordData[WORD_WIDTH-1..0]	: output; 	-- отправляемые данные/номер события при синхронном старте
+		
+		
+		Event_in_Progress		: input	= GND ;  -- уровень, сообщает о занятости контроллера событий
+		Next_Event_Ena			: input;		-- уровень, сообщает о том, что контроллер событий скоро освободится (Dead Time)
+		LinkMessage				: input	= GND ;  -- уровень, сообщает о занятости линков
+		-- Link_Work_Now		: input = GND ;
+		Push_Event				: output ;	-- выход на запуск контроллера событий
+											-- для организации событий а-ля Калибровка
+															--
+--		Transaction_Status[WORD_WIDTH-1..0]		: output;
+	Error                   : output; -- сигнал ошибки (неверная команда)
+
+
+-- Standard Bus signaling for Master/Slave connection
+			-- General Signals
+	Bus_Clock				: input; -- Global FPGA Clock, assumed 100MHz for T2Q project 
+	Reset					: input = GND;  -- Common FPGA Reset
+	DataBus_In[15..0]		: input;  -- отправляемые с Внутренней Шины  данные
+	DataBusOut[15..0]       : output; -- выдаваемые на Внутреннюю Шину  данные
+	DataBusStrobe           : input;  -- строб приема/передачи данных наружу (высокий уровень, защелкиваем по заднему фронту)
+
+	-- Master Mode Signals -- используется при работе данного Модуля в режиме Master)
+--	AccessRequest           : output; -- запрос на доступ к шине для чтения/записи данных Пользователя 	
+--	AccessGranted			: input;  -- Разрешение Арбитра выставить Адрес и направление обмена (захват шины)
+--	DirectOut				: output; -- направление передачи данных, на внутреннюю шину или с нее, по умолчанию =GND, передача от внутренних ресурсов платы Модуль,
+--	AddrBusOut[15..0]       : output; -- адрес при операциях доступа ко внутренним ресурсам Оцифровщика (чтения/записи по Командному Листу).
+
+			-- Slave Mode Signals	-- используется при работе данного Модуля в режиме Slave
+		Select					: input;  -- Выбор Модуля для работы с памятью в режиме Slave (с КАМАК-ом)
+		DirectIn				: input;  -- направление передачи данных, Если =GND, то данный Модуль читается, если =VCC, то пишется.
+		AddrBus_In[7..0]		: input;  -- адрес при операциях доступа чтения/записи с КАМАК-а
+	
+ --   Test1,Test2,Test3,Test4,Test5,Test6,Test7      : output ; -- to be conected to test output of main Project 
+   Test1,Test2,Test3,Test4,Test5     : output ; -- to be conected to test output of main Project 
+
+)
+
+Variable
+
+-- Input_Requestes_Register		: LPM_SHIFTREG With (LPM_WIDTH = 8);
+Event_Number_Counter			: LPM_COUNTER  With (LPM_WIDTH = 2*WORD_WIDTH);
+Event_Number_Counter_wren		: node;
+Event_Number_Counter_Buffer[2*WORD_WIDTH-1..0]		:dff;
+ENC_we1, ENC_we2				:dff;
+
+Begin_Event_Generation			:	Edge_Sensing_Sync; 
+End_Event_Generation			:	Edge_Sensing_Sync;
+Queue_Line_Clear				:	Edge_Sensing_Sync;
+Yes_No_Register					:	LPM_SHIFTREG With (LPM_WIDTH = 2*WORD_WIDTH);
+Yes_No_Register_Buffer[2*WORD_WIDTH-1..0]		:dff;
+Yes_No_Register_BufferD[2*WORD_WIDTH-1..0]		:dff;
+--Insensitive_Time				:	Pulse_Width_Shaper with (Duration=70); -- 70 ns to lock Event signal
+
+EventCode_Reg[8..1]				: LPM_SHIFTREG With (LPM_WIDTH = WORD_WIDTH);
+EventCode_Reg_Buffer[8..1]		: LPM_SHIFTREG With (LPM_WIDTH = WORD_WIDTH);
+EventCode_Reg_wren[8..1]		: node ;
+
+
+EventCode_Out[WORD_WIDTH-1..0]	:node; -- 
+EventCode_Out_Reg[WORD_WIDTH-1..0]		: dff;
+
+Input_Requestes_Edge_Sensor[4..1]	:Edge_Sensing_Sync;
+Input_Requestes_Edge_Extender[4..1]	:SRFF; --	Waiting for  Yes/No
+EventCode_Imm[WORD_WIDTH-1..0]		:node; -- 
+Start_Immediate						:node;
+
+
+Set_in_Queue[4..1]					:Edge_Sensing_Sync; -- Single pulse for request
+Queue_Line[4..1]					:SRFF;	--	Waiting for service and Yes/No
+EventCode_Queue[WORD_WIDTH-1..0]	:node; -- 
+Start_from_Queue					:node;
+Queue_Overflow						:node ;
+Edge_of_Queue_Overflow				:Edge_Sensing_Sync;
+
+RST									:node;
+DataBusOut_Reg[WORD_WIDTH-1..0]		: dff;
+DataBusOut_[WORD_WIDTH-1..0]		:node;
+
+Inhibit_Stable_Level_Sensor			: LPM_SHIFTREG With (LPM_WIDTH = 8);
+Inhibit_is_Stable					:node;
+
+
+
+begin
+
+DEFAULTS
+	Queue_Line[].R	= GND; -- Implicit OR declaration
+	EventCode_Imm[]	= GND;
+	EventCode_Queue[]	= GND;
+END DEFAULTS;
+
+
+-- Main Loop Control Begin
+RST=dff(.d=dff(.d=Reset, .clk=Cavity_Clock), .clk=Cavity_Clock);	-- Resync 
+Inhibit_Stable_Level_Sensor.(clock, shiftin)	=	(Cavity_Clock, Inhibit_for_Start_at_Edge);
+Inhibit_is_Stable	=	DFF(.d=(Inhibit_Stable_Level_Sensor.q[]==VCC), .clk=Cavity_Clock);
+Begin_Event_Generation.(d,clk,clr) 	=	(Event_in_Progress, Cavity_Clock, RST); -- Single pulse at Begin of Event
+End_Event_Generation.(d,clk,clr) 	=	(!Event_in_Progress, Cavity_Clock,RST);  -- Single pulse at end of Event
+Queue_Line_Clear.(d,clk,clr) 	=	(Next_Event_Ena, Cavity_Clock,RST);  -- Single pulse at end of Event
+--Push_Event	=(Start_from_Queue OR Start_Immediate) AND !(End_Event_Generation.q OR DFF(.d=End_Event_Generation.q,.clk=Clock)); 
+--Push_Event	=(Start_from_Queue OR Start_Immediate) AND !Insensitive_Time.PulseOut; 
+Push_Event	=(Start_from_Queue OR Start_Immediate) AND !Next_Event_Ena AND !Edge_of_Queue_Overflow.q;
+
+IF (Start_from_Queue)  -- IF queue exist, than it will be servised first
+Then	EventCode_Out[]	=	EventCode_Queue[];
+Else	EventCode_Out[]	=	EventCode_Imm[];
+END IF;
+
+Error	=	Queue_Overflow ;
+Edge_of_Queue_Overflow.(d,clk,clr)	=	(Queue_Overflow, Cavity_Clock, RST);
+
+EventCode_Out_Reg[].clk=Cavity_Clock; EventCode_Out_Reg[].d=EventCode_Out[];
+Transaction_Command[]		=	EventCode_Out_Reg[COMMAND_SIZE-1..0].q;
+Time_Set_Command[]			=	EventCode_Out_Reg[WORD_WIDTH-1..COMMAND_SIZE].q;
+
+
+-- Main Loop Control End 
+
+
+
+
+-- NOT queue requestes  --- Shaping and registering Begin
+--Input_Requestes_Edge_Sensor[].(d, clk, clr)	=	(Start_at_Edge[],Clock,(Reset OR Event_in_Progress OR Insensitive_Time.PulseOut)) ;
+for i in 1 to 4 generate 
+Input_Requestes_Edge_Sensor[i].(d, clk, clr)	=	(Start_at_Edge[i], Cavity_Clock, RST OR Inhibit_is_Stable ) ;
+
+Input_Requestes_Edge_Extender[i].(S, clk,R)	=	(Input_Requestes_Edge_Sensor[i].q, Cavity_Clock, End_Event_Generation.q) ;
+end generate;
+
+Test1	=	Start_Immediate;
+Test2	=	End_Event_Generation.q ;
+Test3	=	Begin_Event_Generation.q;
+Test4	=	Cavity_Clock;
+Test5	=	Start_from_Queue;
+
+--- Shaping and registering End
+
+IF ( Input_Requestes_Edge_Sensor[].q != GND )
+then Start_Immediate	=	VCC;
+else Start_Immediate	=	GND;
+end if;
+
+-- Priority encoder for immediate requestes
+IF (Input_Requestes_Edge_Extender[1].q )
+Then EventCode_Imm[]					=		EventCode_Reg_Buffer[1].q[]; 
+ElsIF (Input_Requestes_Edge_Extender[2].q )
+		Then EventCode_Imm[]			=		EventCode_Reg_Buffer[2].q[]; 
+		ElsIF (Input_Requestes_Edge_Extender[3].q )
+				Then EventCode_Imm[]	=		EventCode_Reg_Buffer[3].q[]; 
+				Else EventCode_Imm[]	=		EventCode_Reg_Buffer[4].q[];
+END IF;
+
+
+-- Queue requestes turning in		--- Shaping and registering Begin
+for i in 1 to 4 generate 
+-- Edgign
+Set_in_Queue[i].(d, clk, clr)	=	(Start_at_Level[i], Cavity_Clock, RST) ;
+
+-- Restoring 
+Queue_Line[i].(S, clk, clrn)	=	(Set_in_Queue[i].q, Cavity_Clock, !RST);
+end generate;
+
+--- Shaping and registering End
+
+
+IF ( Queue_Line[].q != GND )
+then Start_from_Queue	=	VCC;
+else Start_from_Queue	=	GND;
+end if;
+
+-- Priority encoder for Queue requestes
+IF ( Queue_Line[1].q )
+Then EventCode_Queue[]	=				EventCode_Reg_Buffer[5].q[]; 		Queue_Line[1].R =	Queue_Line_Clear.q AND Yes_No_Register.q[8];
+ElsIF ( Queue_Line[2].q )
+		Then EventCode_Queue[]	=		EventCode_Reg_Buffer[6].q[]; 		Queue_Line[2].R	=	Queue_Line_Clear.q AND Yes_No_Register.q[9];
+		ElsIF ( Queue_Line[3].q )
+			Then EventCode_Queue[]	=	EventCode_Reg_Buffer[7].q[];		Queue_Line[3].R	=	Queue_Line_Clear.q AND Yes_No_Register.q[10];
+			Else EventCode_Queue[]	=	EventCode_Reg_Buffer[8].q[];		Queue_Line[4].R	=	Queue_Line_Clear.q AND Yes_No_Register.q[11];
+END IF;
+
+IF( Queue_Line[].q == VCC )
+THEN	Queue_Overflow =	VCC;
+Else	Queue_Overflow =	GND;
+END IF;
+
+
+
+----------------------------------------------------------
+Event_Number_Counter.clock	=	Cavity_Clock;
+Event_Number_Counter.cnt_en	=	End_Event_Generation.q;
+Event_Number_Counter.sclr	=	RST;
+Event_Number_Counter.sload	=	ENC_we2.q; -- Event_Number_Counter_wren;
+Event_Number_Counter.data[15..0]	=	DataBus_In[];
+Event_Number_Counter.data[31..16]	=	GND;
+FirstWordData[]				=	Event_Number_Counter.q[15..0];
+
+------------------------
+Yes_No_Register.data[3..0]		=	Input_Requestes_Edge_Extender[4..1].q ;
+Yes_No_Register.data[7..4]		=	Input_Requestes_Edge_Extender[4..1].q ;--GND ; -- reserved for extentions
+
+Yes_No_Register.data[11..8]		=	Queue_Line[4..1].q ;
+Yes_No_Register.data[15..12]	=	Queue_Line[4..1].q ;--GND ; -- reserved for extentions
+
+Yes_No_Register.data[31..16]	=	EventCode_Out[15..0];
+
+Yes_No_Register.(clock, load, enable)	=	(Cavity_Clock, VCC, Begin_Event_Generation.q);
+
+-----------------------------------------------------------
+
+
+
+	Case AddrBus_In[7..0]	IS
+		WHEN 1	=>	EventCode_Reg_wren[1]	=	( Select AND DirectIn AND DataBusStrobe ) ;
+		WHEN 2	=>	EventCode_Reg_wren[2]	=	( Select AND DirectIn AND DataBusStrobe ) ;
+		WHEN 3	=>	EventCode_Reg_wren[3]	=	( Select AND DirectIn AND DataBusStrobe ) ;
+		WHEN 4	=>	EventCode_Reg_wren[4]	=	( Select AND DirectIn AND DataBusStrobe ) ;
+		
+		WHEN 9	=>	EventCode_Reg_wren[5]	=	( Select AND DirectIn AND DataBusStrobe ) ;
+		WHEN 10	=>	EventCode_Reg_wren[6]	=	( Select AND DirectIn AND DataBusStrobe ) ;
+		WHEN 11	=>	EventCode_Reg_wren[7]	=	( Select AND DirectIn AND DataBusStrobe ) ;
+		WHEN 12	=>	EventCode_Reg_wren[8]	=	( Select AND DirectIn AND DataBusStrobe ) ;
+		
+		WHEN 19	=>	Event_Number_Counter_wren	=	( Select AND DirectIn AND DataBusStrobe );
+--		WHEN 20	=>	Event_Number_Counter_wren	=	( Select AND DirectIn AND DataBusStrobe );
+		WHEN OTHERS	=>	EventCode_Reg_wren[]	=	GND ; Event_Number_Counter_wren	=	GND;
+	END CASE;	
+ENC_we1.clk=Cavity_Clock; ENC_we2.clk=Cavity_Clock; ENC_we1.d=Event_Number_Counter_wren; ENC_we2.d=ENC_we1.q;
+
+
+
+FOR i in 1 to 8 generate
+	FOR j in 0 to WORD_WIDTH-1 generate
+		EventCode_Reg[i].(data[j], clock, load, enable )	=	(DataBus_In[j], Bus_Clock, VCC, EventCode_Reg_wren[i]);
+		EventCode_Reg_Buffer[i].(data[j], clock, load, enable)=	(EventCode_Reg[i].q[j], Cavity_Clock, VCC, VCC);
+	end generate;
+end generate;
+
+
+Yes_No_Register_Buffer[].clk=Bus_Clock; Yes_No_Register_Buffer[].d=Yes_No_Register.q[];
+Yes_No_Register_BufferD[].clk=Bus_Clock; Yes_No_Register_BufferD[].d=Yes_No_Register_Buffer[].q;
+Event_Number_Counter_Buffer[].clk=Bus_Clock; Event_Number_Counter_Buffer[].d=Event_Number_Counter.q[];
+
+	Case AddrBus_In[7..0]	IS
+		WHEN 1	=>	DataBusOut_[]	=	EventCode_Reg[1].q[];	
+		WHEN 2	=>	DataBusOut_[]	=	EventCode_Reg[2].q[];	
+		WHEN 3	=>	DataBusOut_[]	=	EventCode_Reg[3].q[];	
+		WHEN 4	=>	DataBusOut_[]	=	EventCode_Reg[4].q[];
+			
+		WHEN 9	=>	DataBusOut_[]	=	EventCode_Reg[5].q[];	
+		WHEN 10	=>	DataBusOut_[]	=	EventCode_Reg[6].q[];	
+		WHEN 11	=>	DataBusOut_[]	=	EventCode_Reg[7].q[];	
+		WHEN 12	=>	DataBusOut_[]	=	EventCode_Reg[8].q[];	
+		
+		WHEN 19	=>	DataBusOut_[]	=	Event_Number_Counter_Buffer[15..0].q;
+		WHEN 20	=>	DataBusOut_[]	=	Event_Number_Counter_Buffer[31..16].q;
+		
+		WHEN 21	=>	DataBusOut_[]	=	Yes_No_Register_BufferD[15..0].q;	-- Request bitmap capturing
+		WHEN 22	=>	DataBusOut_[]	=	Yes_No_Register_BufferD[31..16].q;	-- Event Code Capturing
+		
+		WHEN OTHERS	=>	DataBusOut_[]	=	GND;
+	END CASE;	
+DataBusOut[]=DataBusOut_Reg[].q; DataBusOut_Reg[].clk=Bus_Clock; DataBusOut_Reg[].d=DataBusOut_[]; 
+
+end;

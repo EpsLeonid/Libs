@@ -1,0 +1,81 @@
+Title "Threshold module";
+
+
+Include "LPM_Counter.inc";
+Include "LPM_shiftreg.inc";
+
+
+Constant WORD_WIDTH	 = 16;
+
+
+
+PARAMETERS
+(
+  CHANNEL_NUM = 32,
+  PWM_CLK_WIDTH = 4096,
+  Phase_shift =  1   --number of clock cycles phase shift
+);
+SUBDESIGN PWM_Module
+(
+	Clock								 : input ; 		--  
+
+
+-- Skeleton BUS signals	
+	DataBusStrobe						: input  ; 	-- 
+	DirectIn								: input  ; 	-- 
+   AddrBusIn[5..0]					: input  ; 	-- 
+	DataBusIn[WORD_WIDTH-1..0] 	: input  ; 	-- 
+	DataBusOut[WORD_WIDTH-1..0]	: output ; 	-- 
+	Select							 	: input  ; 	-- Module Select from External Address Comparator
+ 	Reset							    	: input=GND ; -- Common FPGA signal Reset (Active HIGH)
+
+
+-- Function Specific Signals
+	PWM_Out[CHANNEL_NUM-1..0]		: output;
+)
+
+Variable 
+
+   Amp_Divider[CHANNEL_NUM-1..0]               : LPM_COUNTER with ( lpm_width=16);
+   Amp_Low_Mark[CHANNEL_NUM-1..0]              : node;
+   Amp_Up_Mark[CHANNEL_NUM-1..0]    		     : node;
+   Amp_Shaper_Cnt[CHANNEL_NUM-1..0]            : LPM_COUNTER with ( lpm_width=16);
+   Amp_Shaper_Trig[CHANNEL_NUM-1..0]           : SRFF;
+   Amp_Pulse[CHANNEL_NUM-1..0]                 : DFF;
+   Amp_Reg[CHANNEL_NUM-1..0]          			  : lpm_shiftreg with (LPM_WIDTH = 16, LPM_DIRECTION="unused");
+   
+   Amp_Reg_CS[CHANNEL_NUM-1..0]		  			  : node;
+
+BEGIN
+
+
+--      
+   FOR i IN 0 TO CHANNEL_NUM-1 GENERATE
+		--Amp_Divider[i].(clock,sclr) = (Clock, Amp_Low_Mark[i]);
+		Amp_Divider[i].(clock,sclr) = (Clock, (Amp_Divider[i].q[] == PWM_CLK_WIDTH));
+		IF(Amp_Divider[i].q[] == PWM_CLK_WIDTH-Phase_shift*i) THEN Amp_Low_Mark[i] = VCC;
+																				ELSE Amp_Low_Mark[i] = GND;
+		END IF;
+   
+		Amp_Shaper_Trig[i].(S,clk,R) = ((Amp_Low_Mark[i] AND !Amp_Shaper_Trig[i].q), Clock, Amp_Up_Mark[i] OR Reset);
+		Amp_Shaper_Cnt[i].(clock,sclr,cnt_en) 	   = (Clock, (Amp_Up_Mark[i] OR Reset), Amp_Shaper_Trig[i].q);
+		IF (Amp_Shaper_Cnt[i].q[] >= Amp_Reg[i].q[]) THEN Amp_Up_Mark[i] = VCC;
+																	ELSE Amp_Up_Mark[i] = GND;
+		END IF;
+		Amp_Pulse[i].(d,clk) = (Amp_Shaper_Trig[i].q, Clock);
+
+		IF (AddrBusIn[] == i)  
+			THEN DataBusOut[] 	= Amp_Reg[i].q[];  
+				  Amp_Reg_CS[i]  	= DataBusStrobe and DirectIn AND Select; 
+			ELSE Amp_Reg_CS[i]   = GND;
+		END IF;
+		Amp_Reg[i].(data[], clock, enable, load)	=	(DataBusIn[], Clock, Amp_Reg_CS[i], VCC);
+		
+		PWM_Out[i] 			= Amp_Pulse[i].q;
+   END GENERATE;
+ 
+--   FOR i IN 0 TO CHANNEL_NUM-1 GENERATE
+--		PWM_Out[i] 			= Amp_Pulse[i].q;
+--   END GENERATE;
+
+END;

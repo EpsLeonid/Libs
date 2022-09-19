@@ -1,0 +1,269 @@
+TITLE "Ethernet IPv4 decoder";
+
+INCLUDE "Edge_Sensing_Sync.inc";
+INCLUDE "lpm_shiftreg.inc";
+INCLUDE "lpm_counter.inc";
+
+Constant PARCER_CYLCLE_WIDTH = 2;--20;
+Constant PARCER_CYLCLE_CNT_WIDTH = Ceil(log2(PARCER_CYLCLE_WIDTH))+1;
+Constant WORD_WIDTH	= 16; 
+
+CONSTANT PacketLenghts_at_signaling_layer  = 4096;--2048;-- maximum length value in bytes
+CONSTANT RxByte_Cnt_Width = Ceil( LOG2(PacketLenghts_at_signaling_layer))-1;
+
+Constant IPv4_type    		    = H"0008";
+
+CONSTANT HeaderFrame_Type		= 6;  -- 2 байт тип запроса (ARP или IPv4 или ...)
+--CONSTANT IP_Header    			= 7;  -- 20 байт (10 слова) для IP заголовка
+--CONSTANT UDP_Header    			= 17; -- 8 байт (4 слова) для UDP заголовка
+CONSTANT RxCommandPath 			= 21; -- номер слова дешифруемое командой
+CONSTANT RxDataPath    			= 22; -- номер слова дешифруемое как адрес или данные в зависимости от команды
+--CONSTANT RxDataWordLenght  		= 500;--(PacketLenghts_at_signaling_layer div 2)-RxCommandPath-1;
+CONSTANT RxByteLenght			= (PacketLenghts_at_signaling_layer div 2)-1;
+
+-- протокольные команды
+CONSTANT CMD_PING 	   			= 1; -- команда эхо
+CONSTANT CMD_READ_AD 	  		= 2; -- команда чтения адрес,данные,адрес,данные...
+CONSTANT CMD_WRITE_AD 	   		= 3; -- команда записи адрес,данные,адрес,данные...
+CONSTANT CMD_READ_AA			= 4; -- команда чтения адрес,адрес,адрес,адрес... в ответе данные,данные,данны...
+CONSTANT CMD_READ_BLOCK_16 	   	= 5; -- команда чтения адрес, 16 слов данных с автоинкрементом адреса, адрес, 16 слов данных...  
+CONSTANT CMD_WRITE_BLOCK_16    	= 6; -- команда запмси адрес, 16 слов данных с автоинкрементом адреса, адрес, 16 слов данных... 
+
+
+
+SUBDESIGN Eth_IPv4_Decoder_v1
+(
+  Clock                         : input; -- System Clock, really Bus_Clock
+
+  Rx_Data[WORD_WIDTH-1..0]  	: input;
+  Rx_Addr[10..0]  				: output;
+  Rx_Parcer_RQ					: input;
+  Rx_NUM_Data[10..0]  			: input;
+   
+  Tx_Addr[10..0]  				: output;
+  Tx_Data[WORD_WIDTH-1..0]  	: output;
+  Tx_Word_Strobe      			: output;
+  
+  Reset                         : input;
+  
+  Rx_Error_IP                   : output;
+  Tx_Start				        : output;
+  Rx_Parcer_in_progress  		: output;
+  Rx_TRUE_RQ		            : output;
+  Rx_NOT_RQ                 	: output;
+  
+  IP_Addr0_[WORD_WIDTH-1..0]	: input;
+  IP_Addr1_[WORD_WIDTH-1..0]	: input;
+  Port[WORD_WIDTH-1..0]			: input;
+  
+  Identification[WORD_WIDTH-1..0] : output;
+  
+ 
+  --Сигналы для обмена с Секлеткой внутренней шиной проекта  
+  AccessRequest			    	: output;
+  AccessGranted			    	: input; 
+  DirectOut				    	: output;
+  AddrBusOut[15..0]	    		: output;
+  DataBus_In[15..0]			    : input;  -- отправляемые с Внутренней Шины в Модуль данные
+  DataBusOut[15..0]     	  	: output;
+  DataBusStrobe 			 	: input;  -- строб приема/передачи данных наружу (высокий уровень, защелкиваем по заднему фронту)
+ 
+  test : output;
+)
+VARIABLE
+  Rx_Parcer_RQ_ES               : Edge_Sensing_Sync;
+  RxParcerActive                : SRFF;
+  Tx_Start_Pulse_Flag           : SRFF;
+
+  ParcerCnt						: LPM_COUNTER WITH (LPM_WIDTH = RxByte_Cnt_Width);
+  ParcerCnt_Inc_s				: node;
+  
+  Prescaler                     : LPM_COUNTER WITH (LPM_WIDTH = PARCER_CYLCLE_CNT_WIDTH);
+  Pascer_Sample_Enable 			: node;
+  
+  IPv4_type_True				: node;
+  IPv4_type_Flag				: SRFF;
+  IP_address_check_Flag[1..0]	: SRFF;
+  IP_True[1..0]					: node;
+  Wrong_IP_address				: node;
+  
+  ParcerEndCycle                 : node;
+  
+  BUS_Direct                    : node; -- bus operation type (direction), Write - HI, Read - LOW
+  Target_Command_Reg  			: LPM_SHIFTREG WITH (LPM_WIDTH = WORD_WIDTH);
+  CMD_CS                        : node; -- если опознан ARP запрос то защелкиваем команду, взводим флаг отправки данных из Tx буффера
+  Target_Address_Reg			: LPM_SHIFTREG WITH (LPM_WIDTH = WORD_WIDTH);
+  ADDR_CS						: node;
+  DATA_CS						: node;
+  TA_REG_Load					: node;
+  Target_Data_Reg				: LPM_SHIFTREG WITH (LPM_WIDTH = WORD_WIDTH);
+  DataOutReg_en					: node;
+   
+  Access_Request                : SRFF;
+  Data_Sent_OK					: node;
+  Requiest_Enable     			: node;
+  Tx_Word_Strobe_s              : node;
+  
+  Tx_Start_Pulse 				: node;
+  Tx_Start_Pulse_EN				: node;     
+   
+ 
+  Identification_Cnt			: LPM_COUNTER WITH (LPM_WIDTH = WORD_WIDTH);
+  
+    
+  Rx_Data_[WORD_WIDTH-1..0]     : node;
+  
+  
+  Src_IP_Addr0_reg				: LPM_SHIFTREG WITH (LPM_WIDTH = WORD_WIDTH);
+  Src_IP_Addr0_en      			: node;
+  Src_IP_Addr1_reg				: LPM_SHIFTREG WITH (LPM_WIDTH = WORD_WIDTH);
+  Src_IP_Addr1_en     			: node;
+  Src_Port_reg					: LPM_SHIFTREG WITH (LPM_WIDTH = WORD_WIDTH);
+  Src_Port_en					: node;
+  
+
+  
+BEGIN
+
+   
+   Pascer_Sample_Enable = VCC;
+
+-------------------------------------------- Rx section --------------------------------------------
+   Rx_Data_[] = Rx_Data[];
+
+   Rx_Parcer_RQ_ES.(d,clk)  = (Rx_Parcer_RQ, Clock);
+   RxParcerActive.(S,clk,R) = (Rx_Parcer_RQ_ES.q, Clock, ParcerEndCycle OR Reset);
+   
+   ParcerCnt.(clock,sload,cnt_en) = (Clock, Rx_Parcer_RQ_ES.q OR ParcerEndCycle, RxParcerActive.q AND ParcerCnt_Inc_s);
+   ParcerCnt.data[] = HeaderFrame_Type-1;
+   
+   Src_IP_Addr0_reg.(data[],clock, load, enable) = (Rx_Data[],Clock,VCC, Src_IP_Addr0_en);
+   Src_IP_Addr1_reg.(data[],clock, load, enable) = (Rx_Data[],Clock,VCC, Src_IP_Addr1_en);
+   Src_Port_reg.	(data[],clock, load, enable) = (Rx_Data[],Clock,VCC, Src_Port_en);
+   
+  
+   IF(RxParcerActive.q == VCC) THEN
+        Tx_Addr[10..0] = ParcerCnt.q[]; 
+        
+        CASE ParcerCnt.q[] IS
+            WHEN 5			=>  Rx_Addr[10..0] = 6 ;
+			WHEN 6			=>  Rx_Addr[10..0] = 7 ; Tx_Data[] = Rx_Data_[]; 			-- Packet header type
+			WHEN 7			=>	Rx_Addr[10..0] = 8 ; Tx_Data[] = Rx_Data_[]; 
+			WHEN 8			=>  Rx_Addr[10..0] = 17; Tx_Data[] = Rx_Data_[];
+			WHEN 9			=>  Rx_Addr[10..0] = 10; Tx_Data[] = Identification_Cnt.q[]; Src_Port_en = VCC; 
+			WHEN 10			=>  Rx_Addr[10..0] = 11; Tx_Data[] = Rx_Data_[];
+			WHEN 11			=>  Rx_Addr[10..0] = 12; Tx_Data[] = Rx_Data_[];
+			WHEN 12			=>  Rx_Addr[10..0] = 13; Tx_Data[] = Rx_Data_[];
+			WHEN 13			=>  Rx_Addr[10..0] = 14; Tx_Data[] = IP_Addr0_[]; 			 Src_IP_Addr0_en = VCC;
+			WHEN 14			=>  Rx_Addr[10..0] = 15; Tx_Data[] = IP_Addr1_[]; 			 Src_IP_Addr1_en = VCC;
+			WHEN 15			=>  Rx_Addr[10..0] = 16; Tx_Data[] = Src_IP_Addr0_reg.q[];
+			WHEN 16			=>  Rx_Addr[10..0] = 21; Tx_Data[] = Src_IP_Addr1_reg.q[];
+			WHEN 17			=>  Rx_Addr[10..0] = 18; Tx_Data[] = Port[]; CMD_CS = VCC; -- latch module port number to TX buffer, latch operation type	  			
+			WHEN 18			=>  Rx_Addr[10..0] = 19; Tx_Data[] = Src_Port_reg.q[];     -- latch incoming packet port number to TX buffer
+			WHEN 19			=>  Rx_Addr[10..0] = 20; Tx_Data[] = Rx_Data_[];
+			WHEN 20			=>  Rx_Addr[10..0] = 21; Tx_Data[] = GND; 				   -- UDP checksum (not analize)
+			WHEN 21			=>  Rx_Addr[10..0] = 22; Tx_Data[] = (Rx_Data_[] OR H"0002"); Tx_Start_Pulse = VCC; -- latch answer command, if IP and UDP fields is correct then enable transmite Tx data	  
+			WHEN OTHERS	    =>  Rx_Addr[10..0] = ParcerCnt.q[]+1; CMD_CS = GND; 
+								-- encoding address and data from packet
+								IF (ParcerCnt.q[0] == GND) THEN ADDR_CS = VCC; DATA_CS = GND; Tx_Data[] = Rx_Data_[]; 
+														   ELSE ADDR_CS = GND; DATA_CS = VCC; Tx_Data[15..8]  = DataBus_In[7..0]; Tx_Data[7..0] = DataBus_In[15..8];
+								END IF;
+        END CASE;
+        
+        CASE ParcerCnt.q[] IS
+			WHEN 6		=>  if(Rx_Data_[] == IPv4_type) THEN  IPv4_type_True = VCC; END IF;
+			WHEN 7		=>	if(IPv4_type_Flag.q == GND) THEN  ParcerEndCycle = VCC; END IF;
+			WHEN 15		=>  IP_True[0] = VCC;--if(Rx_Data_[] == IP_Addr0_[]) THEN IP_True[0] = VCC; END IF;
+			WHEN 16		=>  IP_True[1] = VCC;--if(Rx_Data_[] == IP_Addr1_[]) THEN IP_True[1] = VCC; END IF;
+			WHEN 17		=>  IF ( (IP_address_check_Flag[0].q AND IP_address_check_Flag[1].q) == GND )
+								THEN ParcerEndCycle   = VCC; Wrong_IP_address = VCC;
+							END IF;
+        END CASE;
+        
+        IF (ParcerCnt.q[]  >= Rx_NUM_Data[10..0]) THEN ParcerEndCycle = VCC; END IF;  -- End IPv4 parcer cycle
+
+		Requiest_Enable    	=   Pascer_Sample_Enable AND ADDR_CS;
+		TA_REG_Load			=   Pascer_Sample_Enable AND ADDR_CS;
+       
+	
+        IF (DATA_CS==VCC) THEN Tx_Word_Strobe_s = Data_Sent_OK; ParcerCnt_Inc_s = Data_Sent_OK;
+  						  ELSE Tx_Word_Strobe_s = Pascer_Sample_Enable AND (ParcerCnt.q[] >= HeaderFrame_Type); ParcerCnt_Inc_s= Pascer_Sample_Enable;
+        END IF;
+    
+        AddrBusOut[15..0]	=	Target_Address_Reg.q[];
+        DataBusOut[15..0] 	=	Target_Data_Reg.q[];
+        
+                               ELSE
+   
+        IPv4_type_True	 	 = GND;
+        Rx_Addr[]        	 = GND;
+        Tx_Addr[]			 = GND;
+        Tx_Data[] 			 = GND; 
+        ParcerEndCycle       = GND;
+        CMD_CS               = GND;
+        ADDR_CS              = GND;
+        DATA_CS              = GND;
+        AddrBusOut[15..0]	 = GND;
+        DataBusOut[]		 = GND;
+        BUS_Direct 			 = GND;
+        Requiest_Enable		 = GND;
+        TA_REG_Load			 = GND;
+        Tx_Word_Strobe_s	 = GND;
+        IP_True[0] 			 = GND;
+        IP_True[1] 			 = GND;
+        Wrong_IP_address     = GND;
+        Src_IP_Addr0_en      = GND;
+        Src_IP_Addr1_en      = GND;
+        Src_Port_en			 = GND;
+   END IF;
+  
+   
+   Identification_Cnt.(clock,cnt_en) = (Clock,Edge_Sensing_Sync(.d=IPv4_type_True,.clk=Clock));
+
+   -- Master Access Control: send request to internal skeleton bus
+   Access_Request.S  	=	Requiest_Enable; 
+   Access_Request.clk 	=  	Clock;
+   Access_Request.R  	=	Data_Sent_OK; 
+   AccessRequest		=	Access_Request.q;
+   DirectOut            =   BUS_Direct;
+   
+   Data_Sent_OK	        =	DataBusStrobe AND AccessGranted;
+   
+   Target_Command_Reg.(clock, enable, load, sclr) = (Clock, (CMD_CS  AND Pascer_Sample_Enable) OR Rx_Parcer_RQ_ES.q OR Reset, VCC, Rx_Parcer_RQ_ES.q OR Reset);
+   Target_Command_Reg.data[15..8] = Rx_Data_[7..0]; Target_Command_Reg.data[7..0] = Rx_Data_[15..8];
+   Target_Address_Reg.(clock, enable, load, sclr) = (Clock, TA_REG_Load OR Rx_Parcer_RQ_ES.q OR Reset, VCC, Rx_Parcer_RQ_ES.q OR Reset);
+   Target_Address_Reg.data[15..8] = Rx_Data_[7..0]; Target_Address_Reg.data[7..0] = Rx_Data_[15..8];
+   -- generate a single-cycle pulse to latch data
+   Target_Data_Reg.(clock, enable, load, sclr) = (Clock, DATA_CS AND (!DFF(.d=DATA_CS,.clk=Clock)) OR ParcerEndCycle OR Reset, VCC, ParcerEndCycle OR Reset);
+   Target_Data_Reg.data[15..8] = Rx_Data_[7..0]; Target_Data_Reg.data[7..0] = Rx_Data_[15..8];
+   
+   CASE (Target_Command_Reg.q[] AND H"00FF")IS  -- analize LSB, define command type (Read/Write)
+			WHEN CMD_READ_AD		=>  BUS_Direct = GND; 
+			WHEN CMD_WRITE_AD 		=>	BUS_Direct = VCC; 
+			WHEN OTHERS			    =>  BUS_Direct = GND; 
+   END CASE;
+   IF(Target_Command_Reg.q[15..8] == 2) THEN Tx_Start_Pulse_EN = GND; -- analize MSB, определяем входящаяя или возвращенная посылка
+                                        ELSE Tx_Start_Pulse_EN = VCC; -- check packet payload: incoming or returned
+   END IF;
+   
+   -- flags
+   IPv4_type_Flag.(S,clk,R)       = (IPv4_type_True, Clock, Rx_Parcer_RQ_ES.q OR Reset);
+   Tx_Start_Pulse_Flag.(S,clk,R)  = (Tx_Start_Pulse_EN AND Tx_Start_Pulse, Clock, Rx_Parcer_RQ_ES.q OR Reset OR ParcerEndCycle);
+   IP_address_check_Flag[0].(S,clk,R) = (IP_True[0], Clock, Rx_Parcer_RQ_ES.q OR Reset);
+   IP_address_check_Flag[1].(S,clk,R) = (IP_True[1], Clock, Rx_Parcer_RQ_ES.q OR Reset);
+
+   
+   -- outputs
+   Rx_Error_IP	          = Edge_Sensing_Sync(.d=Wrong_IP_address,.clk=Clock);
+   Rx_NOT_RQ              = (!IPv4_type_Flag.q) AND ParcerEndCycle;
+   Tx_Start				  = Tx_Start_Pulse_Flag.q AND ParcerEndCycle;
+   Rx_Parcer_in_progress  = RxParcerActive.q;
+   Tx_Word_Strobe         = RxParcerActive.q AND Tx_Word_Strobe_s;
+   Rx_TRUE_RQ             = IPv4_type_Flag.q AND ParcerEndCycle;
+   
+   Identification[]		  = Identification_Cnt.q[];
+   
+  
+   
+   test = IPv4_type_Flag.q;
+END;

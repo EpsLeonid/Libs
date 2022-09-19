@@ -1,0 +1,166 @@
+TITLE "TwoPort";
+
+INCLUDE "lpm_shiftreg.inc" ;
+INCLUDE "lpm_counter.inc" ;
+INCLUDE "Edge_Sensing.inc" ;
+
+Constant ADDR_WIDTH	=	19; 
+Constant DATA_WIDTH	=	16; 
+
+%SUBDESIGN TwoPortsExpansion
+(
+		Clock	                    : input ;
+		
+		Address_A[ADDR_WIDTH-1..0]	: input ;
+		DataIn_A[DATA_WIDTH-1..0]	: input ;
+		DataOut_A[DATA_WIDTH-1..0]	: output;
+		WRen_A						: input ;
+		Direct_A					: input ;
+		
+		Address_B[ADDR_WIDTH-1..0]	: input ;
+		DataIn_B[DATA_WIDTH-1..0]	: input ;
+		DataOut_B[DATA_WIDTH-1..0]	: output;
+		WRen_B						: input ;
+		Direct_B					: input ;
+		
+		Address_RAM[ADDR_WIDTH-1..0]: output;
+		DataIn_RAM[DATA_WIDTH-1..0]	: input ;
+		DataOut_RAM[DATA_WIDTH-1..0]: output;
+		WRen_RAM					: output;
+		Direct_RAM					: output;
+		
+		Sync 						: output;
+
+)
+
+VARIABLE
+       PortA_En						: node;
+       PortB_En						: node;
+       Address_Bus[ADDR_WIDTH-1..0]	: node;
+       Data_Bus_WR[DATA_WIDTH-1..0]	: node;  
+       
+       addr_A_reg 					: lpm_shiftreg with(lpm_width=ADDR_WIDTH); 
+       data_A_reg 					: lpm_shiftreg with(lpm_width=DATA_WIDTH);
+       strobe_A						: DFF;  
+       dir_A						: DFFE;
+       
+       addr_B_reg 					: lpm_shiftreg with(lpm_width=ADDR_WIDTH); 
+       data_B_reg 					: lpm_shiftreg with(lpm_width=DATA_WIDTH);
+       strobe_B						: DFF; 
+       dir_B						: DFFE;
+       
+       RAM_data_reg 				: lpm_shiftreg with(lpm_width=DATA_WIDTH);     
+BEGIN
+	  
+	  addr_A_reg.(data[],clock,enable,load) = (Address_A[],Clock, WRen_A, VCC);
+	  data_A_reg.(data[],clock,enable,load) = (DataIn_A[],Clock,  WRen_A, VCC);
+	  strobe_A.(d,clk) = ( (WRen_A OR DFF(.clk=Clock,.d=WRen_A)), Clock);
+	  dir_A.(d,clk,ena) = ( Direct_A, Clock, WRen_A);
+	  
+	  addr_B_reg.(data[],clock,enable,load) = (Address_B[],Clock, WRen_B, VCC);
+	  data_B_reg.(data[],clock,enable,load) = (DataIn_B[],Clock,  WRen_B, VCC);
+	  strobe_B.(d,clk) = ( (WRen_B OR DFF(.clk=Clock,.d=WRen_B)), Clock);
+	  dir_B.(d,clk,ena) = ( Direct_B, Clock, WRen_B);
+	  
+       
+      PortA_En	=	DFF(.clk=Clock, .d=!PortA_En);
+      PortB_En	=	DFF(.clk=Clock, .d= PortA_En);
+       
+    -- Мультиплексор подключения потртов А и B к шине памяти
+	  IF (PortA_En == VCC)
+	                  -- подключение к порту А 
+                               THEN 
+                                    Address_Bus[ADDR_WIDTH-1..0] = addr_A_reg.q[];
+                                    Data_Bus_WR[DATA_WIDTH-1..0] = data_A_reg.q[];
+                                    Direct_RAM = dir_A.q;
+                      -- подключение к порту B 
+	                           ELSE 
+                                    Address_Bus[ADDR_WIDTH-1..0] = addr_B_reg.q[];
+									Data_Bus_WR[DATA_WIDTH-1..0] = data_B_reg.q[];
+									Direct_RAM = dir_B.q;
+       END IF;
+
+        
+       WRen_RAM = ( (strobe_A.q AND PortA_En) OR (strobe_B.q AND PortB_En) )
+        
+      
+	   Address_RAM[ADDR_WIDTH-1..0]  = Address_Bus[ADDR_WIDTH-1..0];
+       DataOut_RAM[DATA_WIDTH-1..0]	 = Data_Bus_WR[DATA_WIDTH-1..0];
+       
+	   DataOut_A[DATA_WIDTH-1..0]	 = DataIn_RAM[];
+       DataOut_B[DATA_WIDTH-1..0]	 = DataIn_RAM[];
+   	  
+   	   Sync = PortA_En;--PortB_En;
+   	   
+     
+ 	
+END; -- конец проекта%
+
+
+
+SUBDESIGN TwoPortsExpansion
+(
+		Clock	                    : input ;
+		
+		Address_A[ADDR_WIDTH-1..0]	: input ;
+		DataIn_A[DATA_WIDTH-1..0]	: input ;
+		DataOut_A[DATA_WIDTH-1..0]	: output;
+		WRen_A						: input ;
+		Direct_A					: input ;
+		
+		Address_B[ADDR_WIDTH-1..0]	: input ;
+		DataIn_B[DATA_WIDTH-1..0]	: input ;
+		DataOut_B[DATA_WIDTH-1..0]	: output;
+		WRen_B						: input ;
+		Direct_B					: input ;
+		
+		Address_RAM[ADDR_WIDTH-1..0]: output;
+		DataIn_RAM[DATA_WIDTH-1..0]	: input ;
+		DataOut_RAM[DATA_WIDTH-1..0]: output;
+		WRen_RAM					: output;
+		Direct_RAM					: output;
+		
+		Sync 						: output;
+
+)
+
+VARIABLE
+       PortA_En						: node;
+       PortB_En						: node;
+       Address_Bus[ADDR_WIDTH-1..0]	: node;
+       Data_Bus_WR[DATA_WIDTH-1..0]	: node;       
+BEGIN
+       
+      PortA_En	=	DFF(.clk=Clock, .d=!PortA_En);
+      PortB_En	=	DFF(.clk=Clock, .d= PortA_En);
+       
+    -- Мультиплексор подключения потртов А и B к шине памяти
+	  IF (PortA_En == VCC)
+	                  -- подключение к порту А 
+                               THEN 
+                                    Address_Bus[ADDR_WIDTH-1..0] = Address_A[];
+                                    Data_Bus_WR[DATA_WIDTH-1..0] = DataIn_A[];
+                                    Direct_RAM = Direct_A;
+                      -- подключение к порту B 
+	                           ELSE 
+                                    Address_Bus[ADDR_WIDTH-1..0] = Address_B[];
+									Data_Bus_WR[DATA_WIDTH-1..0] = DataIn_B[];
+									Direct_RAM = Direct_B;
+       END IF;
+
+        
+        WRen_RAM = ( (( WRen_A OR DFF(.clk=Clock,.d=WRen_A)) AND PortA_En)  OR
+					 (( WRen_B OR DFF(.clk=Clock,.d=WRen_B)) AND PortB_En)  );
+        
+      
+	   Address_RAM[ADDR_WIDTH-1..0]  = Address_Bus[ADDR_WIDTH-1..0];
+       DataOut_RAM[DATA_WIDTH-1..0]	 = Data_Bus_WR[DATA_WIDTH-1..0];
+       
+	   DataOut_A[DATA_WIDTH-1..0]	 = DataIn_RAM[];
+       DataOut_B[DATA_WIDTH-1..0]	 = DataIn_RAM[];
+   	  
+   	   Sync = PortA_En;--PortB_En;
+   	   
+     
+ 	
+END; -- конец проекта

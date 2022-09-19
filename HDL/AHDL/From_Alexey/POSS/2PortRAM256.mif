@@ -1,0 +1,116 @@
+-- Copyright (C) 1991-2008 Altera Corporation
+-- Your use of Altera Corporation's design tools, logic functions 
+-- and other software and tools, and its AMPP partner logic 
+-- functions, and any output files from any of the foregoing 
+-- (including device programming or simulation files), and any 
+-- associated documentation or information are expressly subject 
+-- to the terms and conditions of the Altera Program License 
+-- Subscription Agreement, Altera MegaCore Function License 
+-- Agreement, or other applicable license agreement, including, 
+-- without limitation, that your use is for the sole purpose of 
+-- programming logic devices manufactured by Altera and sold by 
+-- Altera or its authorized distributors.  Please refer to the 
+-- applicable agreement for further details.
+
+-- Quartus II generated Memory Initialization File (.mif)
+
+WIDTH=16;
+DEPTH=256;
+
+ADDRESS_RADIX=UNS;
+DATA_RADIX=UNS;
+
+CONTENT BEGIN
+	0    :   8192;
+	1    :   1544;
+	2    :   1545;
+	3    :   1546;
+	4    :   1547;
+	5    :   1548;
+	6    :   1549;
+	7    :   1550;
+	8    :   1551;
+	9    :   1552;
+	10   :   13312;
+	11   :   1536;
+	12   :   5376;
+	13   :   5377;
+	14   :   5378;
+	15   :   5379;
+	16   :   5380;
+	17   :   5381;
+	18   :   5382;
+	19   :   5383;
+	20   :   5384;
+	21   :   5385;
+	22   :   5386;
+	23   :   5387;
+	24   :   5388;
+	25   :   5389;
+	26   :   5390;
+	27   :   5391;
+	28   :   5392;
+	29   :   5393;
+	30   :   5394;
+	31   :   5395;
+	32   :   5396;
+	33   :   5397;
+	34   :   5398;
+	35   :   5399;
+	36   :   5400;
+	37   :   5401;
+	38   :   5402;
+	39   :   5403;
+	40   :   5898;
+	41   :   5899;
+	42   :   5897;
+	43   :   5404;
+	44   :   5405;
+	45   :   5406;
+	46   :   26629;
+	47   :   26630;
+	48   :   26631;
+	49   :   26632;
+	50   :   26633;
+	51   :   26637;
+	52   :   13328;
+	53   :   5407;
+	54   :   43013;
+	55   :   43014;
+	56   :   43015;
+	57   :   43016;
+	58   :   43017;
+	59   :   43022;
+	[60..127]  :   0;
+	128  :   100;
+	129  :   12250;
+	130  :   1;
+	[131..132]  :   2100;
+	133  :   2110;
+	134  :   2;
+	135  :   12;
+	136  :   1500;
+	137  :   1510;
+	138  :   3856;
+	139  :   0;
+	[140..167]  :   100;
+	168  :   51;
+	169  :   255;
+	170  :   1;
+	[171..173]  :   100;
+	174  :   597;
+	175  :   21845;
+	176  :   22018;
+	177  :   49320;
+	178  :   2;
+	179  :   27015;
+	180  :   8;
+	181  :   100;
+	182  :   597;
+	183  :   21845;
+	184  :   22018;
+	185  :   49320;
+	186  :   2;
+	187  :   27015;
+	[188..255]  :   0;
+END;

@@ -1,0 +1,150 @@
+TITLE "AD7989";
+
+INCLUDE "ADC_RAM.inc";
+INCLUDE "Edge_Sensing.inc";
+INCLUDE "lpm_counter.inc";
+INCLUDE "lpm_shiftreg.inc";
+
+constant WORD_SIZE      = 16;
+CONSTANT ADC_DATA_WIDTH	= 18; -- размер данных, приходящих с АЦП (бит)
+
+constant PresclrValue   = 2;
+Constant HalfPresclr    = FLOOR( PresclrValue DIV 2);
+
+Constant ADC_CONVERTIOM_TIME    = 80; --x20ns
+--Constant ADC_ACQUSITION_TIME    = 20; --x20ns
+Constant ADC_CYCLE_TIME         = 110; 
+Constant ADC_MEASUREMENT_CYCLES = 4; 
+constant FULL_CYCLE_LENGHT      = ADC_CYCLE_TIME*ADC_MEASUREMENT_CYCLES+2000;--100+10;
+
+Constant MUX_NUM_VALUE       = 3;
+Constant RAM_CNT_SIZE        = Ceil( LOG2(MUX_NUM_VALUE*2))+1;
+
+Constant Order_BitCt    = Ceil( LOG2(FULL_CYCLE_LENGHT))+1;
+Constant Order_WordCt   = Ceil( LOG2(ADC_DATA_WIDTH))+1;
+Constant Order_Presc    = Ceil( LOG2(PresclrValue))+1;
+
+SUBDESIGN AD7989_5
+(
+--Design specific inputs outputs
+    Conv_Clock							: INPUT ;
+    ADC_DATA							: INPUT ;
+    ADC_CNV,ADC_CLK						: OUTPUT;
+
+    Active_MUX_Next						: OUTPUT; -- следующий адрес куда складывать измереные данные
+    Sensor_Next                         : OUTPUT; -- следующий датчик для измерения
+    
+    ADC_Data_Out[ADC_DATA_WIDTH-1..0]   : OUTPUT;
+
+--Standart BUS input output
+%	Bus_Clock					: input ; -- частота работы модуля (25..125МГц). Main clock, assumed F_link x 4 = 100MHz
+	DataBusStrobe				: input ; -- строб приема/передачи данных наружу (высокий уровень, защелкиваем по заднему фронту)
+	Direct_In					: input ; -- направление передачи данных на шину КАМАК
+    AddrBus_In[7..0]			: input ; -- шина адреса для доступа в пространство памяти
+	DataBus_In[15..0]  			: input  ; -- 
+	DataBusOut[15..0] 			: output  ; -- 
+	Select						: input  ; -- Module Select from External Address Comparator%
+ 	Reset						: input=gnd ; -- Common FPGA signal Reset (Active HIGH)
+ 	
+ 	
+)
+
+VARIABLE
+    
+    PRESCALER					: lpm_counter with (lpm_width=Order_Presc, lpm_direction="up" );
+    BitCounter                 	: lpm_counter with (lpm_width=Order_BitCt, lpm_direction="up" );
+    ADC_data_shifter			: LPM_SHIFTREG with (lpm_width=ADC_DATA_WIDTH,lpm_direction="left"); 
+    
+    ADC_Cycle_End               : node;
+    ADCclk                      : node;
+    ADC_Conv                    : node;
+    Sample_ena                  : Edge_Sensing;
+    MUXnext                     : node;
+    
+    ADC_Max_Data_Word           : node;
+    Word_Sample_En              : node;
+  
+    RAM_Addr_Cnt				: lpm_counter with (lpm_width=RAM_CNT_SIZE, lpm_direction="up" );
+    RAM_ADC						: ADC_RAM;
+    
+    ADC_Data_Reg                : LPM_SHIFTREG with (lpm_width=ADC_DATA_WIDTH,lpm_direction="left");  
+    ADC_Aligned_Data_Reg        : LPM_SHIFTREG with (lpm_width=ADC_DATA_WIDTH,lpm_direction="left");  
+    
+    Sensor_Next_ES              : Edge_Sensing;
+    
+BEGIN
+
+
+----------------------------------------- Prescaler clock divider ----------------------------------
+    PRESCALER.clock = Conv_Clock;
+    PRESCALER.sclr  = (PRESCALER.q[]==PresclrValue-1);--сбрасываем счетчик если мы не в цикле или достигли конца счета
+    IF PRESCALER.q[] <= (HalfPresclr-1)
+	 	THEN ADCclk = GND;
+		ELSE ADCclk = VCC;
+    END IF;		
+
+    Sample_ena.d   = ADCclk;--(PRESCALER.q[]==PresclrValue-1);--Импульс по которому продвигаются все данные; скрытый IF
+    Sample_ena.clk = Conv_Clock;
+    
+------------------------------------------ Шифтер для даных с АЦП ------------------------------------
+    ADC_data_shifter.shiftin = ADC_DATA;
+    ADC_data_shifter.(clock, enable)= (Conv_Clock, Sample_ena.q);-- AND(ADC_Acq OR ADC_Cycle_End));
+------------------------------------------------------------------------------------------------------
+    
+------------------------------------------------ Счетчик бит -----------------------------------------
+    BitCounter.clock   = Conv_Clock;
+    BitCounter.cnt_en  = Sample_ena.q;    -- Counts synchronously with End of ADC_clock pulse 
+    BitCounter.sclr    = ADC_Cycle_End;   -- сброс счетчика по окончании цикла АЦП. ADC_Cycle_End это сигнал для сброса счетчика
+    ADC_Cycle_End      = (BitCounter.q[] == FULL_CYCLE_LENGHT); -- окончание цикла
+    
+    FOR i in 0 to ADC_MEASUREMENT_CYCLES-1 GENERATE
+      ADC_Conv           = ((BitCounter.q[]>=(ADC_CYCLE_TIME*i)) AND (BitCounter.q[]<(ADC_CYCLE_TIME*i+ADC_CONVERTIOM_TIME-1)));
+      ADC_Max_Data_Word  = ((BitCounter.q[]>=((ADC_CYCLE_TIME*i)+ADC_CONVERTIOM_TIME)) AND (BitCounter.q[]<((ADC_CYCLE_TIME*i) + ADC_CONVERTIOM_TIME+ADC_DATA_WIDTH))); 
+    END GENERATE;
+    
+   -- Word_Sample_En     = (BitCounter.q[]==ADC_CONVERTIOM_TIME+WORD_SIZE) OR (BitCounter.q[]==ADC_CONVERTIOM_TIME+ADC_DATA_WIDTH);
+
+----------------------------------------------------
+
+    ADC_CNV  		= DFF(.d=ADC_Conv,  .clk = Conv_Clock);
+    ADC_CLK 		= DFF(.d=ADCclk OR !ADC_Max_Data_Word, .clk = Conv_Clock);
+    Active_MUX_Next = DFF(.d=MUXnext, .clk = Conv_Clock);
+    MUXnext  		= Sensor_Next_ES.q;--(BitCounter.q[] == 30);
+    
+    
+    Sensor_Next_ES.(d,clk) = ((BitCounter.q[] == ((ADC_CYCLE_TIME*(ADC_MEASUREMENT_CYCLES-1)) + ADC_CONVERTIOM_TIME+ADC_DATA_WIDTH)+1),Conv_Clock);
+    Sensor_Next     = Sensor_Next_ES.q;--DFF(.d=(BitCounter.q[] == ADC_CONVERTIOM_TIME+ADC_DATA_WIDTH+1),.clk = Conv_Clock);
+--------------------------------------- RAM --------------------------------------------
+
+% 	RAM_Addr_Cnt.clock   = Conv_Clock;
+    RAM_Addr_Cnt.cnt_en  = (Sample_ena.q AND Word_Sample_En);
+    RAM_Addr_Cnt.sclr    = (RAM_Addr_Cnt.q[]==MUX_NUM_VALUE*2) AND Sample_ena.q;   
+
+--Память. Порт B: используется внутри проекта
+    RAM_ADC.data_b[15..0]	             =	ADC_data_shifter.q[15..0];
+    RAM_ADC.address_b[RAM_CNT_SIZE-1..0] =	RAM_Addr_Cnt.q[RAM_CNT_SIZE-1..0];
+    RAM_ADC.address_b[7..RAM_CNT_SIZE]   =  GND;
+    RAM_ADC.wren_b			             =	Sample_ena.q AND Word_Sample_En;
+    RAM_ADC.clock_b			             =	Conv_Clock;
+
+--Память. Порт А: подсоединение на внешнюю шину
+    RAM_ADC.clock_a         = Bus_Clock;
+    RAM_ADC.address_a[7..0] = AddrBus_In[7..0];
+    RAM_ADC.data_a[15..0]   = DataBus_In[15..0];
+    DataBusOut[15..0]       = RAM_ADC.q_a[15..0];
+    RAM_ADC.wren_a          = Direct_In AND Select AND DataBusStrobe;%
+ 	
+ 	
+ 	
+ 	ADC_Data_Reg.(clock, enable,load,data[17..0]) = (Conv_Clock,Sample_ena.q AND (BitCounter.q[]==((ADC_CYCLE_TIME*(ADC_MEASUREMENT_CYCLES-1))+ADC_CONVERTIOM_TIME+ADC_DATA_WIDTH)),VCC,ADC_data_shifter.q[17..0]);
+ 	ADC_Aligned_Data_Reg.(clock, enable,load) = (Conv_Clock,Sample_ena.q AND (BitCounter.q[]==((ADC_CYCLE_TIME*(ADC_MEASUREMENT_CYCLES-1))+ADC_CONVERTIOM_TIME+ADC_DATA_WIDTH)+1),VCC);
+ 	IF(ADC_Data_Reg.q[17] == VCC) THEN ADC_Aligned_Data_Reg.data[16..0] = !ADC_Data_Reg.q[16..0];
+                                       ADC_Aligned_Data_Reg.data[17]    =  ADC_Data_Reg.q[17];
+                                  ELSE
+                                       ADC_Aligned_Data_Reg.data[16..0] =  ADC_Data_Reg.q[16..0];
+                                       ADC_Aligned_Data_Reg.data[17]    =  ADC_Data_Reg.q[17];
+    END IF;
+ 	
+    ADC_Data_Out[] = ADC_Aligned_Data_Reg.q[];--ADC_Data_Reg.q[];
+ 	
+END;

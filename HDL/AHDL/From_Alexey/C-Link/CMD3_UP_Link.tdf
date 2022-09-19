@@ -1,0 +1,488 @@
+TITLE "CMD3_UP_Link " ;
+-- Файл содержит описание протокола медленного линка КМД-3 и его
+-- унифицированную реализацию - Модуль UP_Link для нисходящего узла ССД.
+-- Рубан, Козырев, 4592.  30.08.2006 последняя редакция 09.02.2009.
+-- Данная часть должна встраиваться в платы сбора данных и обеспечивать связь с "вышестоящим"
+-- по дереву блоком - ГИБДД (он же селивановская коробка)
+% Данная версия расширена узлами :
+"Пресэмплер" - автоматическая подстройка фазы, компенсирующая
+возможную разность задержки фазы и данных в селивановской коробке
+"Редиректор" - командный автомат доступа с Линка на шину плат а-ля T2Q.
+%
+INCLUDE "lpm_shiftreg.inc" ;
+INCLUDE "lpm_counter.inc" ;
+INCLUDE "Pulse_Width_Shaper.inc";
+INCLUDE "RedirectorRAM.inc" ;
+Include "CMD3_DAQ_LINK.inc";
+INCLUDE "CRC_Gen.inc";
+INCLUDE "Median_bitstream.inc";
+INCLUDE "Addr_add.inc";
+PARAMETERS
+(
+RefClock=100   -- Пользователь здесь указывает частоту в МГц-ах (целых), которую он подал на вход "Clock" 
+);
+ASSERT (RefClock>20 AND RefClock<180)
+REPORT "You enter RefClock (%) which is not suitable for Link function" RefClock
+SEVERITY ERROR;
+Constant PrescalerModule = RefClock div Link_Speed ;
+
+
+SUBDESIGN CMD3_UP_Link
+(
+-- Module specific signals
+		-- Сигналы со стороны последовательного канала
+			Link_Data_in		: input ; -- Данные для приема/передачи в/из линка
+			Link_Data_out		: output;
+			Link_TxRx			: OUTPUT; -- направление передачи, управляет приемо-передатчиком LVDS
+			Interlock			: input=VCC;	-- desable writing from serial side, active LOW
+			Clock				: input; -- Global FPGA Clock, assumed 100MHz for T2Q project 
+
+--			CRC_Out[15..0]			: output;
+
+		-- Сигналы со стороны параллельного канала (Интерфейс Пользователя)
+		   LinkMessage             : output; -- сообщение о приходе валидной команды, аналог сигнала FLT+ для "энергетических" каналов, 
+--		   OpCodeData[COMMAND_SIZE+pause -1..0]        : output; -- получаемая-она_же-отправляемая команда
+
+-- Standard Bus signaling for Master/Slave connection
+			-- General Signals
+			Bus_Clock				: input; -- Global FPGA Clock, assumed 100MHz for T2Q project 
+			Reset					: input ;  -- Common FPGA Reset
+			DataBus_In[15..0]		: input;  -- отправляемые с Внутренней Шины в Линк данные
+			DataBusOut[15..0]		: output; -- выдаваемые на Внутреннюю Шину из Линка данные
+			DataBusStrobe			: input;  -- строб приема/передачи данных наружу (высокий уровень, используя его как Enable, "защелкиваем" по заднему фронту
+			Error					: output; -- сигнал ошибки (неверная команда)
+			Median_Filter_Correction	: output ;
+	-- Master Mode Signals -- используется при работе данного Модуля в режиме Master)
+	AccessRequest			: output; -- запрос к Арбитру на доступ к шине для чтения/записи данных Пользователя в режиме Master	
+	AccessGranted			: input;  -- Разрешение Арбитра выставить Адрес и направление обмена (захват шины)
+	DirectOut				: output; -- направление передачи данных, на внутреннюю шину или с нее, по умолчанию =GND, передача от внутренних ресурсов платы Модуль,
+	AddrBusOut[15..0]		: output; -- адрес при операциях доступа ко внутренним ресурсам Оцифровщика (чтения/записи по Командному Листу).
+		-- Slave Mode Signals	-- используется при работе данного Модуля в режиме Slave
+		Select					: input;  -- Выбор Модуля для работы с памятью Командного Листа в режиме Slave (с КАМАК-ом)
+		DirectIn				: input;  -- направление передачи данных, Если =GND, то данный Модуль читается, если =VCC, то пишется.
+		AddrBus_In[9..0]		: input;  -- адрес при операциях доступа чтения/записи Командного Листа с КАМАК-а
+
+	
+	
+% Общий смысл таков, что по мере работы линка модуль с параллельной стороны  предпринимет действия:
+	1. При обнаружении валидного Кода Транзакции (в дальнейшем - Команды), он выставляется 
+на  OpCodeData[6..0] и сопровождается сигналом LinkMessage. Сигнал стоит все время работы Линка.
+	2. По концу приема очередного слова или по началу передачи очередного слова Модуль в режиме Master предпринимает
+действия по захвату шины и доступу ко внутренним ресурсам платы-оцифровщика. Здесь Модуль выступает как
+Мастер шины. Формальная сторона действий аналогична описанной в Модуле КАМАК. 
+Суть обмена определяется содержимым активной страницы памяти Редиректора. 
+
+ От Пользователя требуется только обеспечить реакцию на запрос Модуля,
+не превышающую 18..16 тактов линка. Число запросов на обмен определяется по "Соглашением Линка" (через константы).
+%
+    Test1,Test2,Test3,Test4,Test5,Test6,Test7      : output ; -- to be conected to test output of main Project 
+    SE_Test_Output_to_Virtual_Pin		: output ;
+    TxShifter_Load						: output ;
+    
+)
+
+VARIABLE
+-- Automatic Phase Ajustment
+Prescaler			:	LPM_COUNTER with ( lpm_width=4, lpm_direction="up" );
+Prescaler_Desabler	:	SRFF; -- Flag of Phase-Dependent enable 
+PrescalerOut		:	node ;  -- enable of action
+Presampler[1..0]	:	DFF	; -- Sampling input data at high clock rate
+Sample_Enable		:	node	; -- One FPGA Clock pulse which enables all data moving
+Median_Bts			: median_bitstream ;
+
+-- Resiever Part
+RxShifter                  : LPM_SHIFTREG with (lpm_width=WORD_WIDTH+PAUSE+PAUSE, lpm_direction="left"); -- регистр входных данных, sampled at normal rate 
+Reg_OpCode                 : LPM_SHIFTREG with (lpm_width=COMMAND_SIZE+PAUSE, lpm_direction="left");  -- регистр Команд
+Reg_EventNumber            : LPM_SHIFTREG with (lpm_width=WORD_WIDTH, lpm_direction="left");  -- регистр номера события (первое слово после OpCode, влючая биты паузы )
+HeaderError      	        : node; --  
+-- ParityError              : node; --
+-- CRC_Error				: node;
+
+Command[COMMAND_SIZE+PAUSE-1..0]	: node;
+First_Word[WORD_WIDTH-1..0]	: node;
+--Command_[COMMAND_SIZE+PAUSE-1..0]	: node;
+--Command[COMMAND_SIZE+PAUSE-1..0]	: DFF; -- Command is used instead of RegOpCode.q if Error occured
+--First_Word_[WORD_WIDTH-1..0]	: node;
+--First_Word[WORD_WIDTH-1..0]	: DFF;
+RxOpCodeReload				: node;
+RxHeaderReload				: node;
+RxWordReload                : node; -- сигнал конца фрейма (о приеме одного слова), 
+-- высоким уровнем разрешает перезагрузку принятого слова из RxShifter в RxDataReg или память
+-- LockRxData[WordsToGoDown + 1..0] : node ; -- выходы компараторов-формирователей, используются для явного определения схемы "ИЛИ"
+
+
+-- Transmitter Part
+Data_Path_Reg              : LPM_SHIFTREG with (lpm_width=WORD_WIDTH);
+Data_Path[15..0], Data_Path_[15..0]	 : node ;
+TxShifter                  : LPM_SHIFTREG with (lpm_width=WORD_WIDTH, lpm_direction="left"); -- регистр-передатчик выходных данных 
+TxDataReg                  : LPM_SHIFTREG with (lpm_width=WORD_WIDTH, lpm_direction="left"); -- регистр-буфер данных передатчика 
+TxOpCodeReload				 : node ;
+TxHeaderReload				 : node; -- высоким уровнем разрешает перезагрузку команды и первого слова в TxShifter
+TxWordReload				 : node; -- высоким уровнем разрешает перезагрузку слова из TxDataReg в TxShifter
+--LockTxWord[WordsToGoUp+1..0] : node ;-- выходы компараторов-формирователей
+
+
+-- Flow Control
+LinkBitCounter		: LPM_COUNTER with ( lpm_width=11, lpm_direction="up" ); -- счетчик числа принятых/переданных бит из/в линк
+LinkActiveFlag		: SRFF; -- флаг начала цикла приема/передачи данных из/в линк
+StartLinkCycle		: node; -- сигнал начала цикла приема/передачи данных из/в линк
+EndLinkCycle		: node; -- флаг окончания цикла приема/передачи из/в линк
+	LinkDirectFlag             : SRFF; -- флаг передачи=LOW/приема=HIGH из/в линк
+	ChangeDirect               : node; -- сигнал о преключении направления передачи
+
+Header_Error_Flag			: DFFE	; -- Flag to desable data movement, not TIMING of Link
+--Header_Error_Flag_			: node;
+Dead_Time_Flag				:Pulse_Width_Shaper with ( Duration = Dead_Time, RefClock = RefClock ); -- Флаг мертвого времени - защитного промежутка
+
+
+
+
+-- Redirector Part
+WordCounter                : LPM_COUNTER with ( lpm_width=6, lpm_direction="up" ); -- счетчик числа принятых/переданных слов
+
+RedirRAM                    : RedirectorRAM;
+Addr_Page_offset[9..0]		: node;
+Data_Page_offset[9..0]		: node;
+Address_Sum					:Addr_add;
+--RAM_a_we					: node;
+--RAM_b_we					: node;
+
+	AccessRequest			: SRFF; 
+	AccessRq				: node ;
+	CRC_Checker				: CRC_Gen with (PolinomPower = WORD_WIDTH);
+	CRC_Reload				: node ;
+--**********************************************************************************************
+BEGIN
+
+DEFAULTS
+	RxWordReload = GND;
+	TxWordReload = GND;
+END DEFAULTS;
+
+
+
+------------------- Section Data Sampling and Clock Adjustment Begin
+-- Определяем частоту сэмплирования
+IF (Prescaler.q[] == (PrescalerModule-1) ) THEN PrescalerOut = VCC; ELSE PrescalerOut = GND; END IF;
+			Prescaler.clock	=	Clock;
+			Prescaler.sclr	=	PrescalerOut OR Prescaler_Desabler.q ;
+			-- Предделитель остановлен в состоянии НОЛЬ, пока не придет Стартовый Бит
+-- Определяем относительную фазу сэмплирования
+Sample_Enable	=	DFF(.clk=Clock, .d=(Prescaler.q[] == b"0001" ));
+
+SE_Test_Output_to_Virtual_Pin	=	Sample_Enable;
+								Median_Bts.clock = Clock;
+								Median_Bts.in_stream = Link_Data_In ;
+								Median_Filter_Correction	=	Median_Bts.crr ;
+			Presampler[0].d	=	Median_Bts.out_stream	; 							-- Data enters Presampler
+			Presampler[].clk	=	Clock ;		Presampler[1].d	=	Presampler[0].q;-- Data sampled at High Rate
+			
+			RxShifter.shiftin	=	Presampler[1].q; -- вход шифтера Rx (Normal Rate) для приема данных из линка
+			RxShifter.(clock, enable) = (Clock, Sample_Enable); -- шифтер Rx синхронно продвигает данные из линка
+			-- Момент защелкивания БИТА данных определяется выходной фазой предделителя.
+			-- Первый PrescalerOut позволяет защелкнуть стартовый бит в сдвигатель
+		--	RxShifter.aclr	=	Prescaler_Desabler.q ;-- Нет синхронизма - > нет данных
+			--RxShifter.sclr	=	LinkDirectFlag.q OR HeaderError ;
+			RxShifter.sclr	=	LinkDirectFlag.q OR Prescaler_Desabler.q;-- OR Header_Error_Flag.q ;
+			Prescaler_Desabler.clk	=	Clock;
+			Prescaler_Desabler.R	=	Median_Bts.out_stream	;--Presampler.q ; 
+			-- Когда Стартовый Бит засэмплируется , то вот здесь-то и отпускаем предделитель,
+			-- чтобы его выход стробировал продвижение данных по шифтеру Rx
+			Prescaler_Desabler.S	=	EndLinkCycle OR Reset;
+------------------- Section Data Sampling and Clock Adjustment End
+
+
+
+------------------- Section Main Loop  "Начало и конец работы линка" Begin
+	-- Здесь описаны основные события цикла работы линка  
+			LinkActiveFlag.(S,R,clk) = (StartLinkCycle AND !(EndLinkCycle OR Reset), EndLinkCycle OR Reset, Clock );
+	StartLinkCycle	=	RxShifter.q[COMMAND_SIZE+PAUSE -1];-- Starting in any case when StartBit enters
+
+	   CASE RxShifter.q[COMMAND_SIZE+PAUSE-1..0] IS
+	      	WHEN CMDL_Cfg_Read		=>	HeaderError = GND; -- Чтение памати редиректора
+			WHEN CMDL_Cfg_Write		=>	HeaderError = GND;	-- Запись в память редиректора
+			WHEN CMDL_Exe_Read_000	=>	HeaderError = GND;	-- Чтение 0
+			WHEN CMDL_Exe_Read_010	=>	HeaderError = GND;	-- Чтение 1
+			WHEN CMDL_Exe_Read_100	=>	HeaderError = GND;	-- Чтение 2
+			WHEN CMDL_Exe_Read_110	=>	HeaderError = GND;	-- Чтение 3
+			WHEN CMDL_Exe_Write_001	=>	HeaderError = GND;	-- Запись 0
+			WHEN CMDL_Exe_Write_011	=>	HeaderError = GND;	-- Запись 1
+			WHEN CMDL_Exe_Write_101	=>	HeaderError = GND;	-- Запись 2
+			WHEN CMDL_Exe_Write_111	=>	HeaderError = GND;	-- Запись 3
+			WHEN OTHERS             =>	HeaderError = VCC;
+	   END CASE;-- Если Стартовый Бит прошел достаточно далеко по шифтеру, а команда не опозналась, взводим HeaderError
+	-- Проверка валидности команды -> взводим флаг активности и начинаем счет тактов 
+
+--	Error	=	HeaderError; -- OR ParityError; OR CRC_Error;
+Header_Error_Flag.(d,clrn,clk,ena) = ( HeaderError, !EndLinkCycle, Clock, (StartLinkCycle AND !LinkActiveFlag.q));
+--Header_Error_Flag_ =DFF(.d=Header_Error_Flag.q, .clk = Clock);
+	Error	=	Header_Error_Flag.q ;-- OR Marker_Error_Flag.q ;
+
+	--LinkBitCounter.(clock,sclr) = (Clock,  (EndLinkCycle OR HeaderError OR Reset ) );
+	LinkBitCounter.(clock,sclr) = (Clock,  EndLinkCycle);--(EndLinkCycle OR Reset ) );
+	LinkBitCounter.cnt_en		=	LinkActiveFlag.q  AND Sample_Enable;
+
+				-- По концу работы линка запускаем формировку защитного промежутка	
+		Dead_Time_Flag.(Clock, Reset, Event)	=	(Clock, Reset, ((LinkBitCounter.q[] >= (MaxNumberOfBit+1))));
+
+EndLinkCycle		=	Dead_Time_Flag.PulseOut ; 
+
+LinkMessage = (DFF(.d=LinkActiveFlag.q, .clk=Clock)) OR EndLinkCycle ; -- Connection to User Interface, one clock later,
+--	 when OpCode locked. Duration extended with DeadTime.
+
+------------------- Section Main Loop  "Начало и конец работы линка" End
+
+
+
+------------------- Section "Direction control" Begin
+
+-- режим передачи по высокому уровню LinkDirectFlag.q, режим приема по низкому
+-- по концу цикла переключаемся на прием (состояние по умолчанию)
+--LinkDirectFlag.(S,clk,R) = (ChangeDirect,Clock,EndLinkCycle OR HeaderError);
+LinkDirectFlag.(S,clk,R) = (ChangeDirect,Clock,EndLinkCycle);
+
+-- условие переключения с приема на передачу
+IF (LinkBitCounter.q[] == BitOfReverse) 	THEN ChangeDirect = VCC;
+																ELSE ChangeDirect = GND;
+END IF;     -- переключаемся с приема на передачу
+
+Link_TxRx = LinkDirectFlag.q; -- Connection to Link Interface - output to Phy Control
+----------------- Section "Direction control" End
+
+
+
+
+
+-- Section "Bus Connections" Begin
+-- Здесь описана структура соединений шин данных
+
+--			OpCodeData[5..0] =WordCounter.q[5..0]; -- Вывод OpCod-а на интерфейс пользователя, 
+--			OpCodeData[7..6] =GND;
+			Command[]	=	Reg_OpCode.q[];
+			First_Word[]=	Reg_EventNumber.q[];
+			
+IF (!Header_Error_Flag) 				-- Substitution if Error found
+THEN		Reg_OpCode.data[(COMMAND_SIZE+PAUSE-1)..0]	=		RxShifter.q[(COMMAND_SIZE+PAUSE-1)..0];
+			Reg_EventNumber.data[(WORD_WIDTH-1)..0]		=		RxShifter.q[(WORD_WIDTH+PAUSE-1)..PAUSE]; 
+ELSE		Reg_OpCode.data[(COMMAND_SIZE+PAUSE-1)..0]	=		CMDL_Cfg_Read ;
+			Reg_EventNumber.data[(WORD_WIDTH-1)..0]		=		512; -- Addreses of Pedestals
+END IF;
+
+
+
+
+
+
+		RedirRAM.data_a[(WORD_WIDTH-1)..0]			=		RxShifter.q[(WORD_WIDTH+PAUSE-1)..PAUSE]; 
+		-- записывать данные в порт А может только Линк
+
+	Link_Data_Out = TxShifter.shiftout; -- подключение выхола шифтера Tx на двунаправленный выход
+
+	TxShifter.shiftin = GND; -- используется для создания паузы (сдвигаем на PAUSE тактов)
+
+	TxDataReg.data[] = DataBus_In[]; -- подключение буферного параллельного регистра Tx к интерфейсу пользователя
+
+-- Section "Bus Connections" End
+
+---------------------------------------
+-- Section "Redirector connection"
+
+-- соединение порта А
+  -- определяем адрес ОЗУ командного листа (в ячейках которого хранятся абсолютные адреса устройсв)
+Addr_Page_offset[5..0] = WordCounter.q[5..0]; -- перемещение внутри страницы
+Addr_Page_offset[8..6] = Reg_OpCode.q[5..3];  -- переключение страниц
+Addr_Page_offset[9]    = GND;					-- Для хранения адресов используем нижнюю половину памяти
+Address_Sum.dataa[9..0]	= First_Word[9..0]; 
+Address_Sum.datab[5..0]	=	WordCounter.q[5..0]; Address_Sum.datab[9..6]	=GND; --Address_Sum.clock=clock;
+%
+CASE Command[] IS  -- определяем адрес ОЗУ командного листа (в ячейках которого хранятся абсолютные адреса устройсв)
+  	WHEN CMDL_Cfg_Read       => RedirRAM.address_a[9..0] = Address_Sum.result ; --First_Word[9..0] + WordCounter.q[5..0]; 
+   	WHEN CMDL_Cfg_Write      => RedirRAM.address_a[9..0] = Address_Sum.result ; --First_Word[9..0] + WordCounter.q[5..0];
+	WHEN CMDL_Exe_Read_000   => RedirRAM.address_a[9..0] = Addr_Page_offset[];
+	WHEN CMDL_Exe_Read_010   => RedirRAM.address_a[9..0] = Addr_Page_offset[];
+	WHEN CMDL_Exe_Read_100   => RedirRAM.address_a[9..0] = Addr_Page_offset[];
+	WHEN CMDL_Exe_Read_110   => RedirRAM.address_a[9..0] = Addr_Page_offset[];
+  	WHEN CMDL_Exe_Write_001  => RedirRAM.address_a[9..0] = Addr_Page_offset[];
+  	WHEN CMDL_Exe_Write_011  => RedirRAM.address_a[9..0] = Addr_Page_offset[];
+	WHEN CMDL_Exe_Write_101  => RedirRAM.address_a[9..0] = Addr_Page_offset[];
+	WHEN CMDL_Exe_Write_111  => RedirRAM.address_a[9..0] = Addr_Page_offset[];
+END CASE;
+%
+IF Command[6]==GND then RedirRAM.address_a[9..0] = Address_Sum.result[9..0] ; else RedirRAM.address_a[9..0] = Addr_Page_offset[];end if;
+
+RedirRAM.clock_a = Clock;
+-- запись с порта А возможна только по команде конфигурации командного листа (CMDL_Cfg_Write)
+
+RedirRAM.wren_a	= RxWordReload AND Sample_Enable AND DFF(.d=(Command[] == CMDL_Cfg_Write), .clk=Clock) and DFF(.d=Interlock, .clk=Clock);
+-- конец подключения порта А
+
+-- счетчик-указатель адреса страницы ОЗУ Редиректора
+WordCounter.clock		= Clock ; -- 
+WordCounter.cnt_en		= (TxWordReload OR RxWordReload) AND Sample_Enable ; -- счетчик-указатель считает номера слов на приемо/передачу данных
+WordCounter.sclr		= (! LinkActiveFlag.q OR ChangeDirect);  -- обнуление счета проиходит при смене направления прердачи и при неактивности линка
+
+-- соединение порта B
+Data_Page_offset[5..0]		= WordCounter.q[5..0];
+Data_Page_offset[8..6]		= Reg_OpCode.q[5..3]; 
+Data_Page_offset[9]			= VCC;  -- Отделяем старшую половину ОЗУ под данные, которые могут писаться во внутренние ресурсы
+-- платы по командам Запись 1 и др.
+RedirRAM.data_b[15..0] = DataBus_In[15..0]; -- По порту В данные пишутся только в режиме Slave
+
+IF (Select == VCC)	
+					THEN -- если Select == VCC значит модуль работает в режиме Slave (например, конфигурация с КАМАК-а)
+	RedirRAM.address_b[9..0] = AddrBus_In[9..0];
+					ELSE -- модуль работает в режиме Master (принимает/отдает данные наружу)
+	RedirRAM.address_b[9..0] = Data_Page_offset[9..0];		
+END IF;
+
+RedirRAM.wren_b = DataBusStrobe and  DFF(.d=(DirectIn and Select), .clk=Bus_Clock) ; -- Caienu ii ii?oo A oieuei n aioo?aiiae oeiu ieaou (iai?eia?, eiioeao?aoey n EAIAE-a)
+
+AddrBusOut[15..0] = RedirRAM.q_a[15..0]; -- Реально адрес будет использован на шине платы только когда идет работа с 
+									-- линком, т.е. в режиме Мастер
+DataBusOut[15..0] = RedirRAM.q_b[15..0];
+RedirRAM.clock_b = Bus_Clock;
+	
+-- При работе Линка Модуль захватывает шину как Master, направление на шине задается OpCode
+-- Section "Redirector connection" End
+
+--------------------------------------------------------------------
+----------------------------------------------------------------------
+--Test1 = CRC_Checker.Residue_OK ;
+Test1=HeaderError;
+--Test2 = RxShifter.q[1];
+Test2 = Sample_Enable ;
+Test3 = Presampler[1].q;--Clock;
+--Test4 = StartLinkCycle;
+--Test4	=	CRC_Checker.Test2;
+Test4=(StartLinkCycle AND !LinkActiveFlag.q);--Header_Error_Flag.q ;
+--Test5 = CRC_Checker.CRC_Serial_Out;
+Test5=LinkActiveFlag.q;
+--Test5 = RxHeaderReload OR RxWordReload;
+--Test6 = TxHeaderReload;
+Test6 = CRC_Reload; -- AND Sample_Enable AND DFF(.d=(Command[] == CMDL_Cfg_Write), .clk=Clock); --TxWordReload OR TxHeaderReload OR RxOpCodeReload OR RxHeaderReload;
+--Test7 = CRC_Checker.Test1;
+Test7 = StartLinkCycle AND !LinkMessage;
+
+--CRC_Out[]	=	CRC_Checker.CRC_Parallel_Out[];
+--------------------------------------------------------------------
+
+
+
+
+-- Дальше идет собственно управление продвижением данных, организация пословной разбивки  
+
+-- Section "Rx Flow Control" Begin
+-- Управление защелкиванием Reg_OpCode
+Reg_OpCode.(clock, enable, load)	=	(Clock, RxOpCodeReload, VCC);
+RxOpCodeReload	=	DFF(.clk=Clock, .d=(StartLinkCycle AND !LinkActiveFlag.q)) ;
+-- Управление защелкиванием Reg_EventNumber 
+-- Note: If Error, Reg_EventNumber will be loaded with 0000, since RxShifter will be cleared
+Reg_EventNumber.(clock, enable, load) = (Clock, Sample_Enable AND RxHeaderReload, VCC);
+IF (LinkBitCounter.q[] == (WORD_WIDTH+PAUSE)) 	
+THEN  RxHeaderReload = VCC;
+ELSE  RxHeaderReload = GND;
+END IF;
+
+-- Генерим схемы совпадения на моменты заполнения Rx shiftera и используем их для записи в память 
+			FOR i IN 1 TO WordsToGoDown GENERATE
+			   IF (LinkBitCounter.q[] == ((WORD_WIDTH+PAUSE)*i+WORD_WIDTH+PAUSE)) 
+			THEN RxWordReload = VCC; -- формируем импульс для защелкивания данных в регистр данных, память
+			ELSE RxWordReload = GND;
+			   END IF;
+			   
+			END GENERATE;
+		
+-- Section "Rx Flow Control" End
+
+
+-- Section "Tx Control" Begin
+TxShifter.(clock,enable) = (Clock, Sample_Enable); -- сдвигаем данные для передачи в линк
+TxShifter.load = DFF(.d=(CRC_Reload OR TxWordReload OR TxHeaderReload OR TxOpCodeReload), .clk=Clock) ; -- защелкиваем данные для передачи в линк
+-- DFF was added 270310 to improve timing for timing analyzer
+
+TxShifter_Load	=	CRC_Reload OR TxWordReload OR TxHeaderReload OR TxOpCodeReload ;
+-- Управление Мультиплексором на входе Tx shifter -- имеем зависимость как от момента времени, так и от OpCode
+
+CASE LinkBitCounter.q[] IS
+-- подсоединяем к Tx шифтеру выходы с Reg_OpCode
+	WHEN BitOfAnswerStart		=>	TxHeaderReload = GND; TxOpCodeReload = VCC; CRC_Reload=GND;
+									TxShifter.data[WORD_WIDTH-1..(WORD_WIDTH-(COMMAND_SIZE+PAUSE))] = Reg_OpCode.q[]; 
+-- подсоединяем к Tx шифтеру выходы с Reg_EventNumber
+	WHEN Bit_of_Header_UP_Reload=>	TxHeaderReload = VCC; TxOpCodeReload = GND; CRC_Reload=GND;
+									TxShifter.data[] = Reg_EventNumber.q[] ; 
+-- подсоединяем к Tx шифтеру выход CRC
+	WHEN Bit_of_CRC_Reload		=>	TxHeaderReload = GND; TxOpCodeReload = GND;	CRC_Reload=VCC;	
+									TxShifter.data[] = CRC_Checker.CRC_Parallel_Out[];
+-- подсоединяем к Tx шифтеру остальные данные
+	WHEN OTHERS					=>	TxHeaderReload = GND; TxOpCodeReload = GND;	CRC_Reload=GND;		
+									TxShifter.data[]	= Data_Path[];
+END CASE;
+
+Data_Path[]	=	Data_Path_Reg.q[]; Data_Path_Reg.data[]= Data_Path_[]; Data_Path_Reg.(clock, load)=(Clock, VCC);
+
+CASE Command[] IS  -- 
+					  	WHEN CMDL_Cfg_Read       => Data_Path_[]	=	RedirRAM.q_a[15..0];
+					   	WHEN CMDL_Cfg_Write      => Data_Path_[]	=	RedirRAM.q_a[15..0];
+						WHEN CMDL_Exe_Read_000   => Data_Path_[]	= 	TxDataReg.q[];
+						WHEN CMDL_Exe_Read_010   => Data_Path_[]	= 	TxDataReg.q[];
+						WHEN CMDL_Exe_Read_100   => Data_Path_[]	= 	TxDataReg.q[];
+						WHEN CMDL_Exe_Read_110   => Data_Path_[]	= 	TxDataReg.q[];
+					  	WHEN CMDL_Exe_Write_001  => Data_Path_[]	= 	RedirRAM.q_b[15..0];
+					  	WHEN CMDL_Exe_Write_011  => Data_Path_[]	= 	RedirRAM.q_b[15..0];
+						WHEN CMDL_Exe_Write_101  => Data_Path_[]	= 	RedirRAM.q_b[15..0];
+						WHEN CMDL_Exe_Write_111  => Data_Path_[]	= 	RedirRAM.q_b[15..0];
+					END CASE;  
+
+-- Гененерим схемы совпадения на моменты перезагрузки данных в Tx shifter
+   FOR i IN 1 TO (WordsToGoUp) GENERATE
+    	IF LinkBitCounter.q[] == ((BitOfAnswerStart+COMMAND_SIZE+PAUSE)+(WORD_WIDTH+PAUSE)*i) 
+		THEN	TxWordReload = VCC; -- формируем импульс для защелкивания данных в регистр Tx shifter
+		ELSE	TxWordReload = GND;
+      	END IF;
+   END GENERATE;
+---------------------------------- Section "Tx Control" End
+
+
+CRC_Checker.Clock				=	Clock;
+CRC_Checker.Bit_Sample_Enable	=	Sample_Enable;
+CRC_Checker.Serial_In			=	TxShifter.shiftout;
+CRC_Checker.Reset				=	Reset ;
+
+%-- CRC_Gen control for data block only
+CRC_Checker.Start_Seed_Load = TxHeaderReload ; -- CRC Check begin with
+CRC_Checker.Message_End		=	TxWordReload;
+%
+-- CRC_Gen check from Start Bit
+CRC_Checker.Start_Seed_Load 	=	LinkDirectFlag.q ;
+CRC_Checker.Message_Begin		=	TxOpCodeReload;
+
+
+-- Section "User Interface Control" Begin
+TxDataReg.(enable,load) = (DataBusStrobe AND AccessGranted AND LinkDirectFlag.q, VCC); -- прием данных во временный регистр передатчика
+TxDataReg.clock  = Bus_Clock ;
+
+ -- генерация запроса на предоставление/получение данных от/к юзер интерфейсу
+	CASE Command[] IS 
+      	WHEN CMDL_Cfg_Read		=>	AccessRq  = GND;							DirectOut=GND;
+		WHEN CMDL_Cfg_Write		=>	AccessRq  = GND;							DirectOut=GND;	
+		WHEN CMDL_Exe_Read_000	=>	AccessRq  =TxWordReload OR TxHeaderReload;	DirectOut=GND;	-- ?oaiea 1 ia oeia
+		WHEN CMDL_Exe_Read_010	=>	AccessRq  =TxWordReload OR TxHeaderReload;	DirectOut=GND;	-- ?oaiea 1 ia oeia
+		WHEN CMDL_Exe_Read_100	=>	AccessRq  =TxWordReload OR TxHeaderReload;	DirectOut=GND;	-- ?oaiea 2 ia oeia
+		WHEN CMDL_Exe_Read_110	=>	AccessRq  =TxWordReload OR TxHeaderReload;	DirectOut=GND;	-- ?oaiea 3 ia oeia
+		WHEN CMDL_Exe_Write_001	=>	AccessRq  =TxWordReload OR TxHeaderReload;	DirectOut=DFF(.d=Interlock, .clk=Clock);--VCC;	-- Caienu 1 ia oeia
+		WHEN CMDL_Exe_Write_011	=>	AccessRq  =TxWordReload OR TxHeaderReload;	DirectOut=DFF(.d=Interlock, .clk=Clock);--VCC;	-- Caienu 1 ia oeia
+		WHEN CMDL_Exe_Write_101	=>	AccessRq  =TxWordReload OR TxHeaderReload;	DirectOut=DFF(.d=Interlock, .clk=Clock);--VCC;	-- Caienu 2 ia oeia
+		WHEN CMDL_Exe_Write_111	=>	AccessRq  =TxWordReload OR TxHeaderReload;	DirectOut=DFF(.d=Interlock, .clk=Clock);--VCC;	-- Caienu 3 ia oeia
+		WHEN OTHERS				=>	AccessRq  = GND ; 							DirectOut=GND;  -- iao ?aaiou n oeiie
+	END CASE; 
+
+-- Загрузка заголовка TxHeaderReload "толкает" опережающее чтение с шины, не инкрементируя счетчика слов.
+-- следующий запрос возникает одновременно с перезагрузкой в Tx shifter уже готовых данных
+-- Явно указываю, что все обмены с внешним миром (С проектом пользователя, режим Master) идут только во время ОТВЕТА ЛИНКА, 
+-- т.е. только по TxWordReload. 
+AccessRequest.S	=	DFFE(.d=AccessRq, .clk=Bus_Clock, .ena=Sample_Enable);
+AccessRequest.clk = Bus_Clock ;
+AccessRequest.R  = ((DataBusStrobe AND AccessGranted)OR Dead_Time_Flag.PulseOut) ; 
+-- Section "User Interface Control" End
+
+END;

@@ -1,0 +1,391 @@
+TITLE "USB_RAM_Reg";
+
+INCLUDE "CMD3_DAQ_Addresses.inc";
+INCLUDE "lpm_shiftreg.inc" ;
+INCLUDE "lpm_counter.inc" ;
+INCLUDE "Edge_Sensing_Sync.inc" ;
+INCLUDE "USB_Command_List_RAM.inc" ;
+
+ -- FT245R timing
+--Constant RD_End_Cycle_Time	=	25; --+2clocks in begig and 1clk at end on resynchro
+--Constant RD_Sample_Time	=	9; 
+--Constant RD_Strobe_Start_Time	=	2; 
+--Constant RD_Strobe_Stop_Time	=	12; 
+
+-- FT23H timing, FS mode
+Constant RD_End_Cycle_Time		=	6; --+2clocks in beging and 1clk at end on resynchro
+Constant RD_Sample_Time			=	4; 
+Constant RD_Strobe_Start_Time	=	1; 
+Constant RD_Strobe_Stop_Time	=	5; 
+
+
+
+Constant WR_End_Cycle_Time	=	25; 
+Constant WR_Strobe_Start_Time	=	5; 
+Constant WR_Strobe_Stop_Time	=	15; 
+Constant WR_ZZZ_Start_Time	=	2; 
+Constant WR_ZZZ_Stop_Time	=	22; 
+
+Constant BYTE_WIDTH	=	8; 
+Constant WORD_WIDTH	=	16; 
+
+Constant	Header_Key_Symbol			=	85;
+Constant	Header_Key_Symbol_Number	=	12;
+Constant	Trailer_Key_Symbol			=	170;
+Constant	Trailer_Key_Symbol_Number	=	8;
+Constant    Error_Symbol                =   H"EE"; 
+
+SUBDESIGN USB_RAM_Reg
+(
+
+-- Module specific signals
+		-- Neaiaeu ni noi?iiu iineaaiaaoaeuiiai eaiaea
+
+			FT_TXEn				: input ; -- Aaiiua aey i?eaia/ia?aaa?e a/ec eeiea
+			FT_RXFn				: input ;
+			FT_RDn				: OUTPUT; 
+			FT_WR				: OUTPUT;
+			FT_DATA_In[7..0]	: input ;
+			FT_DATA_Out[7..0]	: output ;
+			FT_ZZ				: OUTPUT;
+			USB_Active			: output ;
+			Header_recognized	: output;
+			Trailer_recognized		: output;
+--			Last_Byte[7..0]		: output ;
+--Test outputs
+Packet_Proc				: output ;
+Length_is_wrong			: output ;
+RAM_Filling				: output ;
+RAM_WE					: output ;
+
+Header_recognized_VP	: output ;
+Trailer_recognized_VP	: output ;
+Sample_Enable_VP		: output ;
+Error_at_packet_is_detected	: output ;
+
+-- Standard Bus signaling for Master/Slave connection
+			-- General Signals
+	Bus_Clock	: input ;  -- Global FPGA Clock, assumed 100MHz for T2Q project 
+	Reset					: input=GND ;  -- Common FPGA Reset
+	DataBus_In[15..0]		: input;  -- ioi?aaeyaiua n Aioo?aiiae Oeiu a Eeie aaiiua
+	DataBusOut[15..0]       : output; -- auaaaaaiua ia Aioo?aii?? Oeio ec Eeiea aaiiua
+	DataBusStrobe           : input;  -- no?ia i?eaia/ia?aaa?e aaiiuo ia?o?o (aunieee o?iaaiu, cauaeeeaaai ii caaiaio o?iioo)
+	Error                   : output; -- neaiae ioeaee (iaaa?iay eiiaiaa)
+
+	-- Master Mode Signals -- eniieucoaony i?e ?aaioa aaiiiai Iiaoey a ?a?eia Master)
+	AccessRequest           : output; -- cai?in ia ainooi e oeia aey ?oaiey/caiene aaiiuo Iieuciaaoaey 	
+	AccessGranted			: input;  -- ?ac?aoaiea A?aeo?a aunoaaeou Aa?an e iai?aaeaiea iaiaia (caoaao oeiu)
+	DirectOut				: output; -- iai?aaeaiea ia?aaa?e aaiiuo, ia aioo?aii?? oeio eee n iaa, ii oiie?aie? =GND, ia?aaa?a io aioo?aiieo ?ano?nia ieaou Iiaoeu,
+	AddrBusOut[15..0]       : output; -- aa?an i?e iia?aoeyo ainooia ei aioo?aiiei ?ano?nai Ioeo?iaueea (?oaiey/caiene ii Eiiaiaiiio Eenoo).
+
+			-- Slave Mode Signals	-- eniieucoaony i?e ?aaioa aaiiiai Iiaoey a ?a?eia Slave
+		Select					: input;  -- Auai? Iiaoey aey ?aaiou n iaiyou? Eiiaiaiiai Eenoa a ?a?eia Slave (n EAIAE-ii)
+		Direct_In				: input;  -- iai?aaeaiea ia?aaa?e aaiiuo, Anee =GND, oi aaiiue Iiaoeu ?eoaaony, anee =VCC, oi ieoaony.
+		AddrBus_In[8..0]		: input;  -- aa?an i?e iia?aoeyo ainooia ?oaiey/caiene Eiiaiaiiai Eenoa n EAIAE-a
+	
+--TestOutBus[15..0]				: output ;
+)
+
+
+
+VARIABLE
+RD_Timing_Counter		:	lpm_counter		with (lpm_width=BYTE_WIDTH);
+RD_to_Go				:node;
+RXF_Edge				:	Edge_Sensing_Sync	;
+Start_Read				:node;
+RD_Cycle_is_Active		:SRFF;
+RD_Strob_SRFF			:SRFF;
+
+Fast_input_buffer_FT_Bus	: LPM_SHIFTREG with (lpm_width=BYTE_WIDTH);
+Fast_output_buffer_FT_Bus	: LPM_SHIFTREG with (lpm_width=BYTE_WIDTH);
+
+Fast_output_buffer      : LPM_SHIFTREG with (lpm_width=BYTE_WIDTH);     
+
+WR_Timing_Counter		:	lpm_counter		with (lpm_width=BYTE_WIDTH);
+WR_to_Go				:node;
+WR_Cycle_is_Active		:SRFF;
+WR_Strob_SRFF			:SRFF;
+WR_ZZZ_SRFF				:SRFF;
+Out_Buffer_Ena			:node;
+AccessRequest			: SRFFE ;
+
+--RAM_Block				:	USB_Buffer_RAM	;
+--RAM_Addr_Pointer_CNT	:	lpm_counter		with (lpm_width=BYTE_WIDTH);
+
+H_Key_Cnt					:	lpm_counter		with (lpm_width=4);
+Header_Locked				:	node;
+--RD_Strobe_Trailing_Edge		:	Edge_Sensing_Sync	;
+T_Key_Cnt					:	lpm_counter		with (lpm_width=4);
+Trailer_Locked				:	node;
+
+Sample_Enable				:	node;
+Packet_is_in_Progress		:	SRFFE;
+Byte_Number_CNT				:	lpm_counter		with (lpm_width=WORD_WIDTH);
+Length_of_Packet_H_REG		:	LPM_SHIFTREG with (lpm_width=BYTE_WIDTH);
+Length_of_Packet_L_REG		:	LPM_SHIFTREG with (lpm_width=BYTE_WIDTH);
+Length_of_Packet[WORD_WIDTH-1..0]		:	node;
+Length_is_wrong				:	node;
+
+Service_Type_L_REG			:	LPM_SHIFTREG with (lpm_width=BYTE_WIDTH);
+Service_Type_H_REG			:	LPM_SHIFTREG with (lpm_width=BYTE_WIDTH);
+Service_Type[WORD_WIDTH-1..0]		:	node;
+--Service_Type_is_wrong				:	node;
+
+Load_Data_L_REG				:	LPM_SHIFTREG with (lpm_width=BYTE_WIDTH);
+Load_Data_H_REG				:	LPM_SHIFTREG with (lpm_width=BYTE_WIDTH);
+Load_Data[WORD_WIDTH-1..0]		:	node;
+
+RAM_Block_Filling_is_in_Progress	:	SRFFE;
+RAM_from_USB_WE				:	node;
+USB_CMDL_RAM				: USB_Command_List_RAM ;
+
+
+RD_Paket_End_Edge           : Edge_Sensing_Sync;
+--Out_Buff_Sample_Enable				:	node;
+Command_List_has_control		:	SRFFE;
+Out_Buff_Byte_Number_CNT	:	lpm_counter		with (lpm_width=WORD_WIDTH);
+Command_List_End_control    : node;
+
+
+Sample_Enable_CNT           : lpm_counter with (lpm_width=5);
+Byte_Strob                  : node;
+
+ USB_CMDL_RAM_Addr_CNT      :	lpm_counter		with (lpm_width=WORD_WIDTH); 
+ USB_CMDL_RAM_Addr_CNT_En_Trig : SRFF;
+ USB_CMDL_RAM_Addr_CNT_En    : node;
+  
+-- Error Flag
+Error                               : node;
+Error_at_packet_is_detected         : SRFF;
+Packet_Length_is_wrong              : node; 
+
+Addr_Page_offset[10..0]             : node; 
+Data_Page_offset[10..0]             : node; 
+
+Fast_Module_buffer                 : LPM_SHIFTREG with (lpm_width=WORD_WIDTH);
+Data_Path[15..0]                   : node;
+
+begin
+DEFAULTS
+	RD_to_Go = GND;
+	WR_to_Go = GND;
+	Out_Buffer_Ena = GND;
+	
+--	USB_CMDL_RAM.address_a[7..0] = Byte_Number_CNT.q[8..1];
+	Fast_output_buffer.data[] = GND;
+END DEFAULTS;
+
+-- Header_Recognizing proc
+-- определение начального спец. символа
+H_Key_Cnt.(clock, cnt_en, sclr)	=	(Bus_Clock, Sample_Enable		, ((Fast_input_buffer_FT_Bus.q[]!=Header_Key_Symbol) OR Header_Locked));
+Header_Locked					=	DFF(.clk=Bus_Clock, .d=(H_Key_Cnt.q[]==Header_Key_Symbol_Number));
+Header_recognized				=	Header_Locked;
+Header_recognized_VP			=	Header_Locked;
+--RD_Strobe_Trailing_Edge.(clk, d)=	(Bus_Clock, !RD_Strob_SRFF.q);
+-- определение конечного спец. символа 
+T_Key_Cnt.(clock, cnt_en, sclr)	=	(Bus_Clock, Sample_Enable		, ((Fast_input_buffer_FT_Bus.q[]!=Trailer_Key_Symbol) OR Trailer_Locked));
+Trailer_Locked					=	DFF(.clk=Bus_Clock, .d=(T_Key_Cnt.q[]==Trailer_Key_Symbol_Number));
+Trailer_recognized				=	Trailer_Locked;
+Trailer_recognized_VP			=	Trailer_Locked;
+Sample_Enable_VP			    =	Sample_Enable;
+-- Packet working condition
+Sample_Enable	=	DFF(.clk=Bus_Clock, .d=(RD_Timing_Counter.q[]==RD_Sample_Time+1));
+Packet_is_in_Progress.(S,R,clk)	=	(Header_Locked, Trailer_Locked OR Error, Bus_Clock);
+Byte_Number_CNT.(clock, cnt_en, sclr)	=	(Bus_Clock, (RD_Timing_Counter.q[]==RD_Sample_Time+2), !Packet_is_in_Progress.q);
+Packet_Proc		=	Packet_is_in_Progress.q;
+-- проверяем: если принято байт больше чем указано в длине пакета, то сбрасываем обработку пакета
+IF(Byte_Number_CNT.q[] > Length_of_Packet[]) THEN Packet_Length_is_wrong = VCC;
+                                             ELSE Packet_Length_is_wrong = GND;
+END IF;
+
+
+--Control Registers filling proc
+Length_of_Packet_L_REG.(clock,enable,load,data[])	=	(Bus_Clock, (Sample_Enable AND (Byte_Number_CNT.q[] == 0) AND Packet_is_in_Progress.q)	, VCC, Fast_input_buffer_FT_Bus.q[]);
+Length_of_Packet_H_REG.(clock,enable,load,data[])	=	(Bus_Clock, (Sample_Enable AND (Byte_Number_CNT.q[] == 1) AND Packet_is_in_Progress.q)	, VCC, Fast_input_buffer_FT_Bus.q[]);
+Length_of_Packet[7..0]	=	Length_of_Packet_L_REG.q[]; Length_of_Packet[15..8]	=	Length_of_Packet_H_REG.q[];
+
+-- длина пакета вклчает: длину пакета 2 байта + тип сервиса 2 байта + адрес и данные 0...n байт + конечный спец. символ 8 байт. Т.е. мин. длина пакета 12 байт
+Length_is_wrong	=	(Length_of_Packet[]<12) AND (Sample_Enable AND (Byte_Number_CNT.q[] == 2)); 
+
+Service_Type_L_REG.(clock,enable,load,data[])		=	(Bus_Clock, (Sample_Enable AND (Byte_Number_CNT.q[] == 2) AND Packet_is_in_Progress.q)	, VCC, Fast_input_buffer_FT_Bus.q[]);
+Service_Type_H_REG.(clock,enable,load,data[])		=	(Bus_Clock, (Sample_Enable AND (Byte_Number_CNT.q[] == 3) AND Packet_is_in_Progress.q)	, VCC, Fast_input_buffer_FT_Bus.q[]);
+Service_Type[7..0]	=	Service_Type_L_REG.q[]; 	Service_Type[15..8]	=	Service_Type_H_REG.q[];
+
+Load_Data_L_REG.(clock,enable,load,data[])		=	(Bus_Clock, (Sample_Enable AND (!Byte_Number_CNT.q[0]) AND Packet_is_in_Progress.q)	, VCC, Fast_input_buffer_FT_Bus.q[]);
+Load_Data_H_REG.(clock,enable,load,data[])		=	(Bus_Clock, (Sample_Enable AND (Byte_Number_CNT.q[0])  AND Packet_is_in_Progress.q)	, VCC, Fast_input_buffer_FT_Bus.q[]);
+Load_Data[7..0]	=	Load_Data_L_REG.q[]; 	Load_Data[15..8]	=	Load_Data_H_REG.q[];
+
+-- RAM Filling
+RAM_Block_Filling_is_in_Progress.(S,R,clk)	=	((Sample_Enable AND (Byte_Number_CNT.q[] == 0)), ((Byte_Number_CNT.q[] == (Length_of_Packet[]))), Bus_Clock);
+RAM_Filling									=	RAM_Block_Filling_is_in_Progress.q;
+
+RAM_from_USB_WE		=	Sample_Enable AND RAM_Block_Filling_is_in_Progress.q AND !Byte_Number_CNT.q[0] AND Packet_is_in_Progress.q;
+RAM_WE	=	RAM_from_USB_WE;
+
+
+-- RAM & Command List control
+
+USB_CMDL_RAM.(clock, wren_a)			=	(Bus_Clock, RAM_from_USB_WE);
+USB_CMDL_RAM.data_a[15..0]				=	Load_Data[15..0];
+USB_CMDL_RAM.(data_b[15..0], wren_b)	=	(DataBus_In[15..0], (Select AND Direct_In AND DataBusStrobe AND AddrBus_In[8]));
+
+	
+Addr_Page_offset[10..0] = USB_CMDL_RAM_Addr_CNT.q[11..1]+1;   -- определяем адреса
+Data_Page_offset[10..0] = USB_CMDL_RAM_Addr_CNT.q[11..1]+2; -- и данные в командном листе
+
+IF(Command_List_has_control.q == VCC) THEN USB_CMDL_RAM.address_a[] = Addr_Page_offset[];   -- если Command_List_has_control.q == VCC значит идет этап отправки ответного пакета
+                                      ELSE USB_CMDL_RAM.address_a[] = Byte_Number_CNT.q[11..1];
+END IF;
+
+IF (Select == VCC)	THEN -- если Select == VCC значит модуль работает в режиме Slave (например, конфигурация с КАМАК-а)
+	USB_CMDL_RAM.address_b[8..0]  = AddrBus_In[8..0];
+	USB_CMDL_RAM.address_b[10..9] = GND;
+					ELSE -- модуль работает в режиме Master (принимает/отдает данные наружу)
+	USB_CMDL_RAM.address_b[10..0] = Data_Page_offset[10..0];		
+END IF;
+AddrBusOut[15..0] = USB_CMDL_RAM.q_a[];
+
+Fast_Module_buffer.(data[], clock, enable,load)=(DataBus_In[], Bus_Clock, DataBusStrobe AND AccessGranted, VCC);
+
+-- Флаг ошибки
+  Error	=   Packet_Length_is_wrong OR
+            Length_is_wrong;
+           -- Packet_Time_Out			OR 
+           -- Service_Type_is_wrong	;
+  Error_at_packet_is_detected.(S,R,clk)	=	( Header_Locked, Error, Bus_Clock );
+ 
+ 
+-- Single word Read Proc
+	RXF_Edge.(clk,d)	=	(Bus_Clock, (! DFF(.d=FT_RXFn , .clk=Bus_Clock))  );--resyncronize and shape edge
+			Start_Read	=	RD_to_Go OR RXF_Edge.q;
+			RD_Timing_Counter.(clock, sclr)	=	(Bus_Clock, !RD_Cycle_is_Active.q);
+			RD_Cycle_is_Active.(S,R,clk)	=	((Start_Read), (RD_Timing_Counter.q[]==RD_End_Cycle_Time), Bus_Clock);
+			RD_Strob_SRFF.(S,R,clk)		=	((RD_Timing_Counter.q[]==RD_Strobe_Start_Time), (RD_Timing_Counter.q[]==RD_Strobe_Stop_Time), Bus_Clock);
+			Fast_input_buffer_FT_Bus.(clock, enable,load,data[]) =(Bus_Clock, (RD_Timing_Counter.q[]==RD_Sample_Time),    VCC, FT_DATA_In[7..0]);
+			FT_RDn	=	! RD_Strob_SRFF.q;
+
+-- Single word Write Proc
+			WR_Timing_Counter.(clock, sclr)	=	(Bus_Clock, !WR_Cycle_is_Active);
+			WR_Cycle_is_Active.(S,R,clk)	=	(WR_to_Go OR Byte_Strob, (WR_Timing_Counter.q[]==WR_End_Cycle_Time), Bus_Clock);
+--	WR_Strob_SRFF.(S,R,clk)		=	((WR_Timing_Counter.q[]==RD_Strobe_Start_Time), (WR_Timing_Counter.q[]==RD_Strobe_Stop_Time), Bus_Clock);
+--------------------------------------------------------------
+
+-- invert strobe to use this FT245R module with FT232H device
+	WR_Strob_SRFF.(R,S,clk)		=	((WR_Timing_Counter.q[]==RD_Strobe_Start_Time), (WR_Timing_Counter.q[]==RD_Strobe_Stop_Time), Bus_Clock);
+
+	WR_ZZZ_SRFF.(S,R,clk)		=	((WR_Timing_Counter.q[]==WR_ZZZ_Start_Time), (WR_Timing_Counter.q[]==WR_ZZZ_Stop_Time), Bus_Clock);
+			WR_Strob_SRFF.(S,R,clk)		=	((WR_Timing_Counter.q[]==WR_Strobe_Start_Time), (WR_Timing_Counter.q[]==WR_Strobe_Stop_Time), Bus_Clock);
+			FT_DATA_Out[7..0]	=	Fast_output_buffer_FT_Bus.q[7..0];
+			FT_WR	=	WR_Strob_SRFF.q;
+			FT_ZZ	=	WR_ZZZ_SRFF.q;
+	USB_Active	=	RD_Cycle_is_Active.q OR WR_Cycle_is_Active.q;
+
+
+  -- запускаем процедуру отправки данных в FT245 по опознанию конечного спец. символа
+    -- определяем конец работы процедуры приема пакета данных от FT245
+    RD_Paket_End_Edge.(clk,d)	=	(Bus_Clock, (! DFF(.d= Packet_is_in_Progress.q, .clk=Bus_Clock))  );
+    Sample_Enable_CNT.(clock, cnt_en, sclr) = (Bus_Clock, Command_List_has_control.q, RD_Paket_End_Edge.q OR Byte_Strob);
+    IF((Sample_Enable_CNT.q[] >= WR_End_Cycle_Time+1) AND !DFF(.d=FT_TXEn,.clk=Bus_Clock)) THEN Byte_Strob = VCC;
+                                                                                           ELSE Byte_Strob = GND;
+    END IF;
+ 
+    -- Answer condition
+    Command_List_has_control.(S,R,clk)	=	(RD_Paket_End_Edge.q, Command_List_End_control, Bus_Clock);
+    Out_Buff_Byte_Number_CNT.(clock, cnt_en, sclr)	=	(Bus_Clock, Byte_Strob, !Command_List_has_control.q); -- по Sample_Enable увеличиваем счетчик отправленных слов
+    
+    Fast_output_buffer_FT_Bus.(data[],clock, enable,load)=(Fast_output_buffer.q[],Bus_Clock, VCC, VCC);
+    Fast_output_buffer.(clock, enable,load)=(Bus_Clock, Byte_Strob, VCC);
+ -- отправляем спец. символ начала 12 байт
+    IF(Out_Buff_Byte_Number_CNT.q[] >=0 AND Out_Buff_Byte_Number_CNT.q[] < Header_Key_Symbol_Number) THEN Fast_output_buffer.data[] = Header_Key_Symbol;
+    END IF;
+ -- отправляем длину пакета 2 байта
+    IF(Out_Buff_Byte_Number_CNT.q[] == Header_Key_Symbol_Number) 
+                         THEN USB_CMDL_RAM_Addr_CNT_En = VCC;
+                              Fast_output_buffer.data[] = Length_of_Packet[7..0];
+                         ELSE USB_CMDL_RAM_Addr_CNT_En = GND;
+    END IF;
+    IF(Out_Buff_Byte_Number_CNT.q[] == Header_Key_Symbol_Number+1) THEN Fast_output_buffer.data[] = Length_of_Packet[15..8];
+    END IF;
+ -- отправляем тип сервиса 2 байта
+    IF(Out_Buff_Byte_Number_CNT.q[] == Header_Key_Symbol_Number+2) 
+                       THEN IF(Error_at_packet_is_detected.q == GND) THEN Fast_output_buffer.data[] = Error_Symbol; -- проверяем, если пакет битый то отпраляем тип сервиса ОШИБКА
+                                                                     ELSE Fast_output_buffer.data[] = Service_Type[7..0]; -- если нет, то повторяем пришедший тип сервиса 
+                            END IF;
+    END IF;         
+    IF(Out_Buff_Byte_Number_CNT.q[] == Header_Key_Symbol_Number+3) 
+                       THEN IF(Error_at_packet_is_detected.q == GND) THEN Fast_output_buffer.data[] = Error_Symbol; -- проверяем, если пакет битый то отпраляем тип сервиса ОШИБКА
+                                                                     ELSE Fast_output_buffer.data[] = Service_Type[15..8]; -- если нет, то повторяем пришедший тип сервиса 
+                            END IF;
+    END IF;         
+ -- отправляем адрес 2 байта и данные 2 байта в количестве Length_of_Packet[]
+    USB_CMDL_RAM_Addr_CNT.(clock, cnt_en, sclr) = (Bus_Clock, Byte_Strob AND USB_CMDL_RAM_Addr_CNT_En_Trig.q, RD_Paket_End_Edge.q);
+    USB_CMDL_RAM_Addr_CNT_En_Trig.(S,R,clk)     = (USB_CMDL_RAM_Addr_CNT_En, Command_List_End_control, Bus_Clock);
+    IF(Out_Buff_Byte_Number_CNT.q[] >=Header_Key_Symbol_Number+4 AND Out_Buff_Byte_Number_CNT.q[] <= Header_Key_Symbol_Number+Length_of_Packet[]-Trailer_Key_Symbol_Number) 
+        THEN IF(USB_CMDL_RAM_Addr_CNT.q[0] == GND) THEN Fast_output_buffer.data[] = Data_Path[7..0];--USB_CMDL_RAM.q_a[7..0];
+                                                   ELSE Fast_output_buffer.data[] = Data_Path[15..8];--USB_CMDL_RAM.q_a[15..8];
+             END IF;
+    END IF;
+    
+ -- отправляем спец. символ конца  8 байт    
+    IF(Out_Buff_Byte_Number_CNT.q[] >Header_Key_Symbol_Number+Length_of_Packet[]-Trailer_Key_Symbol_Number AND Out_Buff_Byte_Number_CNT.q[] <= Header_Key_Symbol_Number+Length_of_Packet[]) THEN Fast_output_buffer.data[] = Trailer_Key_Symbol;
+    END IF;
+ 
+    IF(Out_Buff_Byte_Number_CNT.q[] >= Header_Key_Symbol_Number+Length_of_Packet[]) 
+                                THEN Command_List_End_control = VCC;
+                                ELSE Command_List_End_control = GND;  
+    END IF; 
+
+
+    
+
+-- Section "User Interface Control" Begin
+	IF (!AddrBus_In[8] AND Select == VCC)	-- если Select == VCC значит модуль работает в режиме Slave
+	    THEN
+		    CASE AddrBus_In[7..0] IS 
+			  WHEN 2		=>	DataBusOut[0]= FT_TXEn; DataBusOut[1]= FT_RXFn; DataBusOut[15..2]  = GND;
+			  WHEN 1		=>	RD_to_Go = (Select AND DataBusStrobe);		DataBusOut[15..0]  = GND;
+					
+			  WHEN 0		=>	DataBusOut[] = Service_Type[];
+			
+			  WHEN 3		=>	Out_Buffer_Ena =(Select AND Direct_In AND DataBusStrobe); DataBusOut[7..0]  = Fast_output_buffer.q[7..0]; DataBusOut[15..8]= GND;
+			  WHEN 4		=>	WR_to_Go	=	(Select AND DataBusStrobe);		DataBusOut[15..0]  = GND;
+			  WHEN 5		=>	DataBusOut[7..0]=Fast_output_buffer.q[7..0]; DataBusOut[15..8]= GND;
+			  WHEN 6		=>	DataBusOut[7..0]=Length_of_Packet_L_REG.q[7..0]; DataBusOut[15..8]= Length_of_Packet_H_REG.q[7..0];
+			  WHEN 7		=>	DataBusOut[7..0]=Service_Type_L_REG.q[7..0]; DataBusOut[15..8]= Service_Type_H_REG.q[7..0];
+			  WHEN OTHERS	=>	DataBusOut[15..0]  = GND; WR_to_Go	=	GND; RD_to_Go	=	GND; Out_Buffer_Ena	=	GND;
+		  END CASE;
+        ELSE 	DataBusOut[15..0]  = USB_CMDL_RAM.q_b[15..0];
+	END IF;
+ 
+	
+	IF(Error_at_packet_is_detected.q == VCC) -- пакет пришел без ошибки
+	          THEN 
+                    CASE Service_Type[15..0] IS  
+                       WHEN H"ABCD"  => DirectOut=GND;  IF(USB_CMDL_RAM_Addr_CNT.q[1..0] <= 1) THEN Data_Path[] = USB_CMDL_RAM.q_a[];
+                                                                                               ELSE Data_Path[] = Fast_Module_buffer.q[]; -- Читаем данные из блока
+                                                        END IF;
+                       WHEN H"CDAB"  => DirectOut=VCC;  Data_Path[] = USB_CMDL_RAM.q_a[];     -- пишем данные в блока
+                       WHEN H"CCCC"  => DirectOut=GND; -- loop back test повторяем отправленные данные
+                       WHEN OTHERS	 => DirectOut=GND;
+                    END CASE;
+     END IF;                   
+	
+	
+	
+	--DirectOut= VCC; --DFF(.d=Interlock, .clk=Clock);
+
+--	AccessRequest.S	=	DFF(.d=(RD_Timing_Counter.q==RD_Sample_Time), .clk=Bus_Clock);
+--	AccessRequest.S	=	DFF(.d=((Sample_Enable AND (Byte_Number_CNT.q[] == 3))), .clk=Bus_Clock);-- requiest on 
+-- по окончанию получения пакета запускаем работу модуля USB
+    
+	AccessRequest.S	=	DFF( .d=(Byte_Strob AND ((USB_CMDL_RAM_Addr_CNT.q[] >= 4) AND (USB_CMDL_RAM_Addr_CNT.q[] <= Length_of_Packet[]-Trailer_Key_Symbol_Number)) AND (USB_CMDL_RAM_Addr_CNT.q[1..0] == 0) AND Error_at_packet_is_detected.q), .clk=Bus_Clock);-- requiest on 
+
+	AccessRequest.clk = Bus_Clock ;
+	AccessRequest.R  = ((DataBusStrobe AND AccessGranted)) ; 
+-- Section "User Interface Control" End
+	--AddrBusOut[15..0]	=	LED_IFace_Offset;
+
+
+    
+	
+end;

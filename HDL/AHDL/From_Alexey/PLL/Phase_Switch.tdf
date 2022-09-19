@@ -1,0 +1,80 @@
+TITLE "Phase_Switch";
+
+-- This file includes functions for automatic switching of refrence clock
+-- sourses - internal quartz 25MHz or external Phase0 signal. 
+-- constant FmaxThresh = 26000 ; -- Upper limit in kHz
+-- constant FminThresh = 24000 ; -- Lower limit in kHz
+INCLUDE "lpm_counter.inc" ;
+
+PARAMETERS
+(
+FmaxThresh = 26000 ,  -- Upper limit in kHz
+FminThresh = 24000    -- Lower limit in kHz
+);
+CONSTANT RefClk = 25000;
+Assert ( !(FmaxThresh > 30000) AND !(FmaxThresh < RefClk))
+Report "In this design FmaxThresh must be some greater then 25000kHz"; 
+Assert ( !(FminThresh < 20000) AND !(FminThresh > RefClk))
+Report "In this design FminThresh must be some smaller then 25000kHz"; 
+
+SUBDESIGN Phase_Switch
+(
+	clock              : input;  -- Global FPGA clock 
+	Phase0             : input;  -- Input from Pin160 "Phase0"
+	Reset              : input;  -- Global FPGA Reset, active High
+	
+	Phase25            : output; -- Output to Pin144  
+	LinkClock_Enabled  : output; -- Signal to ensure what sourse is active
+
+)
+
+VARIABLE 
+-- Cycle Timing counter
+	TimingCnt   : lpm_counter WITH (LPM_WIDTH = 16,LPM_TYPE = "LPM_COUNTER",LPM_DIRECTION = "Up");
+-- Phase freq.  counter	
+	Phase0Cnt   : lpm_counter WITH (LPM_WIDTH = 16,LPM_TYPE = "LPM_COUNTER",LPM_DIRECTION = "Up");
+	
+	Sync_TRG1   : DFF ;              -- Synchronize comparator	
+	Sync_TRG2   : DFF ;              -- Synchronize comparator	
+
+	MUX_Control : node ;
+	Cycle_End   : node ;
+
+BEGIN
+
+-- Frequency diskriminator section begin 
+		-- Base time interval
+TimingCnt.clock = clock ;
+TimingCnt.sclr = Cycle_End OR Reset ;		
+
+Sync_TRG1.clk   = clock ;
+Sync_TRG1.clrn = !Reset;
+		
+IF (TimingCnt.q[15..0] == RefClk) THEN -- Base time interval counter 25000 == 1ms
+    Sync_TRG1.d=VCC;
+ELSE
+	Sync_TRG1.d=GND;
+END IF;
+Cycle_End = Sync_TRG1.q ;
+
+Phase0Cnt.clock = Phase0 ;
+Phase0Cnt.sclr = Cycle_End OR Reset ;
+
+Sync_TRG2.clk = Cycle_End  ;
+Sync_TRG2.clrn = !Reset;
+
+           -- Pulse counter & CMP
+IF ( (Phase0Cnt.q[15..0] > FmaxThresh) OR (Phase0Cnt.q[15..0] < FminThresh)) THEN
+  	Sync_TRG2.d=GND;
+ELSE
+	Sync_TRG2.d=VCC;
+END IF;
+MUX_Control=Sync_TRG2.q    ;
+-- Frequency diskriminator section end 
+
+-- Mux section begin 
+Phase25 = ((Phase0 and MUX_Control) OR (clock and !MUX_Control));
+-- Mux section end 
+
+LinkClock_Enabled = MUX_Control;
+END;

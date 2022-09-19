@@ -1,0 +1,126 @@
+TITLE "Ethernet MAC decoder";
+
+INCLUDE "Edge_Sensing_Sync.inc";
+INCLUDE "lpm_shiftreg.inc";
+INCLUDE "lpm_counter.inc";
+INCLUDE "parameters.inc";
+
+
+Constant Eth_MAC_Pos        = 0;--0; --6
+
+Constant PARCER_CYLCLE_WIDTH = 2;
+Constant PARCER_CYLCLE_CNT_WIDTH = Ceil(log2(PARCER_CYLCLE_WIDTH))+1;
+Constant WORD_WIDTH	= 16; 
+
+
+SUBDESIGN Eth_MAC_Decoder_v1
+(
+  Clock                         : input; -- System Clock, really Bus_Clock
+
+  Rx_Data[WORD_WIDTH-1..0]  	: input;
+  Rx_Addr[10..0]  				: output;
+  Rx_Parcer_RQ					: input;
+   
+  Tx_Addr[10..0]  				: output;
+  Tx_Data[WORD_WIDTH-1..0]  	: output;
+  Tx_Word_Strobe      			: output;
+  
+  MAC_Addr0_[WORD_WIDTH-1..0]	: input;
+  MAC_Addr1_[WORD_WIDTH-1..0]	: input;
+  MAC_Addr2_[WORD_WIDTH-1..0]	: input;
+  
+  Reset                         : input;
+  
+  Rx_Error_MAC                  : output;
+  Next_Parcer			        : output;
+  Rx_Parcer_in_progress  		: output;
+
+)
+VARIABLE
+ 
+  Rx_Parcer_RQ_ES               : Edge_Sensing_Sync;
+  RxParcerActive                : SRFF;
+  --Next_Parcer_Start_Pulse       : node; 
+  
+  ParcerCnt						: LPM_COUNTER WITH (LPM_WIDTH = 3);
+  
+  Prescaler                     : LPM_COUNTER WITH (LPM_WIDTH = PARCER_CYLCLE_CNT_WIDTH);
+  Pascer_Sample_Enable 			: node;
+  
+  Rx_MAC_Addr_Err_Flag          : SRFF;
+  Rx_MAC_Addr_True[3..0]        : node;
+  Rx_MAC_Addr_True_Flag[3..0]   : SRFF;
+  
+  Tx_Strobe 					: node;
+  
+  ParcerEndCyle                 : node;
+  
+  Rx_Data_[WORD_WIDTH-1..0]     : node;
+  
+  incoming_MAC0_Reg				: LPM_SHIFTREG WITH (LPM_WIDTH = 16);
+  incoming_MAC0_Reg_En			: node;
+  incoming_MAC1_Reg				: LPM_SHIFTREG WITH (LPM_WIDTH = 16);
+  incoming_MAC1_Reg_En			: node;
+  incoming_MAC2_Reg				: LPM_SHIFTREG WITH (LPM_WIDTH = 16);
+  incoming_MAC2_Reg_En			: node;
+  
+BEGIN
+
+   Pascer_Sample_Enable = VCC;
+   
+   incoming_MAC0_Reg.(data[],clock, load, enable) = (Rx_Data[],Clock,VCC, incoming_MAC0_Reg_En);
+   incoming_MAC1_Reg.(data[],clock, load, enable) = (Rx_Data[],Clock,VCC, incoming_MAC1_Reg_En);
+   incoming_MAC2_Reg.(data[],clock, load, enable) = (Rx_Data[],Clock,VCC, incoming_MAC2_Reg_En);
+
+-------------------------------------------- Rx section --------------------------------------------
+   Rx_Data_[] = Rx_Data[];
+   --Rx_Addr[2..0] = ParcerCnt.q[]; Rx_Addr[10..3] = GND;
+   --Rx_Addr[] = ParcerCnt.q[]; 
+   
+   Rx_Parcer_RQ_ES.(d,clk)  = (Rx_Parcer_RQ, Clock);
+   RxParcerActive.(S,clk,R) = (Rx_Parcer_RQ_ES.q, Clock, ParcerEndCyle OR Reset);
+   
+   ParcerCnt.(clock,sclr,cnt_en) = (Clock, !RxParcerActive.q, RxParcerActive AND Pascer_Sample_Enable);
+   
+   IF(RxParcerActive.q == VCC) THEN
+	   --Rx_Addr[] = ParcerCnt.q[]; 
+	   Rx_Addr[2..0] = ParcerCnt.q[]; Rx_Addr[10..3] = GND;
+       IF ((ParcerCnt.q[] == Eth_MAC_Pos+1) AND ((Rx_Data_[] == MAC_Addr0_[]) OR (Rx_Data_[] ==H"FFFF") OR (Rx_Data_[] == MMAC_ADDR_0)) ) THEN Rx_MAC_Addr_True[0] = VCC; ELSE Rx_MAC_Addr_True[0] = GND; END IF;
+       IF ((ParcerCnt.q[] == Eth_MAC_Pos+2) AND ((Rx_Data_[] == MAC_Addr1_[]) OR (Rx_Data_[] ==H"FFFF") OR (Rx_Data_[] == MMAC_ADDR_1)) ) THEN Rx_MAC_Addr_True[1] = VCC; ELSE Rx_MAC_Addr_True[1] = GND; END IF; 
+       IF ((ParcerCnt.q[] == Eth_MAC_Pos+3) AND ((Rx_Data_[] == MAC_Addr2_[]) OR (Rx_Data_[] ==H"FFFF") OR (Rx_Data_[] == MMAC_ADDR_2)) ) THEN Rx_MAC_Addr_True[2] = VCC; ELSE Rx_MAC_Addr_True[2] = GND; END IF;
+       
+       --  устанавливаем в заголовке кадра MAC-адрес отправителя посылки
+       IF (ParcerCnt.q[] == Eth_MAC_Pos+1) THEN  Tx_Addr[10..0] = 3; Tx_Data[] = MAC_Addr0_[]; Tx_Strobe = VCC; END IF;
+       IF (ParcerCnt.q[] == Eth_MAC_Pos+2) THEN  Tx_Addr[10..0] = 4; Tx_Data[] = MAC_Addr1_[]; Tx_Strobe = VCC; END IF; 
+       IF (ParcerCnt.q[] == Eth_MAC_Pos+3) THEN  Tx_Addr[10..0] = 5; Tx_Data[] = MAC_Addr2_[]; Tx_Strobe = VCC; END IF;
+       
+       --latch incoming MAC address
+       IF (ParcerCnt.q[] == Eth_MAC_Pos+4) THEN  incoming_MAC0_Reg_En = VCC; ELSE incoming_MAC0_Reg_En = GND; END IF;
+       IF (ParcerCnt.q[] == Eth_MAC_Pos+5) THEN  incoming_MAC1_Reg_En = VCC; ELSE incoming_MAC1_Reg_En = GND; END IF;
+       IF (ParcerCnt.q[] == Eth_MAC_Pos+6) THEN  incoming_MAC2_Reg_En = VCC; ELSE incoming_MAC2_Reg_En = GND; END IF;
+       --  устанавливаем в заголовке кадра MAC-адрес получателя посылк
+       IF (ParcerCnt.q[] == Eth_MAC_Pos+5) THEN  Tx_Addr[10..0] = 0; Tx_Data[] = incoming_MAC0_Reg.q[]; Tx_Strobe = VCC;  END IF;
+       IF (ParcerCnt.q[] == Eth_MAC_Pos+6) THEN  Tx_Addr[10..0] = 1; Tx_Data[] = incoming_MAC1_Reg.q[]; Tx_Strobe = VCC;  END IF;
+       IF (ParcerCnt.q[] == Eth_MAC_Pos+7) THEN  Tx_Addr[10..0] = 2; Tx_Data[] = incoming_MAC2_Reg.q[]; Tx_Strobe = VCC;  END IF;
+	   
+	   IF(ParcerCnt.q[] == Eth_MAC_Pos+7)  THEN  ParcerEndCyle = VCC; ELSE ParcerEndCyle = GND; END IF;
+	       
+							   ELSE  Tx_Addr[10..0] = GND; Tx_Data[] = GND; incoming_MAC0_Reg_En = GND;
+                                     Rx_MAC_Addr_True[0] = GND; Rx_MAC_Addr_True[1] = GND; Rx_MAC_Addr_True[2] = GND;
+                                     Tx_Strobe = GND; Rx_Addr[] = GND;
+   END IF;
+   
+   Rx_MAC_Addr_True[3] = DFF(.d = Rx_MAC_Addr_True_Flag[0].q AND Rx_MAC_Addr_True_Flag[1].q AND Rx_MAC_Addr_True_Flag[2].q, .clk = Clock);
+   
+   FOR i IN 0 TO 3 GENERATE 
+      Rx_MAC_Addr_True_Flag[i].(S,clk,R) = (Rx_MAC_Addr_True[i], Clock, Rx_Parcer_RQ_ES.q OR ParcerEndCyle OR Reset); 
+   END GENERATE;
+ 
+   Rx_MAC_Addr_Err_Flag.(S,clk,R) = ((!Rx_MAC_Addr_True_Flag[3].q) AND ParcerEndCyle, Clock, Rx_Parcer_RQ_ES.q OR Reset); 
+   
+   Rx_Error_MAC 		 = Rx_MAC_Addr_Err_Flag.q;               -- неопознан MAC-адрес мезанина
+   Next_Parcer 			 = Rx_MAC_Addr_True_Flag[3].q AND ParcerEndCyle;  -- MAC-адрес опознан, переходим к следующему парсеру
+   Tx_Word_Strobe 		 = (RxParcerActive.q AND Tx_Strobe AND Pascer_Sample_Enable); -- строб защелкивания в Tx буффер МАС-адрес устройства, МАС-адрес мезанина
+   Rx_Parcer_in_progress = RxParcerActive.q;                     -- идет процесс декодирования MAC-адресов
+    
+END;

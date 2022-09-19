@@ -1,0 +1,46 @@
+TITLE "Pulse_Shaper";
+-- Файл содержит фукцию формирователь импульса преременной длительности. 
+-- Формирователь имеет задержку 1 такт входной частоты
+
+INCLUDE "Edge_Sensing.inc";
+INCLUDE "lpm_counter.inc" ;
+
+PARAMETERS
+(
+  MAX_DURATION = 16
+);
+ 
+CONSTANT COUNTER_SIZE = FLOOR (LOG2(MAX_DURATION))+1;
+
+Subdesign Pulse_Shaper
+(
+       clk        : input;   -- Clock
+       clr        : input = GND; -- Common FPGA Reset
+       d          : input;   -- External signal to synchronize
+       q          : output;  -- Synchronized out
+       cnt_en	  : input ; 
+       Duration[COUNTER_SIZE-1..0] : input; 
+)
+
+Variable
+
+    StartSensing      : Edge_Sensing;
+	StartCycle        : SRFF;
+	TimeCounter	      : LPM_COUNTER with ( lpm_width=COUNTER_SIZE, lpm_direction="up" );   
+	EndCycle          : node;
+
+Begin
+
+StartSensing.(d,clk,clr) = (d,clk,clr);
+StartCycle.(S,clk,R) = (StartSensing.q AND !StartCycle.q,clk, EndCycle OR clr);
+
+TimeCounter.(clock,cnt_en,sclr) = (clk, StartCycle.q AND cnt_en, EndCycle OR clr);
+IF(TimeCounter.q[] == (Duration[]-1) ) THEN 
+    EndCycle = VCC;
+  ELSE
+    EndCycle = GND;
+END IF;
+
+ q = StartCycle.q;
+
+end;

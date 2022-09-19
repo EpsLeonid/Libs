@@ -1,0 +1,127 @@
+% This Function is BUS Controller (Access Arbiter) for CMD-3 (primary T2Q) Project Internal Bus.
+This function ONLY regulate how Master device asserts address on Address Lines. Read or Write 
+data thorough Data Lines is under Master control. Target devices has to decode address and accept/supply data.  
+When Target is READY for transfer, Data Strobe signal is generated to complete the cycle.
+%
+TITLE "Arbiter v0";
+-- Ver4 28.11.2008 Last modified 09.02.09
+
+%
+This  Interface is Syncronouse with Handshake, intended for data tranfser between devices with different speed of Clock.
+
+Bus access is organized in some steps:
+1. Master Device asserts "Bus Access ReQuiest".
+2. At positive transitions of CLK supplied to Arbiter "Bus Access GranteD" occuried.
+If more than one requiest found, high priority device will be granted first.
+3. Master Device which is granted, opens tri-state buffers and thus asserts "Adderess Lines" and "Bus Direction" .
+4. At next positive transition of CLK "Address Valid" signal asserted by Arbiter. 
+5. Now it's some WaiteStates inserted to address decode by Targets'.
+6. When any Target Device recognize it's address, (Address decoded), It asserts signal "Target Ready".
+7. At positive transitions of CLK signal "Target Ready" sampled and, if present, 
+signal "Data Strobe" generated. "Data Strobe" is 1T of CLK, negative transitions
+is the end of transfer cycle.
+P.S. 
+1. If "Target Ready" not asserted while ClockMaxTimout expered, "Data Strobe" 
+will be produced to clear current cycle, "Error" signal generated.
+2. If device granted does not remove request after bus cycle completed it 
+will be ignored for 1 clock cycle.
+This features are to be used at initial system testing, ajusting.
+%
+
+
+INCLUDE "lpm_counter.inc"  ;
+INCLUDE "lpm_shiftreg.inc"  ;
+
+
+PARAMETERS
+(
+  DeviceMaxNumber = 2, -- Number of Master Devices connected to Bus
+  ClockMaxTimout  = 12  -- Maximum clock number until Target Ready
+);
+ASSERT (ClockMaxTimout>1) and (ClockMaxTimout<30)
+	report "Arbiter TimeOut should be 1..60" ;
+	 
+Subdesign Arbiter_v0
+(
+  clock                            : input;  -- System clock
+  Reset                            : input;  -- Active High
+
+-- HandShake Begin
+-- Requestes from Master devices to bus access to 
+  BARQ[DeviceMaxNumber-1..0]		: input; 
+
+-- Bus Access Granted 
+  BAGD[DeviceMaxNumber-1..0]		: output;
+
+--Negotiation signals
+  AddressValid						: output; -- Target Address Decode
+  TargetReady						: input;  -- Target Device Ready when addr decoded
+  DataStrobe						: output; -- One clock HIGH when Target Ready or TimeOut
+-- End of HandShake
+
+  Error								: output; -- One clock HIGH  at TimOut 
+)
+
+VARIABLE
+
+  BARQ_inBuff[DeviceMaxNumber-1..0]         : DFFE ; -- Input sampling
+  BAGD_outBuff[DeviceMaxNumber-1..0]        : DFFE ; -- Output strobed (optional)
+
+  nBARQ_OR									: node;
+  wire_AND[DeviceMaxNumber-2..0]			: node;                              
+
+  End_Cycle								    : node;
+  TimeOutCnt                                : LPM_COUNTER WITH (LPM_WIDTH = 6);
+  TimeOut									: NODE;
+	TimingPipline_1, TimingPipline_2		: lpm_shiftreg with (LPM_WIDTH = 4);
+
+BEGIN
+
+Defaults 
+    wire_AND[] = VCC;  -- aiii?aaaeyai yaii ai eiae?aneie 1
+END Defaults;
+
+-- Bus connection begin			
+     BARQ_inBuff[].d	= BARQ[];				BARQ_inBuff[].(clk, clrn)	=	(clock, !End_Cycle); 
+
+	 BAGD[]				= BAGD_outBuff[].q;		BAGD_outBuff[].clk  = clock;
+
+
+-- Priority Encoder to ensure single active BAGD
+  FOR j IN 0 TO (DeviceMaxNumber-2) GENERATE
+     wire_AND[j] = BARQ_inBuff[j].q;
+     FOR i IN j TO (DeviceMaxNumber-2) GENERATE
+        wire_AND[j] = !BARQ_inBuff[i+1].q;
+     END GENERATE;
+     IF wire_AND[j] == VCC THEN BAGD_outBuff[j].d = VCC; 
+                           ELSE BAGD_outBuff[j].d = GND;
+     END IF;
+  END GENERATE;
+
+  IF   (BARQ_inBuff[DeviceMaxNumber-1].q == VCC) THEN BAGD_outBuff[DeviceMaxNumber-1].d = VCC;
+												 ELSE BAGD_outBuff[DeviceMaxNumber-1].d = GND; 
+  END IF; 
+-- Priority Encoder end
+
+-- Inpit sampling control
+	nBARQ_OR	=	(BARQ_inBuff[].q==GND); 	BARQ_inBuff[].ena=	nBARQ_OR;
+
+-- Output control
+
+TimingPipline_1.(clock, shiftin, sclr)	=	(Clock, !nBARQ_OR, End_Cycle); --Time count begin from nBARQ_OR
+	AddressValid	=	TimingPipline_1.q[1]; -- this time external mux of address lines is ready
+
+TimingPipline_2.(clock, shiftin, sclr)	=	(Clock, AddressValid AND (TargetReady OR TimeOut), End_Cycle);	--Time count begin from TargetReady
+
+-- From "Target Ready" to "Data Strobe" control--Shaping one clock width pulse from positive edge of Target Ready
+	DataStrobe		=	DFF(.d=(TimingPipline_2.q[0] and !TimingPipline_2.q[1]), .clk=Clock) ;
+
+	End_Cycle		=	TimingPipline_2.q[3];
+
+-- Time_Out Timer: Starts  on "Target Ready" , Cleared at next clock of DataStrobe
+		TimeOutCnt.(clock, sclr, cnt_en) = (clock, End_Cycle, AddressValid);-- Count enabled when Address Valid
+		TimeOut		=	DFF (.d=(TimeOutCnt.q[] == ClockMaxTimout-1), .clk=clock);
+	
+	Error = TimeOut;  -- Error marker for external light
+
+END;

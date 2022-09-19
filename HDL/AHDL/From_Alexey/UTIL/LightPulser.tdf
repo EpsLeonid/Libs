@@ -1,0 +1,55 @@
+Title "LightPulser";
+-- This file contain function for LED pulse one-short
+-- Edge sensing, non-continue type.
+INCLUDE "lpm_counter.inc" ;
+--CONSTANT Delay = 2000000; -- Duration of PULSE 
+PARAMETERS
+(
+--  DURATION=2000000,
+  Duration=20,    -- ms
+  RefClock=100000 -- kHz
+);
+CONSTANT PrescalerValue=1000;
+CONSTANT Drtn=Duration * RefClock DIV PrescalerValue;
+
+Subdesign LightPulser
+(
+    clock	 : input;
+    event    : input;
+    LightOut : bidir;
+)
+
+VARIABLE
+
+	Prescaler : lpm_counter WITH ( LPM_WIDTH = 10);
+	Timer     : lpm_counter WITH ( LPM_WIDTH = 20);
+     trg1  : DFF;  -- trg1,trg2 is edge sensitive  
+     trg2  : DFF;  -- one clock pulse shaper
+	 SR    : SRFF; -- Count Enable
+	Carry_pulse : NODE;		
+
+BEGIN
+	Prescaler.clock=clock;
+	Prescaler.aclr  =!SR.q;
+	Timer.clock=clock;
+	Timer.sclr      =!SR.q;
+	if (Prescaler.q[] == PrescalerValue) then Carry_pulse=VCC; 
+									 else Carry_pulse=GND;
+	end if; 
+	
+	Timer.cnt_en   = Carry_pulse;
+	Prescaler.sclr = Carry_pulse;
+
+    trg1.d=event;
+    trg1.clk=clock;
+    trg2.d=trg1.q;
+    trg2.clk=clock;
+    
+	SR.S =  trg1.q AND !trg2.q; 
+	SR.clk=clock;
+	if ( Timer.q[] == Drtn ) then SR.R=VCC;
+				         else SR.R=GND;
+	end if;
+	LightOut=OPNDRN(!SR.q);
+
+END;

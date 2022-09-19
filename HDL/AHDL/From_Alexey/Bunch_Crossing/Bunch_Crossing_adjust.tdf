@@ -1,0 +1,130 @@
+TITLE "Bunch_Crossing_adjust";
+
+INCLUDE "lpm_shiftreg.inc" ;
+INCLUDE "lpm_counter.inc" ;
+INCLUDE "Edge_Sensing.inc";
+
+PARAMETERS
+(
+     Cavity_to_Bunch_Ratio = 14, -- Число во сколько раз делиться входная частота, для получения требуемой выходной
+     Number_of_Channel     = 16  -- Число каналов 
+);
+
+CONSTANT COUNTER_SIZE     = CEIL(log2 (Cavity_to_Bunch_Ratio+1));
+CONSTANT FREQUENCY_FACTOR = Cavity_to_Bunch_Ratio-1;
+CONSTANT ADDR_SIZE        = CEIL(log2 (Number_of_Channel+1));
+
+
+
+SUBDESIGN Bunch_Crossing_adjust
+(
+-- Module specific signals
+	Cavity_Clock	                        : input ;       -- Входная частота которую в дальнейшем будем делить для получения искомой частоты
+	Bunch_Crossing	                        : input = GND ; -- Стартовый бит Медленного Линка
+		--Bunch_Crossing_h	: input =GND ;
+		--Bunch_Crossing_l	: input =GND ;
+
+	Start_Enable[Number_of_Channel-1..0]	: output;
+	Sample_Enable[Number_of_Channel-1..0]	: output;
+	Refrence_Clock[Number_of_Channel-1..0]	: output;
+	Set 	                                : output;
+	Phase[COUNTER_SIZE-1..0]	            : output;
+	Error				                    : output;
+	
+-- Standard Bus signaling for Master/Slave connection
+	BusClock				                : input;  -- Global FPGA Clock, assumed 100MHz
+	DataBus_In[15..0]		                : input;  -- отправляемые с Внутренней Шины в Линк данные
+	DataBusOut[15..0]                       : output; -- выдаваемые на Внутреннюю Шину из Линка данные
+	DataBusStrobe                           : input;  -- строб приема/передачи данных наружу (высокий уровень, используя его как Enable, "защелкиваем" по заднему фронту
+	Select				                 	: input;  -- Выбор Модуля для работы с памятью Командного Листа в режиме Slave (с КАМАК-ом)
+	DirectIn				                : input;  -- направление передачи данных, Если =GND, то данный Модуль читается, если =VCC, то пишется.
+	AddrBus_In[7..0]	                    : input;  -- адрес при операциях доступа чтения/записи Командного Листа с КАМАК-а
+
+)
+VARIABLE
+
+    Bunch_Rising_Edge			                    : Edge_Sensing ;
+    Set_All						                    : node;
+    Sample_Enable_CNT			                    : lpm_counter with (lpm_width=COUNTER_SIZE);
+    Sample_Enable_CNT_Load		                    : node;
+
+    Start_Enable_[Number_of_Channel-1..0]	        : node;
+    Sample_Enable_[Number_of_Channel-1..0]	        : node;
+
+    Refrence_Clock_CNT[Number_of_Channel-1..0]		: lpm_shiftreg with (lpm_width=COUNTER_SIZE);
+    Refrence_Clock_PhaseSet[Number_of_Channel-1..0]	: node;
+
+    Control_Reg[Number_of_Channel-1..0]		        : lpm_shiftreg with (lpm_width=16);
+ 
+BEGIN
+
+DEFAULTS
+	Control_Reg[].enable	= GND;
+	DataBusOut[]			= GND;
+END DEFAULTS;
+
+--Bunch_Rising_Edge.(d, clk)	=	(((Bunch_Crossing_h and !Control_DDR_Reg.q[0]) OR (Bunch_Crossing_l and Control_DDR_Reg.q[0])), Cavity_Clock);
+--IF (AddrBus_In[7..0]==17) 
+--THEN Control_DDR_Reg.enable=(Select AND DirectIn AND DataBusStrobe); DataBusOut[0]=Control_DDR_Reg.q[0]; DataBusOut[15..1]=GND;
+--END IF;
+--Control_DDR_Reg.(clock, load, data[0])	=	(BusClock, VCC, DataBus_In[0]);
+
+
+  --Error	= GND;
+Error	=	DFF(.clk=Cavity_Clock, .d= (!Sample_Enable_CNT_Load) AND Set_All); -- Correction pulse from Bunch_Rising_Edge MUST coincidence with self reset
+
+
+  Bunch_Rising_Edge.(d, clk) = (Bunch_Crossing, Cavity_Clock);
+  Set_All					 = Bunch_Rising_Edge.q; -- Set relative Phase for All counters
+  Set                        = Set_All;
+  IF(Sample_Enable_CNT.q[COUNTER_SIZE-1..0] == FREQUENCY_FACTOR ) -- Main counter --Sample_Enable_CNT.q[3..0]
+	     THEN Sample_Enable_CNT_Load = VCC; 
+	     ELSE Sample_Enable_CNT_Load = GND; 
+  END IF;
+  Sample_Enable_CNT.(clock, sclr) = (Cavity_Clock, Sample_Enable_CNT_Load OR Set_All);-- Synchronize Main Counter
+  Phase[COUNTER_SIZE-1..0]        = Sample_Enable_CNT.q[COUNTER_SIZE-1..0];
+
+-- Start_Enable generating section Begin
+  FOR i IN 0 to Number_of_Channel-1 GENERATE
+		IF(Sample_Enable_CNT.q[COUNTER_SIZE-1..0] == Control_Reg[i].q[COUNTER_SIZE-1..0] ) -- Set relative Phase
+			THEN Start_Enable_[i] = VCC; 
+			ELSE Start_Enable_[i] = GND; 
+        END IF;
+		Start_Enable[i] = DFF(.clk=Cavity_Clock, .d=Start_Enable_[i]); -- output to  Down_Link timing
+  END GENERATE;
+-- Start_Enable generating section End
+
+-- Sample_Enable generating section Begin
+  FOR i IN 0 to Number_of_Channel-1 GENERATE
+		IF(Sample_Enable_CNT.q[COUNTER_SIZE-1..0] == Control_Reg[i].q[COUNTER_SIZE-1+4..4] ) OR (Sample_Enable_CNT.q[COUNTER_SIZE-1..0] == (Control_Reg[i].q[COUNTER_SIZE-1+4..4]+7))-- Set relative Phase
+			THEN Sample_Enable_[i] = VCC;
+			ELSE Sample_Enable_[i] = GND; 
+		END IF;
+		Sample_Enable[i] = DFF(.clk=Cavity_Clock, .d=Sample_Enable_[i]); -- output to  Down_Link timing
+  END GENERATE;
+-- Sample_Enable generating section End
+
+
+-- Refrence_Clock generating section Begin
+  FOR i IN 0 to Number_of_Channel-1 GENERATE
+		IF(Sample_Enable_CNT.q[COUNTER_SIZE-1..0] == Control_Reg[i].q[COUNTER_SIZE-1+8..8]) OR (Sample_Enable_CNT.q[COUNTER_SIZE-1..0] == (Control_Reg[i].q[COUNTER_SIZE-1+8..8]+7)) -- Set relative Phase
+			THEN Refrence_Clock_PhaseSet[i]	= VCC; 
+			ELSE Refrence_Clock_PhaseSet[i] = GND; 
+		END IF;
+		Refrence_Clock_CNT[i].load	                   = Refrence_Clock_PhaseSet[i];
+		Refrence_Clock_CNT[i].data[COUNTER_SIZE-1..0]  = Control_Reg[i].q[COUNTER_SIZE-1+12..12];
+		Refrence_Clock_CNT[i].(shiftin, clock)         = (GND, Cavity_Clock);
+		Refrence_Clock[i]	                           = Refrence_Clock_CNT[i].shiftout;
+  END GENERATE;
+-- Refrence_Clock generating section End
+
+  FOR i in 0 to (Number_of_Channel-1) GENERATE 
+        IF (AddrBus_In[ADDR_SIZE-1..0]==i) 
+            THEN Control_Reg[i].enable=(Select AND DirectIn AND DataBusStrobe); DataBusOut[]=Control_Reg[i].q[];
+        END IF;
+  END GENERATE;
+
+Control_Reg[].(clock, load, data[])	=	(BusClock, VCC, DataBus_In[]);
+
+
+END; -- Конец модуля

@@ -1,0 +1,625 @@
+-- Since  Quartus refused to generate the .mif-file autmatically, 
+-- I had to make it by hand from a .mif-file generated before. 
+-- Hand-made Memory Initialization File (.mif)
+
+--============================================================================
+
+-- Command Word bits' meaning: 
+--     [ 16 15 14 13|12 11 10  9  8  7  6  5  4  3  2  1 ]
+-- Halt   0  0  0  0|                                   |
+-- NOP    0  0  0  1|                                   |
+-- Incr   0  0  1  0| Destn  |                          |
+-- Decr   0  0  1  1| Destn  |                          |
+--JumpUnc 0  1  0  0|           | Address of Program    |Jump_Unconditional
+--JumpCnd 0  1  0  1| Condition | Address of Program    |Jump_Conditional
+--EndLoop 0  1  1  0|           | Address of Program    |End_of_Loop
+-- Wait   0  1  1  1| Condition |                       |
+-- Load   1  0  0  0| Destn  |  | 8-bit word to load    |Load 8-bit word from ProgRAM
+-- Load16 1  0  0  1| Destn  |                          |Load 16-bit word from ProgRAM
+---- Load16 1  0  0  1| Destn  | Source |                 |Load 8/16-bit word from Source
+---- Add    1  0  1  0| Destn  | Source |                 |Destn + Source -> Destn 
+---- Sub    1  0  1  1| Destn  | Source |                 |Destn - Source -> Destn
+-- Read   1  1  0  0|Data_Dst|Addr_Src|                 |Read from Extern.Object
+-- Write  1  1  0  1|Data_Src|Addr_Src|                 |Write to Extern.Object
+-- END    1  1  1  1|                                   |End_of_Prog 
+
+WIDTH=16;
+DEPTH=256;
+
+ADDRESS_RADIX = Dec;
+DATA_RADIX    = Bin;
+
+CONTENT  BEGIN
+
+ 00         : 1111000000000000; -- ENDofProg - for PowerUp
+ 01         : 1111000000000000; -- ENDofProg - for PowerUp
+
+--============================================================================
+--******** Program: "CommdLst_Rd***" Operations -                 ************
+--********     read data from Object(s) according to CommdListXXX ************
+--  1. Initialize: set the initial_addr of the correspondent CommdList
+--  2. During  Command_Sequence:  Store "InData" in MainRAM
+--  3. During  Reply_Sequence:    
+--      Get Addresses from the AddrPage of the selected CommdList
+--      Get Data from  addressed Object(s)
+--      Supply each DataWord to Link, by Link's request
+
+--******** Initialize the "CommdLst_Rd000" Operation ********
+--  ( Reg1 not used yet )
+-- Load initial address of Read000_AddrPage (#3072) => Reg2
+ 02         : 0001000000000000; -- NOP
+ 03         : 1001010000000000; -- Load16:(Ddst=Reg2)              \ InitAddr of
+ 04         : 0000110000000000; --#(3072+  0+  0)            \      >"Read000_AddrPage" =>
+            --  ^^^^^^ "CommdLst000_offset" + AddrPage_offset/     /   => Reg2
+ 05         : 0100000000010001; -- Jump:(to @#17 - subroutine "Processing of Command_Sequence")
+
+--******** Initialize the "CommdLst_Rd010" Operation ********
+--  ( Reg1 not used yet )
+-- Load initial address of Read010_AddrPage (#3200) => Reg2
+ 06         : 0001000000000000; -- NOP
+ 07         : 1001010000000000; -- Load16:(Ddst=Reg2)              \ InitAddr of
+ 08         : 0000110010000000; --#(3072+  0+128)            \      >"Read000_AddrPage" =>
+            --  ^^^^^^ "CommdLst010_offset" + AddrPage_offset/     /   => Reg2
+ 09         : 0100000000010001; -- Jump:(to @#17 - subroutine "Processing of Command_Sequence")
+
+--******** Initialize the "CommdLst_Rd100" Operation ********
+--  ( Reg1 not used yet )
+-- Load initial address of Read100_AddrPage (#3328) => Reg2
+ 10         : 0001000000000000; -- NOP
+ 11         : 1001010000000000; -- Load16:(Ddst=Reg2)              \ InitAddr of
+ 12         : 0000110100000000; --#(3072+  0+256)            \      >"Read100_AddrPage" =>
+            --  ^^^^^^ "CommdLst100_offset" + AddrPage_offset/     /   => Reg2
+ 13         : 0100000000010001; -- Jump:(to @#17 - subroutine "Processing of Command_Sequence")
+
+--******** Initialize the "CommdLst_Rd110" Operation ********
+--  ( Reg1 not used yet )
+-- Load initial address of Read110_AddrPage (#3456) => Reg2
+ 14         : 0001000000000000; -- NOP
+ 15         : 1001010000000000; -- Load16:(Ddst=Reg2)              \ InitAddr of
+ 16         : 0000110110000000; --#(3072+  0+384)            \      >"Read110_AddrPage" =>
+            --  ^^^^^^ "CommdLst110_offset" + AddrPage_offset/     /   => Reg2
+-- 17         : 0100000000010001; -- Jump:(to @#17 - subroutine "Processing of Command_Sequence")
+-- No need to jump^^^^ - just go on (to @#17 - "Treatment of Command_Sequence" subroutine)
+
+
+--************  Processing of the Command_Sequence:               ************
+--************    Copy "InData" to MainRAM, ignore 8 DataWords    ************
+-- NOW: initial_addr of AddrPage of CommdLst*** is in Reg2  - keep the Reg2 contents!! - it points to selected CommdList
+
+  -- Read "InData" from Link
+ 17         : 0001000000000000; -- NOP
+ 18         : 1001001000000000; -- Load16:(Ddst=Reg1)              \ Addr of   
+ 19         : 0000100000100000; --   #2080   \ Addrress of          >InData_Port =>
+            --  ^^^^^^^^ "Link_IFace_offset" / Link's InData_Port  /   => Reg1
+ 20         : 0111000100000000; -- Wait:( for_Int1),  Wait for IORq from Link
+ 21         : 1100011001000000; -- Read:(Ddst=Reg3 A=Reg1)  "InData"   => Reg3
+  -- Store "InData" in MainRAM
+ 22         : 1001100000000000; -- Load16:(Ddst=Reg4)              \ Addr of "InData"
+ 23         : 0000001100000000; --    #768   \ Address of "InData"  >in MainRAM =>
+            --  ^^^^^^^^ "MainRAM_offset"    / in_MainRAM          /   => Reg4
+ 24         : 1101011100000000; --Write:(Dsrc=Reg3 A=Reg4)    "InData" => MainRAM
+ 25         : 0001000000000000; -- NOP
+
+  -- Prepare the address of Link's DataPort
+ 26         : 0010001000000000; -- Incr:(     Reg1)   Now Reg1 = Addr_of_Link's_Data_port
+
+--Prepare Loop:  Read 8 DataWords from Link, and do nothing with them
+ 27         : 1000111000001000; -- Load:(Ddst=PassCt)               #8 => PassCt
+    --Loop: Read one Data_Word, and do nothing with it
+ 28         : 0001000000000000; -- NOP
+ 29         : 0111000100000000; -- Wait:( for_Int1),    Wait for IORq from Link
+ 30         : 1100011001000000; -- Read:(Ddst=Reg3 A=Reg1)  Link's_Data => Reg3
+ 31         : 0110000000011100; -- EndLoop:(return to @#28)
+
+--****************************************************************************
+--IF came from "CommdLst_Rd***" Operation:
+--  read 62 DataWords from 62 "Addresses" listed in AddrPage of the CommdList,
+--  and supply them to Link for the ReplySequence, and copy them to MainRAM.
+--Prepare Loop:  Transfer 62 DataWords (according to CommandList) to Link
+ 32         : 0001000000000000; -- NOP
+ 33         : 1000111000111110; -- Load:(Ddst=PassCt)            #62 => PassCt
+    
+--****************************************************************************
+--IF came from "Read" Operation:
+--  read N="InData" DataWords from N "Addresses" stored in @[769..(768+N)] 
+--  and supply them to Link for the ReplySequence, and copy them to MainRAM.
+
+--******** Processing of the Reply_Sequence
+  -- Prepare the initial_addr of MainRAM'region to copy DataWords sent to Link
+ 34         : 1001100000000000; -- Load16:(Ddst=Reg4)              \ InitAddr of region
+ 35         : 0000001100100000; --    #800   \ InitAddr of region   >in MainRAM =>
+            --  ^^^^^^^^ InitAddr in MainRAM / for copying DWords  /   => Reg4
+    
+--NOW: Initial_addr of Addresses list      is in Reg2
+--  Address of Link's DataPort             is in Reg1
+--  Initial_addr of MainRAM'region to copy the sent DataWords is in Reg4
+--  Number N=62/N="InData" of DWords to read and send is loaded into PassCt (and is stored in @#768).
+
+    --Loop:     @Reg2 =>  Reg3  - current Addr => Reg3
+    --          @Reg3 =>  Reg3  - addressed Data => Reg3
+    --          Wait(for IORq from Link)
+    --           Reg3 => @Reg1  - Data => Link's_DataPort
+    --           Reg3 => @Reg4  - Data => MainRAM
+    --       Incr( Reg2),  Incr( Reg4)
+ 36         : 0001000000000000; -- NOP,  Beg_of_Loop
+ 37         : 1100011010000000; -- Read:(Ddst=Reg3 A=Reg2)      Addr => Reg3
+ 38         : 1100011011000000; -- Read:(Ddst=Reg3 A=Reg3)      Data => Reg3
+ 39         : 0001000000000000; -- NOP
+ 40         : 0111000100000000; -- Wait:( for_Int1),    Wait for IORq from Link
+ 41         : 1101011001000000; --Write:(Dsrc=Reg3 A=Reg1)      Data => Link's_DataPort
+ 42         : 1101011100000000; --Write:(Dsrc=Reg3 A=Reg4)      Data => MainRAM
+ 43         : 0010010000000000; -- Incr:(     Reg2)
+ 44         : 0010100000000000; -- Incr:(     Reg4)
+ 45         : 0110000000100100; -- EndLoop:(return to @#36)
+
+ 46         : 0001000000000000; -- NOP
+ 47         : 1111000000000000; -- ENDofProg
+ 48         : 1111000000000000; -- ENDofProg
+ 49         : 0001000000000000; -- NOP
+
+
+--============================================================================
+--********  Program: "Read" Operation -                       ****************
+--********  read up to 8 words from arbitrary addresses       ****************                    ******
+--  1. During  Command_Sequence:  Store "InData", Data1..Data8 in MainRAM
+--  2. During  Reply_Sequence:    
+--      Read Data1..Data8 from MainRAM and use them as Addresses, read data
+--         from  addressed Object(s)
+--      Supply each DataWord to Link, by Link's request
+
+ 50         : 0001000000000000; -- NOP; BEGINNING of Prog
+    -- Read "InData" from Link
+ 51         : 1001001000000000; -- Load16:(Ddst=Reg1)              \ Addr of   
+ 52         : 0000100000100000; --   #2080   \ Addrress of          >InData_Port =>
+            --  ^^^^^^^^ "Link_IFace_offset" / Link's InData_Port  /   => Reg1
+ 53         : 0111000100000000; -- Wait:( for_Int1),  Wait for IORq from Link
+ 54         : 1100010001000000; -- Read:(Ddst=Reg2 A=Reg1)    "InData" => Reg2
+    -- Write "InData" into MainRAM
+ 55         : 1001100000000000; -- Load16:(Ddst=Reg4)              \ Addr of "InData"
+ 56         : 0000001100000000; --    #768   \ Address of "InData"  >in MainRAM =>
+            --  ^^^^^^^^ "MainRAM_offset"    / in_MainRAM          /   => Reg4
+ 57         : 1101010100000000; --Write:(Dsrc=Reg2 A=Reg4)    "InData" => MainRAM, @#768
+
+ 58         : 0010001000000000; -- Incr:(     Reg1)   Now Reg1 = Addr_of_Link's_Data_port
+    --Now: Addr of Link's DataPort remains in Reg1
+    --     Addr=#768 beyond which the "Address" words are to be stored is in Reg4
+
+--Prepare Loop:  Read 8 "Address" words from DWord fields of the Command Sequence,
+--  and copy them to consecutive cells of MainRAM @(#768+i), thus making an "AddrPage";
+--  Here ALL 8 DWord fields must be read out, regardless of N="InData" !
+ 59         : 1000111000001000; -- Load:(Ddst=PassCt)               #8 => PassCt
+    --Loop:  Wait(for_Int1) - wait for IRQ from Link
+    --      @Reg1 =>  Reg3  - Link's Data => Reg3
+    --       Incr( Reg4)    - Addr = #(768+i)
+    --       Reg3 => @Reg4  - write current Data_Word to MainRAM
+ 60         : 0001000000000000; -- NOP, Beg_of_Loop
+ 61         : 0111000100000000; -- Wait:( for_Int1),    Wait for IORq from Link
+ 62         : 1100011001000000; -- Read:(Ddst=Reg3 A=Reg1)  Link's_Data => Reg3
+ 63         : 0010100000000000; -- Incr:(     Reg4)         Reg4 = #(768+i)
+ 64         : 1101011100000000; --Write:(Dsrc=Reg3 A=Reg4)  curr.Addr => MainRAM
+ 65         : 0110000000111100; -- EndLoop:(return to @#60)
+
+-- Prepare for reading out N="InData" DataWords by N Addresses stored in MainRam
+ 66         : 1001010000000000; -- Load16:(Ddst=Reg2)              \ Addr of "InData"
+ 67         : 0000001100000000; --    #768   \ Address of "InData"  >in MainRAM =>
+            --  ^^^^^^^^ "MainRAM_offset"    / in_MainRAM          /   => Reg2
+ 68         : 1100111010000000; -- Read:(Ddst=PassCt A=Reg2)  "InData" => PassCt
+ 69         : 0010010000000000; -- Incr:(     Reg2)         Reg2 = #769
+
+
+    --Now: Addr of Link's DataPort remains in Reg1
+    --     initial_addr of Addresses list is in Reg2
+    --     Number N="InData" is loaded into PassCt (and is stored in @#768). 
+ 70         : 0100000000100010; -- Jump:(to @#34 - subroutine "Processing of the ReplySequence")
+ 71         : 0000000000000000; -- Halt
+
+
+--============================================================================
+--******** Program: "CommdLst_Wr***" Operations -                 ************
+--********   Write data to Object(s) according to CommdLst*** (AddrPage & DataPage)
+--  1. Initialize: 
+--       set the initial_addr of AddrPage of the correspondent CommdList
+--       set the initial_addr of DataPage of the correspondent CommdList
+--  2. During  Command_Sequence:  Store "InData" in MainRAM
+--  3. During  Reply_Sequence:    
+--      Get Addresses from the AddrPage of the selected CommdList
+--      Get Data      from the DataPage of the selected CommdList
+--      Write picked Data to Addressed Object(s)
+--      Supply each DataWord to Link, by Link's request
+
+--******** Initialize the "CommdLst_Wr001" Operation ********
+-- Load initial address of Wr001_AddrPage (#3136) => Reg2
+-- Load initial address of Wr001_DataPage (#3648) => Reg1
+ 72         : 0001000000000000; -- NOP
+ 73         : 1001010000000000; -- Load16:(Ddst=Reg2)              \ InitAddr of
+ 74         : 0000110001000000; --#(3072+  0+ 64)            \      >"Wr001_AddrPage" =>
+            --  ^^^^^^ "CommdLst001_offset" + AddrPage_offset/     /   => Reg2
+ 75         : 1001001000000000; -- Load16:(Ddst=Reg1)              \ InitAddr of
+ 76         : 0000111001000000; --#(3072+512+ 64)            \      >"Wr001_DataPage" =>
+            --  ^^^^^^ "CommdLst001_offset" + DataPage_offset/     /   => Reg1
+ 77         : 0100000001100000; -- Jump:(to @#96 - "Processing of CommandSequence" subroutine)
+
+--******** Initialize the "CommdLst_Wr011" Operation ********
+-- Load initial address of Wr011_DataPage (#3776) => Reg1
+-- Load initial address of Wr011_AddrPage (#3264) => Reg2
+ 78         : 0001000000000000; -- NOP
+ 79         : 1001010000000000; -- Load16:(Ddst=Reg2)              \ InitAddr of
+ 80         : 0000110011000000; --#(3072+  0+192)            \      >"Wr011_AddrPage" =>
+            --  ^^^^^^ "CommdLst011_offset" + AddrPage_offset/     /   => Reg2
+ 81         : 1001001000000000; -- Load16:(Ddst=Reg1)              \ InitAddr of
+ 82         : 0000111011000000; --#(3072+512+192)            \      >"Wr011_DataPage" =>
+            --  ^^^^^^ "CommdLst011_offset" + DataPage_offset/     /   => Reg1
+ 83         : 0100000001100000; -- Jump:(to @#96 - "Processing of CommandSequence" subroutine)
+
+--******** Initialize the "CommdLst_Wr101" Operation ********
+-- Load initial address of Wr101_DataPage (#3904) => Reg1
+-- Load initial address of Wr101_AddrPage (#3392) => Reg2
+ 84         : 0001000000000000; -- NOP
+ 85         : 1001010000000000; -- Load16:(Ddst=Reg2)              \ InitAddr of
+ 86         : 0000110101000000; --#(3072+  0+320)            \      >"Wr101_AddrPage" =>
+            --  ^^^^^^ "CommdLst101_offset" + AddrPage_offset/     /   => Reg2
+ 87         : 1001001000000000; -- Load16:(Ddst=Reg1)              \ InitAddr of
+ 88         : 0000111101000000; --#(3072+512+320)            \      >"Wr101_DataPage" =>
+            --  ^^^^^^ "CommdLst101_offset" + DataPage_offset/     /   => Reg1
+ 89         : 0100000001100000; -- Jump:(to @#96 - "Processing of CommandSequence" subroutine)
+
+--******** Initialize the "CommdLst_Wr111" Operation ********
+-- Load initial address of Wr001_DataPage (#4032) => Reg1
+-- Load initial address of Wr001_AddrPage (#3520) => Reg2
+ 90         : 0001000000000000; -- NOP
+ 91         : 1001010000000000; -- Load16:(Ddst=Reg2)              \ InitAddr of
+ 92         : 0000110111000000; --#(3072+  0+448)            \      >"Wr111_AddrPage" =>
+            --  ^^^^^^ "CommdLst111_offset" + AddrPage_offset/     /   => Reg2
+ 93         : 1001001000000000; -- Load16:(Ddst=Reg1)              \ InitAddr of
+ 94         : 0000111111000000; --#(3072+512+448)            \      >"Wr111_DataPage" =>
+            --  ^^^^^^ "CommdLst111_offset" + DataPage_offset/     /   => Reg1
+ 95         : 0001000000000000; -- No need to jump - just go on (to @#96 - "Processing of CommandSequence" subroutine)
+
+--************  Processing of the Command_Sequence:               ************
+--************    Copy "InData" to MainRAM, ignore 8 DataWords    ************
+-- NOW: initial addr of DataPage of CommdLst is in Reg1  - keep the Reg1 contents!!
+-- NOW: initial addr of AddrPage of CommdLst is in Reg2  - keep the Reg2 contents!!
+
+    -- Read "InData" from Link
+ 96         : 0001000000000000; -- NOP
+ 97         : 1001100000000000; -- Load16:(Ddst=Reg4)              \ Addr of   
+ 98         : 0000100000100000; --   #2080   \ Addrress of          >InData_Port =>
+            --  ^^^^^^^^ "Link_IFace_offset" / Link's InData_Port  /   => Reg4
+ 99         : 0111000100000000; -- Wait:( for_Int1),  Wait for IORq from Link
+100         : 1100011100000000; -- Read:(Ddst=Reg3 A=Reg4)  "InData"   => Reg3
+    -- Store "InData" in MainRAM
+101         : 1001100000000000; -- Load16:(Ddst=Reg4)              \ Addr of "InData"
+102         : 0000001100000000; --    #768   \ Address of "InData"  >in MainRAM =>
+            --  ^^^^^^^^ "MainRAM_offset"    / in_MainRAM          /   => Reg4
+103         : 1101011100000000; --Write:(Dsrc=Reg3 A=Reg4)    "InData" => MainRAM
+    
+104         : 0001000000000000; -- NOP
+--Prepare Loop: Read 8 DataWords from Link, and do nothing with them
+105         : 1000111000001000; -- Load:(Ddst=PassCt)             #8 => PassCt
+    -- Now: Read  one Data_Word, and do nothing with it
+106         : 0001000000000000; -- NOP
+107         : 0111000100000000; -- Wait:( for_Int1),    Wait for IORq from Link
+108         : 1100011100000000; -- Read:(Ddst=Reg3 A=Reg4)  Link's_Data => Reg3
+109         : 0110000001101010; -- EndLoop:(return to @#106)
+
+--****************************************************************************
+--IF came from "CommdLst_Wr***" Operation:
+--  copy 62 DataWords from DataPage of the CommdLst*** ..
+--  ..to 62 correspondent Addresses listed in AddrPage of this CommdLst***,
+--  (62 DWords because just 62 IORq's will be issued by Link)
+--Impossible - NOT enough Reg-s! --  and supply all DWords to Link for the Reply_Sequence.
+
+--Prepare Loop:  Transfer 62 DataWords (according to CommandList) to Link
+110         : 0001000000000000; -- NOP
+111         : 1000111000111110; -- Load:(Ddst=PassCt)            #62 => PassCt
+    
+--****************************************************************************
+--IF came from "Write" Operation:
+--  copy N="InData" DataWords from "DataPage" (made at @[773..776] of MainRAM)
+--  ..to N correspondent "Addresses" listed in "AddrPage" (made at @[769..773] of MainRAM),
+--Impossible - NOT enough Reg-s! --  and supply N DWords to Link for the Reply_Sequence.
+
+--******** Processing of the Reply_Sequence :
+--******** Copy data from CommdLst to real Object(s) *********************
+--NOW:  Initial_addr of Addresses list  is in Reg2
+--      Initial_addr of_DataWords list  is in Reg1
+--      Number of passes is loaded into PassCt (and is stored in @#768). 
+    --Loop:   @Reg2 => Reg4   - current Addr => Reg4
+    --        @Reg1 => Reg3   - current Data => Reg3
+    --         Reg3 => @Reg4  - write Data to Addr
+    --         Incr( Reg1),  Incr( Reg2)
+112         : 0001000000000000; -- NOP,  Beg_of_Loop
+113         : 1100100010000000; -- Read:(Ddst=Reg4 A=Reg2)      Addr => Reg4
+114         : 1100011001000000; -- Read:(Ddst=Reg3 A=Reg1)      Data => Reg3
+115         : 1101011100000000; --Write:(Dsrc=Reg3 A=Reg4)      Data => Object
+116         : 1001100000000000; -- Load16:(Ddst=Reg4)              \ Addr of   
+117         : 0000100000100001; --   #2081   \ Addrress of          >  Data_Port =>
+            --  ^^^^^^^^ "Link_IFace_offset" / Link's Data_Port    /   => Reg4
+118         : 0111000100000000; -- Wait:( for_Int1),    Wait for IORq from Link
+119         : 1101011100000000; --Write:(Dsrc=Reg3 A=Reg4)      Data => Data_Port
+120         : 0010001000000000; -- Incr:(     Reg1)
+121         : 0010010000000000; -- Incr:(     Reg2)
+122         : 0110000001110000; -- EndLoop:(return to @#112)
+
+123         : 0001000000000000; -- NOP
+124         : 1111000000000000; -- ENDofProg
+125         : 1111000000000000; -- ENDofProg
+
+
+--============================================================================
+--********  Program: "Write" Operation - write up to 4 words to Object(s)  ***
+--  "InData" contains the number N of pairs (Addr-Data) to be processed ;
+--  8 DataWords contain: (Addr1-Data1), [(A2-D2), (A3-D3), (A4-D4)] .
+--      Action :    D1=>@#A1,  [ D2->@#A2, D3->@#A3, D4->@#A4 ]. 
+
+126         : 0001000000000000; -- NOP; BEGINNING of Prog
+    -- Read "InData" from Link
+127         : 1001100000000000; -- Load16:(Ddst=Reg4)              \ Addr of   
+128         : 0000100000100000; --   #2080   \ Addrress of          >InData_Port =>
+            --  ^^^^^^^^ "Link_IFace_offset" / Link's InData_Port  /   => Reg4
+129         : 0111000100000000; -- Wait:( for_Int1),  Wait for IORq from Link
+130         : 1100011100000000; -- Read:(Ddst=Reg3 A=Reg4)  "InData"   => Reg3
+    -- Write "InData" into MainRAM
+131         : 1001010000000000; -- Load16:(Ddst=Reg2)              \ Addr of "InData"
+132         : 0000001100000000; --    #768   \ Address of "InData"  >in MainRAM =>
+            --  ^^^^^^^^ "MainRAM_offset"    / in_MainRAM          /   => Reg2
+133         : 1101011010000000; --Write:(Dsrc=Reg3 A=Reg2)    "InData" => MainRAM, @#768
+
+--Prepare addresses for making an "AddrPage" and "DataPage" in MainRAM :
+134         : 0010100000000000; -- Incr:(     Reg4)   Now Reg4 = #2081(Addr of Data_Port)
+--  AddrPage will be created @[769..772], DataPage will be created @[773..776]
+135         : 0010010000000000; -- Incr:(     Reg2)   Now Reg2 = #769
+136         : 1001001000000000; -- Load16:(Ddst=Reg1)              \ InitAddr of region
+137         : 0000001100000101; --    #773   \ InitAddr of region   >in MainRAM =>
+            --  ^^^^^^^^ "MainRAM_offset"+5  /for making "DataPage"/   => Reg1
+138         : 0001000000000000; -- NOP
+
+--Now:  Addr of Link'_Data_Port       is in Reg4
+--      Initial_addr of the "AddrPage" to be created in this Link_Oper-n is in Reg2
+--      Initial_addr of the "DataPage" to be created in this Link_Oper-n is in Reg1
+--      Number N="InData" is stored in @#768. 
+
+--Prepare Loop: Read 4 pairs (Addr,Data) from DWord fields of the Command Sequence, and copy them ..
+--  to consecutive cells of "AddrPage" @#(768+i) and "DataPage" @#(773+i), respectively
+139         : 1000111000000100; -- Load:(Ddst=PassCt)             #4 => PassCt
+    --Loop:  Wait(for_Int1) - wait for IRQ from Link
+    --      @Reg4 =>  Reg3  - current Addr => Reg3
+    --       Reg3 => @Reg2  - write current Addr to "AddrPage" in MainRAM, @#(768+i)
+    --       Incr( Reg2)
+    --       Wait(for_Int1) - wait for IRQ from Link
+    --      @Reg4 =>  Reg3  - current Data => Reg2
+    --       Reg3 => @Reg1  - write current Data to "DataPage" in MainRAM, @#(773+i)
+    --      -- Incr( Reg1)
+140         : 0001000000000000; -- NOP, Beg_of_Loop
+141         : 0111000100000000; -- Wait:( for_Int1),    Wait for IORq from Link
+142         : 1100011100000000; -- Read:(Ddst=Reg3 A=Reg4)  Link's_Data => Reg3
+143         : 1101011010000000; --Write:(Dsrc=Reg3 A=Reg2)  curr."Addr" => "AddrPage" @#(768+i)
+144         : 0010010000000000; -- Incr:(     Reg2)
+
+145         : 0111000100000000; -- Wait:( for_Int1),    Wait for IORq from Link
+146         : 1100011100000000; -- Read:(Ddst=Reg3 A=Reg4)  Link's_Data => Reg3
+147         : 1101011001000000; --Write:(Dsrc=Reg3 A=Reg1)  curr."Data" => "DataPage" @#(773+i)
+148         : 0010001000000000; -- Incr:(     Reg1)
+149         : 0110000010001100; -- EndLoop:(return to @#140)
+
+-- Prepare for reading out N="InData" DataWords by N Addresses stored in MainRam
+150         : 1001010000000000; -- Load16:(Ddst=Reg2)              \ Addr of "InData"
+151         : 0000001100000000; --    #768   \ Address of "InData"  >in MainRAM =>
+            --  ^^^^^^^^ "MainRAM_offset"    / in_MainRAM          /   => Reg2
+152         : 1100111010000000; -- Read:(Ddst=PassCt A=Reg2)  "InData" => PassCt
+153         : 0010010000000000; -- Incr:(     Reg2)         Reg2 = #769
+154         : 1001001000000000; -- Load16:(Ddst=Reg1)              \ InitAddr of region
+155         : 0000001100000101; --    #773   \ InitAddr of region   >in MainRAM =>
+            --  ^^^^^^^^ "MainRAM_offset"+5  /for making "DataPage"/   => Reg1
+
+--Now:  (Will not be used) Addr of Link'_Data_Port  remains in Reg4
+--      Initial_addr of the "AddrPage" created in this Link_Oper-n is in Reg2
+--      Initial_addr of the "DataPage" created in this Link_Oper-n is in Reg1
+--      Number N="InData"  is loaded into PassCt (and is stored in @#768). 
+156         : 0100000001110000; -- Jump:(to @#112 - subroutine "Processing of the Reply_Sequence")
+157         : 0000000000000000; -- Halt
+
+
+--============================================================================
+--********  Program: "Read62" Operation -                     ****************
+--********  read 62 words from consecutive addresses,         ****************                    ******
+--********      starting_addr = #InData, ending_addr =(#InData+61)    ********
+--  1. During  Command_Sequence:  Store "InData" in MainRAM, 
+--      and use #InData as the initial_addr of the data to be readout
+--  2. During  Reply_Sequence:    
+--      Get Data from  addressed Object(s)
+--      Supply each DataWord to Link, by Link's request
+
+158         : 0001000000000000; -- NOP; BEGINNING of Prog
+    -- Read "InData" from Link
+159         : 1001001000000000; -- Load16:(Ddst=Reg1)              \ Addr of   
+160         : 0000100000100000; --   #2080   \ Addrress of          >InData_Port =>
+            --  ^^^^^^^^ "Link_IFace_offset" / Link's InData_Port  /   => Reg1
+161         : 0111000100000000; -- Wait:( for_Int1),  Wait for IORq from Link
+162         : 1100010001000000; -- Read:(Ddst=Reg2 A=Reg1)  "InData"   => Reg2
+    -- Store "InData" in MainRAM
+163         : 1001100000000000; -- Load16:(Ddst=Reg4)              \ Addr of "InData"
+164         : 0000001100000000; --    #768   \ Address of "InData"  >in MainRAM =>
+            --  ^^^^^^^^ "MainRAM_offset"    / in_MainRAM          /   => Reg4
+165         : 1101010100000000; --Write:(Dsrc=Reg2 A=Reg4)    "InData" => MainRAM
+    
+166         : 0010001000000000; -- Incr:(     Reg1)   Now Reg1 = Addr_of_Link's_Data_port
+
+--Prepare Loop: Read 8 DataWords from Link, and do nothing with them
+167         : 1000111000001000; -- Load:(Ddst=PassCt)             #8 => PassCt
+    -- Loop: Read  one Data_Word, and do nothing with it
+168         : 0001000000000000; -- NOP, Beg_of_Loop
+169         : 0111000100000000; -- Wait:( for_Int1),    Wait for IORq from Link
+170         : 1100011001000000; -- Read:(Ddst=Reg3 A=Reg1)  Link's_Data => Reg3
+171         : 0110000010101000; -- EndLoop:(return to @#168)
+
+    -- Prepare for reading out 62 DataWords 
+172         : 1000111000111110; -- Load:(Ddst=PassCt)            #62 => PassCt
+173         : 0100000011000000; -- Jump:( to @#192 - Read62/Write8 "Reply" subroutine)
+    --Now: Addr of Link's DataPort remains in Reg1
+    --     "InData" word is in Reg2
+    --     Address of "InData"'s position in MainRAM is in Reg4
+
+--172         : 0000000000000000; -- Halt
+--173         : 0000000000000000; -- Halt
+
+
+--============================================================================
+--********  Program: "Write8" Operation - write 8 words to Object(s)  ********
+--**** Get 8 words from Link and write them to 8 consequtive addresses:   ****
+--          starting_addr = #InData,  ending_addr =(#InData + 7)
+
+174         : 0001000000000000; -- NOP; BEGINNING of Prog
+    -- Read "InData" from Link
+175         : 1001001000000000; -- Load16:(Ddst=Reg1)              \ Addr of   
+176         : 0000100000100000; --   #2080   \ Addrress of          >InData_Port =>
+            --  ^^^^^^^^ "Link_IFace_offset" / Link's InData_Port  /   => Reg1
+177         : 0111000100000000; -- Wait:( for_Int1),  Wait for IORq from Link
+178         : 1100010001000000; -- Read:(Ddst=Reg2 A=Reg1)    "InData" => Reg2
+    -- Write "InData" into MainRAM
+179         : 1001100000000000; -- Load16:(Ddst=Reg4)              \ Addr of "InData"
+180         : 0000001100000000; --    #768   \ Address of "InData"  >in MainRAM =>
+            --  ^^^^^^^^ "MainRAM_offset"    / in_MainRAM          /   => Reg4
+181         : 1101010100000000; --Write:(Dsrc=Reg2 A=Reg4)    "InData" => MainRAM
+
+182         : 0010001000000000; -- Incr:(     Reg1)   Now Reg1 = Addr_of_Link's_Data_port
+
+--Loop: Read 8 DataWords from Link and store them consequtively, @( #InData+i )
+183         : 1000111000001000; -- Load:(Ddst=PassCt)             #8 => PassCt
+    -- Now: Read  one Data_Word, and Write it to @#current_Addr
+184         : 0001000000000000; -- NOP, Beg_of_Loop
+185         : 0111000100000000; -- Wait:( for_Int1),    Wait for IORq from Link
+186         : 1100011001000000; -- Read:(Ddst=Reg3 A=Reg1)  Link's_Data => Reg3
+187         : 1101011010000000; --Write:(Dsrc=Reg3 A=Reg2)      Data => @#current_Addr
+188         : 0010010000000000; -- Incr:(     Reg2)
+189         : 0110000010111000; -- EndLoop:(return to @#184)
+190         : 0001000000000000; -- NOP
+    -- Prepare for reading out 8 DataWords just written into Object(s)
+191         : 1000111000001000; -- Load:(Ddst=PassCt)             #8 => PassCt
+
+    --Now: Addr of Link's DataPort remains in Reg1
+    --     Address of "InData"'s position in MainRAM is in Reg4
+
+
+--************ Continuation of Rd62/Wr8 Operations' Program - ****************
+--************     Supply data to Link for the Reply_Sequence ****************
+-- Addr of Link's DataPort remains in Reg1
+-- Address of "InData"'s position in MainRAM remains in Reg4
+-- The PassCt has already been loaded with the relevant number (#62 or #8)
+
+192         : 1100010100000000; -- Read:(Ddst=Reg2 A=Reg4)  "InData" => Reg2
+193         : 0010100000000000; -- Incr:(     Reg4)
+    --Now: Addr of Link's DataPort remains in Reg1
+    --     Addr of the 1st DataWord to be readout in this Link_Oper-n is in Reg2
+    --     Addr to which the 1st DataWord of the ReplySequence must be copied is in Reg4
+
+--The PassCt has already been loaded with the relevant number (#62 or #8)
+--Loop: read 62/8 DataWords from consecutive addresses, starting_addr = #InData,
+--  and supply them to Link upon requests, and copy them to MainRAM
+    --Loop:     @Reg2 =>  Reg3  - Data@curr.Addr => Reg3
+    --          Wait(for IORq from Link)
+    --           Reg3 => @Reg1  - Data => Link's_DataPort
+    --           Reg3 => @Reg4  - Data => MainRAM
+    --       Incr( Reg2),  Incr( Reg4)
+    --   when Link request data, supply this DataWord to Link 
+194         : 0001000000000000; -- NOP,  Beg_of_Loop
+195         : 1100011010000000; -- Read:(Ddst=Reg3 A=Reg2)      Data => Reg3
+196         : 0111000100000000; -- Wait:( for_Int1),    Wait for IORq from Link
+197         : 1101011001000000; --Write:(Dsrc=Reg3 A=Reg1)      Reg3 => Link's_DataPort
+--197         : 0001000000000000; -- NOP
+198         : 1101011100000000; --Write:(Dsrc=Reg3 A=Reg4)      Reg3 => MainRAM
+199         : 0010010000000000; -- Incr:(     Reg2)
+200         : 0010100000000000; -- Incr:(     Reg4)
+201         : 0110000011000010; -- EndLoop:(return to @#194)
+
+202         : 1111000000000000; -- ENDofProg
+203         : 1111000000000000; -- ENDofProg
+
+
+--============================================================================
+--********  Program: "Rd_SelCommdLst" Operation -                 ************
+--********   read data from Object(s) according to CommdList_SELECTED_by_InData
+--  1. During  Command_Sequence:  Store "InData" in MainRAM, 
+--      and use InData as the initial_addr of AddrPage of the CommdList
+--  2. During  Reply_Sequence:    
+--      Get Addresses from AddrPage of the selected CommdLst
+--      Get Data from  addressed Object(s)
+--      Supply each DataWord to Link, by Link's request
+
+    -- Read "InData" from Link, and store it in Reg2 for use later
+204         : 0001000000000000; -- NOP
+205         : 1001001000000000; -- Load16:(Ddst=Reg1)              \ Addr of   
+206         : 0000100000100000; --   #2080   \ Addrress of          >InData_Port =>
+            --  ^^^^^^^^ "Link_IFace_offset" / Link's InData_Port  /   => Reg1
+207         : 0111000100000000; -- Wait:( for_Int1),  Wait for IORq from Link
+208         : 1100010001000000; -- Read:(Ddst=Reg2 A=Reg1)    "InData" => Reg2
+209         : 1100011001000000; -- Read:(Ddst=Reg3 A=Reg1)    "InData" => Reg3
+210         : 0100000000010110; -- Jump:(to @#22 - subroutine "Store InData in MainRAM")
+211         : 0001000000000000; -- NOP
+
+--============================================================================
+--********  Program: "Wr_SelCommdLst" Operation -                 ************
+--********   write data to Object(s) according to CommdList_SELECTED_by_InData
+--  1. During  Command_Sequence:  Store "InData" in MainRAM, and use :
+--      (InData+512) as the initial_addr of DataPage of the CommdList
+--       InData      as the initial_addr of AddrPage of the CommdList
+--  2. During  Reply_Sequence:    
+--      Get Addresses from AddrPage of the selected CommdLst
+--      Get Data      from DataPage of the selected CommdLst
+--      Write each DataWord to correspondent Address 
+--      [? Supply each DataWord to Link, by Link's request ]
+
+    -- Read "InData" from Link, and store it in Reg2 for use later
+212         : 0001000000000000; -- NOP
+213         : 1001001000000000; -- Load16:(Ddst=Reg1)              \ Addr of   
+214         : 0000100000100000; --   #2080   \ Addrress of          >InData_Port =>
+            --  ^^^^^^^^ "Link_IFace_offset" / Link's InData_Port  /   => Reg1
+215         : 0111000100000000; -- Wait:( for_Int1),  Wait for IORq from Link
+216         : 1100010001000000; -- Read:(Ddst=Reg2 A=Reg1)    "InData" => Reg2
+    -- Here is a sophisticated Operation:   @Reg1 => Reg1
+217         : 1100001001000000; -- Read:(Ddst=Reg1 A=Reg1)    "InData" => Reg1
+    -- Here must be an Operation:  Reg1 +512 => Reg1 , but for the moment ..
+    --   .. the "Add" operation is not yet implemented
+--218         : ????001000000000; -- Add: (Ddst=Reg1 ?????????? )
+218         : 0100000001111100; -- Jump:(to @#134 - "Loop: Read 8 DataWords from Link, and do nothing with them")
+
+219         : 0001000000000000; -- NOP
+220         : 1111000000000000; -- ENDofProg
+221         : 1111000000000000; -- ENDofProg
+
+[222..229]  : 1111000000000000; -- ENDofProg
+
+--============================================================================
+--************ Test Programs    **********************************************
+230         : 0001000000000000; -- NOP; BEGINNING of Prog
+231         : 0001000000000000; -- NOP
+232         : 1001010000000000; -- Load16:(Ddst=Reg2)
+233         : 0000001111111111; --   #1023                   Reg2 = 1023
+234         : 1100001010000000; -- Read:  Ddst=Reg1 A=Reg2,  @#1023 => Reg1
+235         : 0010001000000000; -- Incr   Reg1
+236         : 0010001000000000; -- Incr   Reg1
+237         : 1101001010000000; -- Write: Dsrc=Reg1 A=Reg2, #(N+2) => @#1023
+238         : 1111000000000000; -- ENDofProg
+239         : 1111000000000000; -- ENDofProg
+
+240         : 0001000000000000; -- NOP; BEGINNING of Prog
+241         : 1001010000000000; -- Load16:(Ddst=Reg2)
+242         : 0000001111111111; --   #1023                   Reg2 = 1023
+243         : 1100001010000000; -- Read:  Ddst=Reg1 A=Reg2,  @#1023 => Reg1
+--Prepare Loop: 
+244         : 0001000000000000; -- NOP
+245         : 1000111000000100; -- Load:(Ddst=PassCt)            #04 => PassCt
+    --Loop: Increment Reg1 2times, write result into @#1023 upon Int4
+246         : 0001000000000000; -- NOP
+247         : 0010001000000000; -- Incr   Reg1
+248         : 0010001000000000; -- Incr   Reg1
+249         : 0111100000000000; -- Wait    until Int4
+250         : 1101001010000000; -- Write: Dsrc=Reg1 A=Reg2, #(N+2) => @#2049
+251         : 0110000011001100; -- EndLoop:(return to @#204)
+252         : 0001000000000000; -- NOP
+253         : 1111000000000000; -- ENDofProg
+254         : 1111000000000000; -- ENDofProg
+
+255         : 0000000000000000; -- Halt 
+
+END;

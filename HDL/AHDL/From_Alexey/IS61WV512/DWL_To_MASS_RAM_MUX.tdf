@@ -1,0 +1,126 @@
+
+
+
+INCLUDE "Edge_Sensing.inc";
+INCLUDE "lpm_counter.inc";
+INCLUDE "lpm_shiftreg.inc";
+
+CONSTANT WORD_WIDTH = 16;
+CONSTANT DWL_NUM = 8; -- число подключаемых DownLink-ов
+CONSTANT DWL_NUM_DATA_READ = DWL_NUM*64;
+
+CONSTANT DWL_MUX_CNT_SIZE = Ceil(log2(DWL_NUM))+1;
+
+SUBDESIGN DWL_To_MASS_RAM_MUX
+(
+	Clock										: input;   -- Clock 100MHz
+	Event	      								: input;
+	Enable										: input;
+	End_Event									: output;
+	
+	DWL_Answer_Found[DWL_NUM-1..0]				: input;
+	DWL_Data_Bus[DWL_NUM-1..0][WORD_WIDTH-1..0]	: input ;
+	DWL_Address_Bus[7..0]						: output;
+	
+	Mass_RAM_Data[WORD_WIDTH-1..0]				: output;
+	Mass_RAM_Addr[WORD_WIDTH-1..0]				: output;
+	Mass_RAM_Data_Ready							: output;	
+	
+)
+
+VARIABLE
+	Prescaler						:	lpm_counter WITH (LPM_WIDTH = 1);
+	Sample_Enable					:	node; -- 50MHz SE
+	
+	BegCycle_ES						:	Edge_Sensing;
+	EndCycle						:	node;
+	Cycle_SRFF						:	SRFF;
+	
+	DWL_Data_Reg[DWL_NUM-1..0]		:	LPM_SHIFTREG WITH (lpm_width = WORD_WIDTH);
+	
+	DWL_AddrCounter					:	lpm_counter  WITH (LPM_WIDTH = WORD_WIDTH); --
+	DWL_MuxCounter					:	lpm_counter  WITH (LPM_WIDTH = DWL_MUX_CNT_SIZE);
+	MASS_RAM_AddrCounter			:	lpm_counter  WITH (LPM_WIDTH = WORD_WIDTH); --
+    
+	Next_DWL_Addr   				:	node;
+	
+	MASS_RAM_WE_Out 						:	DFF;
+    MASS_RAM_Addr_Out[WORD_WIDTH-1..0] 		:	DFF;
+	Mass_RAM_Data_Out[WORD_WIDTH-1..0]		:	DFF;
+	
+	Init_Latch								:	node;
+	Init_Latch_SRFF							:	SRFF;
+	
+	DWL_Answer_Found_SRFF[DWL_NUM-1..0]		: SRFF;
+	
+
+BEGIN
+
+--	Prescaler.(clock,sclr) = (Clock,Sample_Enable OR !Cycle_SRFF.q);
+--	IF(Prescaler.q[] == 1) THEN Sample_Enable = VCC;
+--						   ELSE Sample_Enable = GND;
+--    END IF;
+--    IF Cycle_SRFF.q == VCC THEN Sample_Enable = Enable;
+--						   ELSE Sample_Enable = GND;
+--    END IF;
+	Sample_Enable = Enable;
+	
+	--BegCycle_ES.(d,clk)	= ((Event AND !Cycle_SRFF.q,Clock);
+	BegCycle_ES.(d,clk)	= (((Event OR DFF(.d=Event,.clk=Clock)) AND Sample_Enable) AND !Cycle_SRFF.q,Clock);
+	Cycle_SRFF.(S,clk,R)= (DFF(.d=DFF(.d=DFF(.d=BegCycle_ES.q,.clk=Clock),.clk=Clock),.clk=Clock),Clock,EndCycle AND Sample_Enable);
+	Init_Latch = DFF(.d=BegCycle_ES.q,.clk=Clock);
+	
+	FOR i IN 0 TO DWL_NUM-1 GENERATE
+		DWL_Data_Reg[i].(clock,load) = (Clock,VCC);
+		DWL_Data_Reg[i].enable = Sample_Enable;
+    END GENERATE;
+    
+    FOR i in 0 to DWL_NUM-1 GENERATE
+		  DWL_Answer_Found_SRFF[i].S 	= DWL_Answer_Found[i];
+		  DWL_Answer_Found_SRFF[i].clk 	= Clock;
+		  DWL_Answer_Found_SRFF[i].R 	= EndCycle;
+	END GENERATE;
+    IF((Next_DWL_Addr == GND) AND (Cycle_SRFF.q==VCC)) 
+							THEN 
+								 DWL_Data_Reg[DWL_NUM-1].data[] = GND;
+								 FOR i IN 0 TO DWL_NUM-2 GENERATE
+									 DWL_Data_Reg[i].data[] = DWL_Data_Reg[i+1].q[];
+		 						 END GENERATE;
+							ELSE
+								 FOR i IN 0 TO DWL_NUM-1 GENERATE
+								     IF DWL_Answer_Found_SRFF[i].q == VCC THEN DWL_Data_Reg[i].data[] = DWL_Data_Bus[i][];
+																		  ELSE DWL_Data_Reg[i].data[] = GND;
+								     END IF;
+								 END GENERATE;
+	END IF;
+    
+    DWL_MuxCounter.(clock,clk_en,cnt_en,sclr) = (Clock,(Sample_Enable AND Cycle_SRFF.q) OR BegCycle_ES.q,VCC, EndCycle OR Next_DWL_Addr OR BegCycle_ES.q);
+	IF(DWL_MuxCounter.q[] == DWL_NUM-1)   THEN Next_DWL_Addr = VCC;
+										  ELSE Next_DWL_Addr = GND;
+    END IF;
+    
+	DWL_AddrCounter.(clock,clk_en,cnt_en,sload) = (Clock,(Sample_Enable AND Cycle_SRFF.q) OR BegCycle_ES.q, Next_DWL_Addr, EndCycle OR BegCycle_ES.q);
+	DWL_AddrCounter.data[] = 16; -- смещение для получения пришедших данных по DownLink-у
+	IF((DWL_AddrCounter.q[] >= 78) AND (Next_DWL_Addr == VCC)) THEN EndCycle=VCC; -- адрес последнего слова данных пришедшего пакета
+															   ELSE EndCycle=GND;
+    END IF;
+    
+
+	MASS_RAM_AddrCounter.(clock,clk_en,cnt_en,sclr) = (Clock,(Sample_Enable AND Cycle_SRFF.q) OR BegCycle_ES.q,VCC,EndCycle OR BegCycle_ES.q);
+
+    MASS_RAM_WE_Out.(d,clk) = (((Sample_Enable AND Cycle_SRFF.q) AND !EndCycle) OR Init_Latch, Clock);
+    FOR i in 0 to 15 GENERATE
+		  MASS_RAM_Addr_Out[i].(d,clk)  = (MASS_RAM_AddrCounter.q[i],Clock);
+		  Mass_RAM_Data_Out[i].(d,clk) 	= (DWL_Data_Reg[0].q[i],Clock);
+	END GENERATE;
+
+    DWL_Address_Bus[7..0] 	= DWL_AddrCounter.q[7..0];
+    Mass_RAM_Addr[15..0] 	= MASS_RAM_Addr_Out[15..0].q; 
+    Mass_RAM_Data_Ready 	= MASS_RAM_WE_Out.q;
+    Mass_RAM_Data[15..0] 	= Mass_RAM_Data_Out[15..0].q;
+    
+    
+    Init_Latch_SRFF.(S,clk,R) = (BegCycle_ES.q AND !Cycle_SRFF.q, Clock, Next_DWL_Addr);
+    End_Event = Edge_Sensing(.d=EndCycle,.clk=Clock);
+ 
+END;

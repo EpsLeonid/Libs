@@ -1,0 +1,153 @@
+TITLE "96LC56BT";
+
+INCLUDE "Edge_Sensing.inc";
+INCLUDE "lpm_counter.inc";
+INCLUDE "lpm_shiftreg.inc";
+
+CONSTANT WORD_SIZE            = 16;
+CONSTANT CLOCK_RATE  	      = 100; -- MHz
+CONSTANT EXCHANGE_RATE        = 1; -- Mbit/s
+CONSTANT PRESCALER_VALUE      = CLOCK_RATE DIV EXCHANGE_RATE;
+CONSTANT HALF_PRESCALER_VALUE = FLOOR( PRESCALER_VALUE DIV 2);
+CONSTANT PRESCALER_SIZE  	  = Ceil( LOG2(PRESCALER_VALUE))+1;
+
+CONSTANT CS_SETUP_TIME  	  = 11; -- 100ns if CLOCK_RATE=100MHz
+CONSTANT CS_LOW_TIME  		  = 30; -- 300ns
+
+CONSTANT OP_CODE_WRITE  	  = B"01";
+CONSTANT OP_CODE_READ  	 	  = B"10";
+CONSTANT OP_CODE_ERA_EN	 	  = B"00";
+CONSTANT OP_CODE_ERASE	 	  = B"11";
+
+SUBDESIGN 96LC56BT
+(
+    Clock						: INPUT;
+	OpCode[1..0]                : INPUT;
+	
+	RAM_DO						: INPUT;
+    RAM_Clock					: OUTPUT ;
+    RAM_CS						: OUTPUT ;
+    RAM_DI						: OUTPUT ;
+
+    Address_In[7..0]			: INPUT;
+    Data_In[15..0]				: INPUT;
+    
+    Data_Out[15..0]				: OUTPUT;
+    Data_Out_Ready              : OUTPUT;
+    End_Exchange_Cycle          : OUTPUT;
+    
+    Exchange                    : INPUT;
+    
+    DirectOut                   : OUTPUT;
+    
+    Test                        : OUTPUT; 
+
+)
+
+VARIABLE
+    
+    PRESCALER					: lpm_counter with (lpm_width=PRESCALER_SIZE, lpm_direction="up" );
+    
+    Bit_Counter                 : lpm_counter with (lpm_width=8, lpm_direction="up" );
+    
+    Start_Cycle_ES				: Edge_Sensing;
+    Start_Cycle_SRFF            : SRFF;
+    End_Cycle_RW                : node;
+    End_Cycle_E                 : node;
+    Exchange_Cycle_SRFF			: SRFF;
+    
+    OpCode_Reg 					: LPM_SHIFTREG with (lpm_width=2);
+    Address_In_Reg				: LPM_SHIFTREG with (lpm_width=8);
+    Data_In_Reg					: LPM_SHIFTREG with (lpm_width=WORD_SIZE);
+    Data_Out_Reg				: LPM_SHIFTREG with (lpm_width=WORD_SIZE);
+    
+    RAM_data_In_shifter			: LPM_SHIFTREG with (lpm_width=16,lpm_direction="left"); 
+    RAM_data_Out_shifter		: LPM_SHIFTREG with (lpm_width=27,lpm_direction="left"); 
+    Shifter_Data[26..0]			: node;
+    Latch_Data                  : node;
+    
+    RAMclk                      : node;
+    Sample_ena                  : Edge_Sensing;
+    
+    ChangeDirect                : node;
+    DirectFlag                  : SRFF;
+    
+BEGIN
+
+
+----------------------------------------- Prescaler clock divider ----------------------------------
+    PRESCALER.clock = Clock;
+    
+    PRESCALER.sclr  = (PRESCALER.q[]==PRESCALER_VALUE-1); ---??????????
+    IF PRESCALER.q[] <= (HALF_PRESCALER_VALUE-1)
+	 	THEN RAMclk = GND;
+		ELSE RAMclk = VCC;
+    END IF;		
+
+    Sample_ena.d   = RAMclk;
+    Sample_ena.clk = Clock;
+    
+    RAM_Clock = !DFF(.d=RAMclk,.clk=Clock);
+    
+---------------------------------------------- Начало цикла ------------------------------------------    
+    Start_Cycle_ES.(d,clk)        = (Exchange, Clock);
+    Start_Cycle_SRFF.(S,clk,R)    = (Start_Cycle_ES.q,Clock, End_Cycle_RW OR End_Cycle_E);
+    
+    
+    RAM_CS 						  = Exchange_Cycle_SRFF.q;
+    
+    Exchange_Cycle_SRFF.(S,clk,R) = ((Start_Cycle_SRFF.q AND Sample_ena.q AND !Exchange_Cycle_SRFF.q), Clock, End_Cycle_RW OR End_Cycle_E);
+   
+------------------------------------------ Шифтер для даных с RAM ------------------------------------
+    RAM_data_In_shifter.shiftin 		 = RAM_DO; --RAM_data_Out_shifter.shiftout;
+    RAM_data_In_shifter.(clock, enable)  = (Clock, Sample_ena.q AND Exchange_Cycle_SRFF.q);
+    Data_Out_Reg.data[]					 = RAM_data_In_shifter.q[];
+	
+    Data_Out_Reg.(clock, enable, load)   = (Clock,Sample_ena.q AND Latch_Data,VCC);
+    Data_Out[] = Data_Out_Reg.q[];
+    
+    Bit_Counter.(clock,cnt_en,clk_en,sclr) = (Clock,Exchange_Cycle_SRFF.q,Sample_ena.q,End_Cycle_RW OR End_Cycle_E);
+
+
+------------------------------------------ Шифтер для данных для RAM ------------------------------------
+    RAM_data_Out_shifter.(clock, enable)  = (Clock, (Sample_ena.q AND Exchange_Cycle_SRFF.q) OR (Start_Cycle_SRFF.q AND Sample_ena.q AND !Exchange_Cycle_SRFF.q));
+    RAM_data_Out_shifter.(data[],load)	  = (Shifter_Data[],Start_Cycle_SRFF.q AND Sample_ena.q AND !Exchange_Cycle_SRFF.q);
+    RAM_data_Out_shifter.shiftin 		  = GND;
+    RAM_data_Out_shifter.sclr             = ChangeDirect;
+    
+    RAM_DI = RAM_data_Out_shifter.shiftout;
+------------------------------------------------------------------------------------------------------
+    OpCode_Reg.(data[],clock,enable,load)     = (OpCode[]    , Clock, Start_Cycle_ES.q, VCC);
+    Address_In_Reg.(data[],clock,enable,load) = (Address_In[], Clock, Start_Cycle_ES.q, VCC);
+    Data_In_Reg.(data[],clock,enable,load) 	  = (Data_In[]   , Clock, Start_Cycle_ES.q, VCC);
+
+    Shifter_Data[26] 	 = VCC;                -- стартовый бит
+	Shifter_Data[25..24] = OpCode_Reg.q[];     -- код операции
+	Shifter_Data[23..16] = Address_In_Reg.q[]; -- адрес ячейки
+	Shifter_Data[15..0]  = Data_In_Reg.q[];    -- данные
+	
+	
+	DirectFlag.(R,clk,S) = (ChangeDirect,Clock,End_Cycle_RW OR End_Cycle_E OR Start_Cycle_ES.q);
+    IF((Bit_Counter.q[] == 11) AND (OpCode_Reg.q[] == OP_CODE_READ)) THEN ChangeDirect = VCC;
+ 	                                                                 ELSE ChangeDirect = GND;
+ 	END IF;
+ 	DirectOut = DirectFlag.q;
+ 	
+ 	IF((Bit_Counter.q[] == 11) AND ((OpCode_Reg.q[] == OP_CODE_ERA_EN) OR (OpCode_Reg.q[] == OP_CODE_ERASE))) THEN End_Cycle_E = VCC;
+ 	                                                                                                          ELSE End_Cycle_E = GND;
+ 	END IF;
+ 	
+ 	
+ 	IF(Bit_Counter.q[] == 27) THEN End_Cycle_RW = VCC;
+ 	                          ELSE End_Cycle_RW = GND;
+ 	END IF;
+ 	
+
+    Latch_Data = (Bit_Counter.q[] == 27);
+    Data_Out_Ready = DFF(.d=End_Cycle_RW,.clk=Clock);
+    End_Exchange_Cycle = End_Cycle_RW OR End_Cycle_E;
+    
+    
+    Test = Start_Cycle_SRFF.q;
+    
+END;

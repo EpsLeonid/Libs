@@ -1,0 +1,407 @@
+TITLE "Event_Controller_V3" ;
+
+%
+This is reduced version module to control behavior of FPGA-internal sequence logic. 
+		What is reduced?
+	1. Event Time Command Set inputs. Ver23 re-entrance this functionality
+	2. Klukwa collaborator I/O.
+	3. Fast bypass channel control.
+	4. Asynchronouse Link control.
+New functionality of Dead_Time 
+Wait;Work;Stop_at_Brakes;Work_Again;Dead_Time;
+Control_Reg.q[15]	Select us/ms in simulating generator	
+Control_Reg.q[14..12]	Select source for scope synchro
+Control_Reg.q[4]		CAMAC_Brake_Ena
+Control_Reg.q[3..0]		Select source for Start Event
+%
+
+INCLUDE "lpm_counter.inc"  ;
+INCLUDE "lpm_shiftreg.inc";
+INCLUDE "Edge_Sensing.inc" ;
+INCLUDE "Pulse_Width_Shaper.inc";
+
+CONSTANT WORD_WIDTH				= 16 ; -- 
+-- Parameters to be edited by Module User
+Constant RefClock				= 175 ; -- MHz, Cavity Clock speed
+
+Constant SubEventNumber			=	10; -- Time stemps inside Event, to be edited by Module User
+Constant Event_Duration_Watchdog_Value	 = 10000; -- x1us=10ms to total Event length 
+Constant Slow_Interface_Watchdog_Value	=	5000; -- x1us=5ms to read Event data with CAMAC/USB
+
+
+SUBDESIGN Event_Controller_V3
+(  
+-- Standard Bus Signals
+	Bus_Clock					: input  ; -- частота работы модул€ (25..125ћ√ц). Main clock, assumed F_link x 4 = 100MHz
+	Reset_Ext					: input=gnd ; -- Common FPGA signal Reset (Active HIGH)
+	DataBusIn[WORD_WIDTH-1..0]  : input  ; -- 
+	DataBusOut[WORD_WIDTH-1..0] : output ; -- 
+	DataBusStrobe				: input  ; -- no?ia i?eaia/ia?aaa?e aaiiuo ia?o?o (aunieee o?iaaiu, cauaeeeaaai ii caaiaio o?iioo)
+
+-- Slave Mode Signals	-- eniieucoaony i?e ?aaioa aaiiiai Iiaoey a ?a?eia Slave
+    AddrBusIn[7..0]				: input  ; -- oeia aa?ana aey ainooia a i?ino?ainoai iaiyoe
+	Select						: input  ; -- Module Select from External Address Comparator
+	DirectIn					: input  ; -- iai?aaeaiea ia?aaa?e aaiiuo ia oeio EAIAE
+-- Standard Bus Signals End
+
+
+----------------  Function Specific Signals
+
+	Cavity_Clock				: input ;
+
+	Time_Set_Command[7..0]		: input = GND;	-- Command from Event Manager Typically used in MChS
+	-- Time_Set_Command[0] Modifier for CLBR link's Start
+	-- Time_Set_Command[1] Modifier for Ordinar link's Start
+	-- Time_Set_Command[2] Modifier for CAMAC Brake
+	-- Time_Set_Command[3] Modifier for Klukwa Brake
+	-- Time_Set_Command[4] Modifier for Synchro_0 - synchro output desabled if bit=VCC
+	-- Time_Set_Command[5] Modifier for Synchro_1 - synchro output desabled if bit=VCC
+
+		------------------ Inputs to Initiate Event Flow
+	Internal_Start_request		: Input=GND  ;	-- Input from FPGA-internal devices to start (at positive edge)
+	-- Common sence input to start Event. Should be tied to Event_Manager or Link_Message
+	Comb_FOR					: Input=GND  ;	-- Input from FPGA devices Specific Rasourses (Combinatorial Fast Or Request) 
+	-- Test board at workbench without MChS or imitator -- Assumed resyncronized to Cavity Clock
+	Forward_Panel_In0			: input =GND ;	-- Off-System Inputs -- Assumed resyncronized at input pin DFF
+	Forward_Panel_In1			: input =GND ;
+	-- Back doors for tests only, not to use in new design
+	
+		------------------ Inputs to check Event Flow 
+		--If these inputs is active at end of event, error flag should be activated
+    Busy_on_Link_Active		: Input=GND  ;	-- Possible to check Event Cycle at end of Event flow Link_Message (when falling edge occured)
+	Busy_on_Digitizing		: Input=GND  ;	-- Possible to check Event Cycle at end of Event flow Digitizing (when falling edge occured)
+	Busy_on_Reloading		: Input=GND  ;	-- Possible to check Event Cycle at end of Event flow Status_Change (when falling edge occured)
+	
+		------------------ Inputs to modify Event flow
+	Slow_Interface_is_done			: Input=GND  ;	-- LEVEL, If slow interfaces like CAMAC or USB is enabled, 
+--	EHR cause Event Controller to wait till end of reading (or  Watch DOG). 
+--  To be used for syncronization real-time events with host programm
+--	Slow_Interface_is_Finished	: Input=GND  ;	-- Pulse or level, when readout is done
+	Event_Terminate_Request		: Input=GND  ;	-- PULSE, if ETR is arrived Event flow is interrupted and terminated.
+--	To be used for Secondary Trigger Negative Desicion action
+
+
+		--- Outputs to control Event Working Time Flow
+    Event_is_in_progress	: Output ;    -- Event Working Time in progress, -- Event_Manager locks input 
+	Next_Event_Ena			: Output ;	--	EVM termenates PushEvent signal 
+	Slow_Interface_readout_eligible	: Output ;	-- Slow_Interface is eligible to take readout
+	
+		
+	--- Outputs of sequencer, to control other controllers of board
+	Synchro_0				: output; -- Output to Scope, Forvard Panel 
+	Synchro_1				: output; -- Output to Scope, Forvard Panel or Test Pin
+	Start_CLBR_Links		: output;
+	Start_ORDINAR_Links		: output;
+	-- For example: CLBR - Reading1, ORDINAR - reading0, Synchro0 - increment RAM page
+--------------  Serial Link & Time Control
+	Error  					: output ; -- Time Out, 2 type
+	Cavity_Refrensed_1us_period_Pulse	: output;
+	Cavity_Refrensed_1ms_period_Pulse	: output;
+	Phase_Alignig_Output	: output; -- Mux'ed output to aligning time in EVC (formerly G5_78)
+	
+
+)
+
+VARIABLE
+----------- Event Cycle Main Loop section Begin
+		
+	Event_Master_SRFF				: SRFF ; 	-- Main Event Cycle loop control
+	Dead_Time_shiftreg				: lpm_shiftreg WITH ( LPM_WIDTH = 8 ) ;
+	Trailing_Edge_of_Event_Dead_Time			: node;
+	Event_Terminate_Request_Leading_Edge		: Edge_Sensing ;
+	EVC_is_configured				: node;	-- enable EVC after configuration
+	Halt_on_slow_interface_readout_SRFF		: SRFF ; 
+	Slow_Interface_Halt_Ena		: node;	--
+	Slow_Interface_Readout_Wired_Unlock_ES		: Edge_Sensing ;
+	Slow_Interface_Readout_Program_Unlock_ES	: Edge_Sensing ;
+	End_of_Command_List_at_Bus_Clk	: node;	-- Access from Sceleton to Addr=20 
+	-- to indicate slow interface is complete it's operation
+	END_of_Transaction			: node;
+	
+	Sequencer_Time_Cnt		: lpm_counter WITH ( LPM_WIDTH = WORD_WIDTH ) ; -- up to 65536 counts
+	Sequence_disturbed			: node;	-- Stop window shapers if sequencer counter halted, paused or jumped
+	
+-- Registers 	
+		Control_Reg				: lpm_shiftreg WITH ( LPM_WIDTH = WORD_WIDTH ) ;
+		Time_Set_Command_Reg	: lpm_shiftreg WITH ( LPM_WIDTH = WORD_WIDTH ) ;--Latched at Event Begin
+		
+		SubEvent[SubEventNumber-1..0]		: node ;
+		SubEvent_Reg[SubEventNumber-1..0]	: lpm_shiftreg WITH ( LPM_WIDTH = WORD_WIDTH ) ;
+	-- Register for jump pointer of Event_termination seq.
+		Pointer_to_jump_to_time				: lpm_shiftreg WITH ( LPM_WIDTH = WORD_WIDTH ) ;
+		DataBusOut_Reg[WORD_WIDTH-1..0]		: DFF;
+		DataBusOut_[WORD_WIDTH-1..0]		: node;
+	--	Dead_Time Control for end of Event
+----------- Event Cycle Main Loop section End
+		
+------------------------------------	Start sourses
+	Event_to_Start			: node ;	-- Request to start Event, combined node
+	Event_to_Stop			: node ;	-- Request to stop  Event, combined node
+	--	Release__Time_Ready			: Edge_Sensing ;
+	--	BLK_EOC_In_ES				: Edge_Sensing ;
+	--	Data_Comm_In_ES				: Edge_Sensing ;
+		Comb_FOR_ES					: Edge_Sensing ;
+	--	Flt_Async_ES				: Edge_Sensing ;
+		Internal_Start_request_ES	: Edge_Sensing ;
+	Internal_Start						: node ;
+	External_Start						: node ;
+	Forward_Panel_Start0				: Edge_Sensing ;
+	Forward_Panel_Start1				: Edge_Sensing ;
+	Bus_Access_Start						: Edge_Sensing ;
+
+-------------------------------- Stopping conditition
+		Reset						: node;
+		End_of_Event				: node;
+--		End_of_Conversion			: Edge_Sensing ; --Shaping at end of "Busy_on_Digitizing"
+--		All_Busy_Released			: Edge_Sensing ; --Shaping at end of Busy_
+--		Busy_on_Dig_End				: Edge_Sensing ; --Shaping at end of Busy_
+		Any_Busy_Flag				: node;
+		G5_78						: node;
+
+		
+
+------------------------------------------------------------
+-- Timers for Event Simulating 
+		T_1us_Presc_CNT						:lpm_counter WITH ( LPM_WIDTH = 8 ) ;-- Up to 250MHz RefClock
+		T_1ms_Presc_CNT						:lpm_counter WITH ( LPM_WIDTH = 10 ) ;-- Down to 1kHz  scale
+		Cavity_Refrensed_1us_period_Pulse_	:node;
+		Cavity_Refrensed_1ms_period_Pulse_	:node;
+
+		Sim_Prescaler_cmp		: node ; -- comparator output	
+		Sim_Timer				: lpm_counter WITH ( LPM_WIDTH = WORD_WIDTH ) ;
+		Sim_Time_cmp			: node ; -- comparator output
+		Sim_Time_Request		: node  ; -- Resync of comparator output
+		Sim_Period_Reg			: lpm_shiftreg WITH ( LPM_WIDTH = WORD_WIDTH ) ;
+
+		Watch_Dog_Timer_1					: lpm_counter WITH ( LPM_WIDTH = WORD_WIDTH ) ;
+		Watch_Dog_Time_cmp_1				: node ; -- comparator output
+		Sequence_Time_Out							: node ; -- dff'ed comparator output
+		
+		Slow_Interface_Watchdog_CNT		: lpm_counter WITH ( LPM_WIDTH = WORD_WIDTH ) ;
+		Slow_Interface_Watchdog_cmp		: node ; -- comparator output
+		Slow_Interface_Time_Out			: node ; -- dff'ed comparator output
+-------------------------------------------------------------		
+		
+BEGIN
+
+
+-- Gating is on while CAMAC Step-by-Step
+-- It's positive edge lock EventManager, negative edge unlock
+
+----------------------- Specific Logic Section Begin
+Reset=DFF(.d=Reset_Ext, .clk=Cavity_Clock); -- Resynchro to Cavity_Clock
+
+ 
+-- Main Flag of Event Control  Section Begin ------------------------------------------
+
+-- Main OUTPUT Signals
+Event_is_in_progress	=	((Event_Master_SRFF.q OR Trailing_Edge_of_Event_Dead_Time)	-- guard delay is included
+								
+								and (!Reset)) ;  -- reset can be single pulse, it is stretched in Dead_Time 
+Next_Event_Ena	=	Dead_Time_shiftreg.q[7] and (Dead_Time_shiftreg.q[6..0] == GND);   -- Single Clock at end of Dead_Time;
+
+
+-- Begin Cycle from External OR Internal sources
+Event_Master_SRFF.S	  =  (Event_to_Start ) -- External wire, Sim_Timer, read/write to local register
+										AND  (! (Reset OR Trailing_Edge_of_Event_Dead_Time))
+										AND  EVC_is_configured ; 
+-- End Cicle from Finish Subevent SubEvent[0] 
+Event_Master_SRFF.R	  =  Event_to_Stop ; Event_to_Stop	=	SubEvent[0] OR Sequence_Time_Out or Reset;
+Event_Master_SRFF.clk =  Cavity_Clock ;
+
+Trailing_Edge_of_Event_Dead_Time	=	!(Dead_Time_shiftreg.q[] == GND); --OR'ed Outputs of shiftreg
+Dead_Time_shiftreg.clock = Cavity_Clock ;
+Dead_Time_shiftreg.shiftin			=	Event_to_Start OR Event_Master_SRFF.q OR Reset;
+
+-- CAMAC and other Interfaces -- New behavior 
+-- When SubEvent[9] time is rached Sequencer_Time_Cnt is to be halted, Slow Interfaces is initiated. 
+--Sequencer_Time_Cnt to be stoped until SI sends the END_of_Transaction signal. EoT signal may be wire signal or rpogramm access to special register.
+--Also Slow_Interface_Watchdog may interrupt this state.
+-- After SI readout is complete Sequencer_Time_Cnt will run. Next SubEvent times will relay on end of readout.
+Halt_on_slow_interface_readout_SRFF.S	=	SubEvent[9] AND Slow_Interface_Halt_Ena; -- Output to initiate slow readout CAMAC/USB/Ethernet
+Halt_on_slow_interface_readout_SRFF.R	=	END_of_Transaction OR Slow_Interface_Time_Out;
+
+END_of_Transaction			=		Slow_Interface_Readout_Wired_Unlock_ES.q 	OR 	-- Wired signal from i/o interface
+												Slow_Interface_Readout_Program_Unlock_ES.q;	 	-- Read/write of EVC register
+																						-- 
+Halt_on_slow_interface_readout_SRFF.clk	=	Cavity_Clock ;
+Slow_Interface_readout_eligible	=	Halt_on_slow_interface_readout_SRFF.q;	-- Output to initiate slow readout CAMAC/USB/Ethernet
+
+
+-- Main Flag of Event Control Section End --------------------------------------------
+Event_Terminate_Request_Leading_Edge.(clk, d) 	=	(Cavity_Clock, Event_Terminate_Request);
+---------------------------------------------------------------------------------
+-- Built-In-Event Time Control, Signaling Layer
+
+Sequencer_Time_Cnt.clock	=	Cavity_Clock ;
+Sequencer_Time_Cnt.sclr		=	!	Event_Master_SRFF.q ; 						--To be 'zero' if not in progress
+Sequencer_Time_Cnt.data[]	=	Pointer_to_jump_to_time.q[]; 			-- Fast time jump address 
+Sequencer_Time_Cnt.sload	=	Event_Terminate_Request_Leading_Edge.q; -- request to jump -- assumed to be early before SubEvent[9] Slow Interface
+Sequencer_Time_Cnt.cnt_en	=	! Halt_on_slow_interface_readout_SRFF.q; -- Time count is stopped until slow readout is in progress
+Sequence_disturbed		=	DFF(.clk=Cavity_Clock, .d=(	Event_Terminate_Request_Leading_Edge.q OR Halt_on_slow_interface_readout_SRFF.q OR End_of_Event));
+
+For i in 0 to SubEventNumber-1 generate -- subevent comparators
+SubEvent[i]=DFF(.clk=Cavity_Clock, .d=(Sequencer_Time_Cnt.q[]==SubEvent_Reg[i].q[]) and EVC_is_configured);
+end generate;
+
+--SubEvents_Done	=	SRFF(.S=SubEvent[0], .R=DFF(.d=End_of_Event,.clk=Cavity_Clock), .clk=Cavity_Clock); -- 
+
+Synchro_0	=	SRFF(.S=(SubEvent[1] AND !Time_Set_Command[4]), .R=(SubEvent[2] OR Sequence_disturbed), .clk=Cavity_Clock);
+Synchro_1	=	SRFF(.S=(SubEvent[3] AND !Time_Set_Command[5]), .R=(SubEvent[4] OR Sequence_disturbed), .clk=Cavity_Clock);
+% -- Digitizer Board's signal layout
+Fast_Trigg_Sim		=	SRFF(.S=SubEvent[7], .R=End_of_Event, .clk=Cavity_Clock); 				-- Simulate Fast Trigg (Common Stop) in bypass 
+Analog_Window =	SRFF(.S=SubEvent[8], .R=Busy_on_Dig_End.q OR End_of_Event, .clk=Cavity_Clock); 	-- Release Analog Part at End of Digitizing
+-- Hardware Fast Bypass Triggering Circuit Control, T2Q, TQ, MCHs_on_T2Q etc.
+--	Busy_on_Dig_End.(d, clk)	=	(! Busy_on_Digitizing, Cavity_Clock) ;   -- Edge_Sensing
+%
+-- MChS board's signal
+Start_CLBR_Links	=	SRFF(.S=((SubEvent[5] AND !Time_Set_Command[0]) OR (SubEvent[6] AND Time_Set_Command[0])), .R=End_of_Event, .clk=Cavity_Clock);
+Start_ORDINAR_Links	=	SRFF(.S=((SubEvent[7] AND !Time_Set_Command[1]) OR (SubEvent[8] AND Time_Set_Command[1])), .R=End_of_Event, .clk=Cavity_Clock);
+
+	
+	
+		EVC_is_configured	=	!(SubEvent_Reg[0].q[]==GND); -- Active High, end Sequence_Time should not be zero
+---------------------------------------------------------------------------------
+
+
+Error = Sequence_Time_Out OR Slow_Interface_Time_Out;  -- Error if Event is not properly termenated
+
+
+--------
+--------------------------------- Gating & Braking Control section
+--If Slow_Interface_Readout is required, it should be initiated by some Subevent 
+--Halt_on_slow_interface_readout_SRFF.S	=	SubEvent[9]; -- Output to initiate slow readout CAMAC/USB/Ethernet
+-- Wired signal from i/o interface
+Slow_Interface_Readout_Wired_Unlock_ES.(clk, d) 	=	(Cavity_Clock, Slow_Interface_is_done); -- falling Edge of Request
+-- Programm signal from i/o interface, Read/write of EVC register at end of event data reading
+End_of_Command_List_at_Bus_Clk				=	DFF(.d=((AddrBusIn[7..0]==20) and Select), .clk=Bus_Clock);
+Slow_Interface_Readout_Program_Unlock_ES.(clk, d)	=	(Cavity_Clock, End_of_Command_List_at_Bus_Clk);
+	
+	Slow_Interface_Halt_Ena	=	Control_Reg.q[4] OR Time_Set_Command[2];
+--	CAMAC_Brake_Ena	=	Control_Reg.q[6] OR Time_Set_Command[3];
+
+
+				
+				
+		
+-- Loop & Braking Control section end 
+--------
+
+
+--- Start inputs Control
+Event_to_Start		=	Internal_Start OR External_Start OR Bus_Access_Start.q;
+			External_Start	=	GND; -- pFLT_M	;	-- Main INPUT Signal from Hardware Fast Bypass Triggering Circuit
+			Bus_Access_Start.(clk, d) 	=	(Cavity_Clock, ((AddrBusIn[7..0]==21) and Select)); --
+-- Enable Control of Internal Starts 
+		Case Control_Reg.q[3..0] is
+			WHEN 0 => Internal_Start =	Internal_Start_request; --  Start from Event Manager pulse, assumed as Cavity Refrenced
+			WHEN 1 => Internal_Start =	Internal_Start_request_ES.q; --  Start from Event Manager, may not be synchronized
+			WHEN 2 => Internal_Start =	Comb_FOR_ES.q ;				-- Start from FOR Controller
+			WHEN 5 => Internal_Start =	Sim_Time_Request;			-- Automatic Start to test at workbench
+			WHEN 9 => Internal_Start =	Forward_Panel_Start0.q;		-- Start 
+			WHEN 10=> Internal_Start =	Forward_Panel_Start1.q;		-- Start 
+			WHEN 11=> Internal_Start =	Forward_Panel_Start0.q OR Forward_Panel_Start1.q;		-- Start from 
+			WHEN Others  => Internal_Start = GND ;				-- Do not allow internal starts
+		End Case;
+-- Resynchronize and shape of input start sources
+				Internal_Start_request_ES.(d, clk)	=	(Internal_Start_request AND !Trailing_Edge_of_Event_Dead_Time,	Cavity_Clock);
+				Comb_FOR_ES.(d, clk)				=	(Comb_FOR,								Cavity_Clock);
+				Forward_Panel_Start0.(d, clk)		=	(Forward_Panel_In0, 					Cavity_Clock);
+				Forward_Panel_Start1.(d, clk)		=	(Forward_Panel_In1, 					Cavity_Clock);
+
+--Any_Busy_Flag	=	Busy_on_Digitizing OR Busy_on_Link_Active OR Busy_on_Reloading ;
+
+---------------------------------------------------------------------------------
+
+End_of_Event		=		(!Dead_Time_shiftreg.q[0]) and (Dead_Time_shiftreg.q[7..1] == VCC);   -- Single Clock at end of Dead_Time;
+--------------------------------------------------------------------------------
+
+-- Extended Control for Synchro
+Case Control_Reg.q[14..12] is
+	WHEN 0 =>  G5_78	=  Event_Master_SRFF.q ;
+	WHEN 1 =>  G5_78	=  Halt_on_slow_interface_readout_SRFF.q ;
+	WHEN 2 =>  G5_78	=  Trailing_Edge_of_Event_Dead_Time;
+	WHEN 3 =>  G5_78	=  Synchro_0;
+	WHEN 4 =>  G5_78	=  Synchro_1;
+	WHEN 5 =>  G5_78	=  Start_CLBR_Links;
+	WHEN 6 =>  G5_78	=  Start_ORDINAR_Links;
+	WHEN 7 =>  G5_78	=  Comb_FOR ;
+	
+--	WHEN Others  =>  G5_78	= GND ;
+End Case;	
+	Phase_Alignig_Output	=	DFF(.clk=Cavity_Clock, .d=G5_78);-- Output to Scope synchro
+-- Specific Logic Section End
+
+
+
+-------------------------------------- Registers connections Section Begin
+
+
+
+Control_Reg.(data[], clock, load)					=	(DataBusIn[], Bus_Clock, VCC );
+Sim_Period_Reg.(data[], clock, load)				=	(DataBusIn[], Bus_Clock, VCC );
+Pointer_to_jump_to_time.(data[], clock, load)		=	(DataBusIn[], Bus_Clock, VCC );
+--Release_Period_Reg.(data[], clock, load)	=	(DataBusIn[], Bus_Clock, VCC );
+for i in 0 to SubEventNumber-1 generate SubEvent_Reg[i].(data[], clock, load)	=	(DataBusIn[], Bus_Clock, VCC);end generate;
+
+Case AddrBusIn[7..0] is 
+--for i in 0 to OldRegNumber-1 generate
+When 0  => DataBusOut_[]=Control_Reg.q[];					Control_Reg.enable		=( Select AND DirectIn AND DataBusStrobe );
+When 1  => DataBusOut_[]=Sim_Period_Reg.q[]; 				Sim_Period_Reg.enable	=( Select AND DirectIn AND DataBusStrobe );
+When 2  => DataBusOut_[]=Pointer_to_jump_to_time.q[]; 		Pointer_to_jump_to_time.enable	=( Select AND DirectIn AND DataBusStrobe );
+--When 2 => DataBusOut_[]=Release_Period_Reg.q[]; 	Release_Period_Reg.enable	=( Select AND DirectIn AND DataBusStrobe );
+When 8  => DataBusOut_[]=SubEvent_Reg[0].q[]; 	SubEvent_Reg[0].enable	=( Select AND DirectIn AND DataBusStrobe );
+When 9  => DataBusOut_[]=SubEvent_Reg[1].q[]; 	SubEvent_Reg[1].enable	=( Select AND DirectIn AND DataBusStrobe );
+When 10 => DataBusOut_[]=SubEvent_Reg[2].q[];	SubEvent_Reg[2].enable	=( Select AND DirectIn AND DataBusStrobe );
+When 11 => DataBusOut_[]=SubEvent_Reg[3].q[];	SubEvent_Reg[3].enable	=( Select AND DirectIn AND DataBusStrobe );
+When 12 => DataBusOut_[]=SubEvent_Reg[4].q[]; 	SubEvent_Reg[4].enable	=( Select AND DirectIn AND DataBusStrobe );
+When 13 => DataBusOut_[]=SubEvent_Reg[5].q[];	SubEvent_Reg[5].enable	=( Select AND DirectIn AND DataBusStrobe );
+When 14 => DataBusOut_[]=SubEvent_Reg[6].q[]; 	SubEvent_Reg[6].enable	=( Select AND DirectIn AND DataBusStrobe );
+When 15 => DataBusOut_[]=SubEvent_Reg[7].q[]; 	SubEvent_Reg[7].enable	=( Select AND DirectIn AND DataBusStrobe );
+When 16 => DataBusOut_[]=SubEvent_Reg[8].q[]; 	SubEvent_Reg[8].enable	=( Select AND DirectIn AND DataBusStrobe );
+When 17 => DataBusOut_[]=SubEvent_Reg[9].q[]; 	SubEvent_Reg[9].enable	=( Select AND DirectIn AND DataBusStrobe );
+When others =>DataBusOut_[]=GND;Control_Reg.enable=GND;Sim_Period_Reg.enable=GND;SubEvent_Reg[].enable=GND;
+end Case ;
+DataBusOut[]=DataBusOut_Reg[].q; DataBusOut_Reg[].clk=Bus_Clock; DataBusOut_Reg[].d=DataBusOut_[];
+
+--------------------------------------- Registers connections Section End
+
+------------------- Counters background connections Section Begin
+
+--------Simulation Scaler
+Sim_Time_cmp	=	DFF(.clk=Cavity_Clock, .d=(Sim_Period_Reg.q[] == Sim_Timer.q[] ));
+Sim_Timer.(clock, cnt_en, sclr)	 = (Cavity_Clock, Sim_Prescaler_cmp, Sim_Time_cmp); -- Toggles at prescaler freq, Self Reload
+Sim_Time_Request	=	Sim_Time_cmp;-- to internal start mux
+-------
+-- Prescaler --> It gives 1us or 1 ms Prescaler clock if RefClock in MHz
+Sim_Prescaler_cmp=	(Cavity_Refrensed_1us_period_Pulse_	and !Control_Reg.q[15])
+					OR 
+					(Cavity_Refrensed_1ms_period_Pulse_	and  Control_Reg.q[15]);
+
+----------System Scalers
+T_1us_Presc_CNT.(clock, sclr)		=	(Cavity_Clock, Cavity_Refrensed_1us_period_Pulse_);-- Prescaler 
+Cavity_Refrensed_1us_period_Pulse_	=DFF(.clk=Cavity_Clock, .d=(T_1us_Presc_CNT.q[]==(RefClock - 2)));
+Cavity_Refrensed_1us_period_Pulse	=	Cavity_Refrensed_1us_period_Pulse_;
+
+T_1ms_Presc_CNT.(clock, sclr, cnt_en)	=	(Cavity_Clock, Cavity_Refrensed_1ms_period_Pulse_, Cavity_Refrensed_1us_period_Pulse_);-- Prescaler 
+Cavity_Refrensed_1ms_period_Pulse_	=	DFF(.clk=Cavity_Clock, .d=(T_1ms_Presc_CNT.q[]==999 AND Cavity_Refrensed_1us_period_Pulse_));
+Cavity_Refrensed_1ms_period_Pulse	=	Cavity_Refrensed_1ms_period_Pulse_;
+
+
+------------------------Watch_Dog section
+Watch_Dog_Time_cmp_1	=DFF(.clk=Cavity_Clock, .d=(Watch_Dog_Timer_1.q[] == Event_Duration_Watchdog_Value));
+Watch_Dog_Timer_1.sclr 	= ! Event_Master_SRFF.q ;
+Watch_Dog_Timer_1.clock	= Cavity_Clock ;
+Watch_Dog_Timer_1.cnt_en	= Cavity_Refrensed_1us_period_Pulse;
+
+Sequence_Time_Out	=	DFF(.clk=Cavity_Clock, .d=Watch_Dog_Time_cmp_1);
+
+Slow_Interface_Watchdog_cmp	=	DFF(.clk=Cavity_Clock, .d=(Slow_Interface_Watchdog_CNT.q[] == Slow_Interface_Watchdog_Value));
+Slow_Interface_Watchdog_CNT.sclr 	= ! Halt_on_slow_interface_readout_SRFF.q ;
+Slow_Interface_Watchdog_CNT.clock	= Cavity_Clock ;
+Slow_Interface_Watchdog_CNT.cnt_en	= Cavity_Refrensed_1us_period_Pulse;
+
+Slow_Interface_Time_Out	=	DFF(.clk=Cavity_Clock, .d=Slow_Interface_Watchdog_cmp);
+
+------------------- Counters background connections Section End
+END;

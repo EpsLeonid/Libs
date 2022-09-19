@@ -1,0 +1,445 @@
+TITLE "Ethernet packets byte RAM";
+-- OSI model   OpenSystem Interface
+-- This Module produce function of "Ethernet Signal layer to Data Link layer bridge"
+-- Media layer to Electrical Layer is done by external chip LXT972
+-- Electrical Layer to Signaling Layer is done by "Tx_Eth100_Sync" and "Fr_ether100_new" functions
+
+INCLUDE "Edge_Sensing_Sync.inc";
+INCLUDE "lpm_shiftreg.inc";
+INCLUDE "lpm_counter.inc";
+INCLUDE "Eth_Pkt_Parcer.inc";
+INCLUDE "EthBufferRAM1024.inc";
+INCLUDE "Eth_In_FIFO4kb.inc";
+
+
+
+CONSTANT PacketLenghts_at_signaling_layer  = 2048;-- maximum length value in bytes
+CONSTANT RxByte_Cnt_Width = Ceil( LOG2(PacketLenghts_at_signaling_layer));
+
+Constant WORD_WIDTH	= 16; 
+
+CONSTANT ETH_HEADER_LENGTH = 14;
+CONSTANT IP_HEADER_LENGTH  = 20;
+CONSTANT UDP_HEADER_LENGTH = 8;
+CONSTANT OPCODE_LENGTH = 2;
+
+CONSTANT KLUKVA_DATA_LENGTH = ((32+512+32)*2)*2; --2304;
+CONSTANT HEADER_LENGTH_BYTES = ETH_HEADER_LENGTH + IP_HEADER_LENGTH + UDP_HEADER_LENGTH + OPCODE_LENGTH;
+CONSTANT HEADER_LENGTH_WORDS = HEADER_LENGTH_BYTES div 2;
+CONSTANT MASS_RAM_BYTE_Tx_Num = HEADER_LENGTH_BYTES + KLUKVA_DATA_LENGTH;
+
+
+
+--CONSTANT MASS_RAM_BYTE_Tx_Num = 40+4+2304; -- (IP header + UDP header) + command + (addr+data)
+-- "Total length" field size=MASS_RAM_BYTE_Tx_Num-14
+-- "UDP lenght" field size=MASS_RAM_BYTE_Tx_Num-(14+20)
+
+-- payload = (576*2)*2 bytes = 2304
+
+
+
+
+SUBDESIGN Eth_ext_pkt
+(
+   Clock                        : input; -- System Clock, really Bus_Clock
+-- PHY Ethernet I/O
+   -- Rx section    --Preambula, SOF and CRC are cutted out
+  Byte_Strobe_Rx      			: input;
+  Rx_Data[7..0]       	 		: input;
+  RxPacket_in_progress  		: input;
+  RxPacket_End             		: input;
+  Packet_Good_End 				: input; -- CRC result
+  Packet_bad_End				: input; -- CRC result
+		
+   
+  Packet_Decode_Error			: output; --next packet is detected while current packet is in processing
+  
+  -- Tx section
+  Eth_Tx_End					: output; -- data transfer end signal
+  
+  Eth_RxTx_In_Progress			: output; -- module is busy
+  
+  Tx_Data_for_FIFO[7..0]		: output;
+  Tx_Strobe_for_FIFO			: output;
+  Tx_End_Pkt_for_FIFO			: output;
+  Tx_packet_RQ					: output;
+  Tx_packet_AG					: input;
+  
+  Out_FIFO_full					: input;
+
+  -- Standard bus connections
+  BUS_Clock                     : input;
+  DataBus_In[15..0]			    : input;  -- отправляемые с Внутренней Шины в Модуль данные
+  DataBusOut[15..0]     	  	: output; -- выдаваемые на Внутреннюю Шину из Модуля данные (младшие 16бит шины R)
+  
+  DataBusStrobe 			 	: input;  -- строб приема/передачи данных наружу (высокий уровень, защелкиваем по заднему фронту)
+  Select					 	: input;  -- Выбор Модуля для работы с памятью Командного Листа в режиме Slave (с КАМАК-ом)
+  DirectIn					  	: input;  -- направление передачи данных, Если =GND, то данный Модуль читается, если =VCC, то пишется.
+  AddrBus_In[12..0]			 	: input;  -- адрес при операциях доступа чтения/записи Командного Листа с КАМАК-а
+  Reset                        	: input = GND;
+  	-- Master Mode Signals 
+  AccessRequest			    	: output;
+  AccessGranted			    	: input; 
+  DirectOut				    	: output;
+  AddrBusOut[15..0]	    		: output;
+
+)
+VARIABLE
+   RxByte_Cnt       	    				: LPM_COUNTER WITH (LPM_WIDTH = RxByte_Cnt_Width+1);
+   RxByte_Cnt_Reg                 			: LPM_SHIFTREG with (lpm_width=WORD_WIDTH);
+   RAM_Overflow								: node;
+   RAM_Overflow_SRFF            			: SRFF;
+   Cnt_Overflow_Edge						: Edge_Sensing_Sync;
+   RxReadyToRecive              			: SRFF;
+   SetRxReadyToRecive           			: node;
+   SetRxReadyToRecive_Parcer				: node;
+   SetRxReadyToRecive_Sc_Bus                : node;
+   RxRAM                    				: EthBufferRAM1024;--EthBufferRAM2048;
+   RxRAM_CS                 				: node;
+   Rx_RAM_Address_Bus[RxByte_Cnt_Width-2..0]: node;
+   
+   Buffer_RAM_Data[WORD_WIDTH-1..0]         : node;
+   
+   Status_REG                   			: LPM_SHIFTREG with (lpm_width=WORD_WIDTH); -- статус проиходящего (идет прием или передача)
+   Status_REG_CS                			: node;
+   Status_REG_ES							: Edge_Sensing_Sync;
+   
+   RxLostPackcet_ES                   		: Edge_Sensing_Sync; 
+   RxLostPacket_node                		: node;
+   RxLostPacket_Cnt            				: LPM_COUNTER  WITH (LPM_WIDTH = WORD_WIDTH);
+   RxLostPacket_Cnt_REG        				: LPM_SHIFTREG WITH (LPM_WIDTH = WORD_WIDTH);
+   RxLostPacket_Cnt_REG_CS     				: node;
+   RxLostPacket_Cnt_REG_ES     				: Edge_Sensing_Sync; 
+   
+   
+   TxByte_Cnt       	    				: LPM_COUNTER WITH (LPM_WIDTH = RxByte_Cnt_Width+1);
+   TxRAM                    				: EthBufferRAM1024;
+   TxRAM_wren                               : node;
+   Tx_RAM_Address_Bus[RxByte_Cnt_Width-2..0]: node;
+   Tx_RAM_Data_Bus[WORD_WIDTH-1..0]         : node;
+   TxRAM_CS                 				: node;
+   TxRQ_Reset								: node;
+   TxRQ_Reset_ES                			: Edge_Sensing_Sync;
+   TxRQ_SRFF                    			: SRFF;
+  -- InternalTxStart              			: node;
+   AnswerTxStart							: node;
+   
+   PacketLenghts_to_be_transmitted_Reg    	: LPM_SHIFTREG WITH (LPM_WIDTH = WORD_WIDTH);
+   PacketLenghts_to_be_transmitted_Reg_CS 	: node;
+   PacketLenghts_DataBus[WORD_WIDTH-1..0] 	: node;
+   PacketLenghts_to_be_transmitted_Reg_EN 	: node;
+
+   Module_MAC_Reg[2..0]			   			: LPM_SHIFTREG WITH (LPM_WIDTH = WORD_WIDTH);
+   Module_MAC_Reg_CS[2..0]    	   			: node;
+   Module_IP_Reg[1..0]			   			: LPM_SHIFTREG WITH (LPM_WIDTH = WORD_WIDTH);
+   Module_IP_Reg_CS[1..0]    	   			: node;
+   Port_Reg									: LPM_SHIFTREG WITH (LPM_WIDTH = WORD_WIDTH);
+   Port_Reg_CS				   	   			: node;
+   
+   RxWordRecive_Reg							: LPM_SHIFTREG WITH (LPM_WIDTH = WORD_WIDTH);
+   Rx_Packet_Lenght_Reg						: LPM_SHIFTREG WITH (LPM_WIDTH = WORD_WIDTH);
+   
+   Source_MAC_Reg[2..0]						: LPM_SHIFTREG WITH (LPM_WIDTH = WORD_WIDTH);
+   
+   Test_Reg									: LPM_SHIFTREG WITH (LPM_WIDTH = WORD_WIDTH);
+   Test_Reg_CS				   	   			: node;
+
+   DataBusOut_[15..0]						: node;	
+
+   Rx_Packet_Cnt							: LPM_COUNTER WITH (LPM_WIDTH = 16);
+   Tx_Packet_Cnt							: LPM_COUNTER WITH (LPM_WIDTH = 16);
+   Rx_Packet_Cnt_Reset						: node;
+   Tx_Packet_Cnt_Reset						: node;
+   
+   In_FIFO									: Eth_In_FIFO4kb;
+   Copy_Byte_Strobe							: node;
+   FIFO_to_RxRAM_Copy						: node; -- enable signal for incrementing the counter-pointer of the input buffer RAM and writing data to the buffer RAM
+   RAM_Ptr_Packet_End						: node; -- signal of the end of data copying from FIFO to buffer RAM and the start of the parcer algorithm
+   
+   Packet_Good_End_ES						: Edge_Sensing_Sync; -- good packet end pointer (CRC good)
+   Packet_bad_End_ES						: Edge_Sensing_Sync; -- bad packet end pointer (CRC failed)
+
+   Pkt_parcer								: Eth_Pkt_Parcer;
+   Data_Flow_parcing						: node;
+   Tx_packet_ready							: node;
+   
+BEGIN
+-------------------------------------------- Input FIFO --------------------------------------------
+	 
+	 -- входное FIFO накапливает пакеты приходящие снаружи. Когда возникает флаг готовности входного буффера (RxReadyToRecive.q)
+	 -- происходит копирование одного пакета из входного FIFO в буферную память. Сигналы окончания пакета старшие биты FIFO (In_FIFO.q[8], In_FIFO.q[9])
+     -- По сигналу окончания In_FIFO.q[8] (плохой пакет, т.е неправильный CRC) сбрасывается счетчик адреса входного буфера 
+     -- и новый пакет копируется во входной буфер.
+     -- По сигналу окончания In_FIFO.q[9] (хороший пакет) запускается алгаритм обработки пакета, в результате которого,
+     -- заполняется выходной буфер.
+     -- Алгаритм обработки пакета состоит из набора независимых модулей, запускающих друг друга по мере обработки пакета
+     -- MAC_Decoder  - модуль проверяте пришедший MAC-адрес и зносит в правильном порядке в выходной буфер. Если MAC-адрес неправильный алгаритм обработки пакета завершается
+     -- ARP_Decoder  - модуль начинает работать после MAC_Decoder, модуль проверяте является ли пакет ARP-запросом. Если да, то заполняет выходной буфер ARP-ответом и завершает алгаритм обработки. Если нет, то передает управление следующему модулю
+     -- IPv4_Decoder - модуль проверяте является ли пакет IPv4 типом. Если да, то заполняет выходной буфер ответом и завершает алгаритм обработки. Если нет, то передает управление следующему модулю
+     -- CCCD_Decoder - модуль проверяте является ли пакет CCCD типом (это нестандартный тип протокола). Если да, то заполняет выходной буфер ответом и завершает алгаритм обработки. Если нет, то передает управление следующему модулю.
+     -- Raw_Decoder  - модуль проверяте является ли пакет CDCD типом (это нестандартный тип протокола). Если да, то заполняет выходной буфер ответом и завершает алгаритм обработки. Если нет, то завершает алгаритм обработки.
+     -- В случае если ни один тип пакета не был опознан, копируется новый пакет из входного FIFO в буфер и процесс повторяется, 
+     -- иначе запускается механизм передачи данных наружу.
+     
+     In_FIFO.data[7..0] 	=	Rx_Data[7..0]; 
+      
+     In_FIFO.data[8] 		=	Packet_bad_End ; -- маркер окончания плохого пакета, сбрасывается счетчик адреса входного буфера. Флаг готовности к копированию пакета из входного FIFO не сбрасывается
+     In_FIFO.data[9] 		=	Packet_Good_End; -- маркер окончания хорошего пакета, используется для запуска обработки пакета
+     
+     In_FIFO.clock			=	Clock;
+     In_FIFO.wrreq  		=	Byte_Strobe_Rx OR RxPacket_End;
+     In_FIFO.rdreq  		=	!In_FIFO.empty AND Copy_Byte_Strobe AND RxReadyToRecive.q;  
+ 
+     
+     FIFO_to_RxRAM_Copy 	=	!In_FIFO.empty AND Copy_Byte_Strobe AND RxReadyToRecive.q;
+     Copy_Byte_Strobe		=	VCC; -- copy at max speed - 100МГц
+        
+     Packet_Good_End_ES.(d,clk) = (In_FIFO.q[9],Clock);
+     Packet_bad_End_ES.(d,clk)  = (In_FIFO.q[8],Clock);
+
+-------------------------------------------- Rx section --------------------------------------------
+   RxReadyToRecive.(S,clk,R) = (SetRxReadyToRecive, Clock, RAM_Ptr_Packet_End);
+   SetRxReadyToRecive = SetRxReadyToRecive_Sc_Bus OR SetRxReadyToRecive_Parcer;
+   Eth_RxTx_In_Progress = !RxReadyToRecive.q;
+  
+   RxByte_Cnt.(clock,clk_en,cnt_en,sclr) = (Clock,VCC, FIFO_to_RxRAM_Copy , --Enable to count actual length
+													   SetRxReadyToRecive OR Packet_bad_End_ES.q    --Not to clear while processing in progress to know actual length
+										    );
+   IF 	(RxByte_Cnt.q[] == PacketLenghts_at_signaling_layer-1) --Check to not overwrite RAM at ubnormal length packets
+		THEN RAM_Overflow	= VCC;
+		ELSE RAM_Overflow	= GND;
+   END IF;
+   RAM_Overflow_SRFF.(S,clk,R) = (Cnt_Overflow_Edge.q,Clock,SetRxReadyToRecive);
+   Cnt_Overflow_Edge.(clk,d)	=	(Clock, RAM_Overflow); -- failed packet size
+   Packet_Decode_Error = Cnt_Overflow_Edge.q ; 			   --
+   
+   RAM_Ptr_Packet_End		 = Packet_Good_End_ES.q;
+  
+   
+   IF((RxPacket_in_progress == VCC) AND (RxReadyToRecive.q == GND)) THEN RxLostPacket_node = VCC; -- был пропущен пакет, т.к модуль 
+																    ELSE RxLostPacket_node = GND; -- не был готов к приему
+   END IF;
+   
+   RxRAM.data_a[7..0] = In_FIFO.q[7..0];  -- input data
+   RxRAM.(address_a[RxByte_Cnt_Width-1..0]   , clock_a, wren_a                       ) =
+         (RxByte_Cnt.q[RxByte_Cnt_Width-1..0], Clock  , FIFO_to_RxRAM_Copy AND !RAM_Overflow_SRFF.q); 
+
+   RxRAM.(address_b[RxByte_Cnt_Width-2..0], clock_b  , data_b[15..8]   , data_b[7..0]     , wren_b  ) =
+         (Rx_RAM_Address_Bus[]            , BUS_Clock, DataBus_In[7..0], DataBus_In[15..8], RxRAM_CS AND DataBusStrobe AND DirectIn AND Select); 
+      
+   
+   RxLostPackcet_ES.(d,clk)                           = (RxLostPacket_node, Clock);
+   RxLostPacket_Cnt.(clock,clk_en,cnt_en,sclr)        = (Clock, VCC, RxLostPackcet_ES.q, GND%RxPacketError_Cnt_REG_ES.q%);
+   RxLostPacket_Cnt_REG.(data[],clock, load, enable)  = (RxLostPacket_Cnt.q[], BUS_Clock, VCC, VCC%RxPacketError_Cnt_REG_ES.q%);
+   RxLostPacket_Cnt_REG_ES.(d,clk)                    = (RxLostPacket_Cnt_REG_CS AND Select AND DataBusStrobe, BUS_Clock);
+
+   Buffer_RAM_Data[]								  = RxRAM.q_b[];
+--   ------------------------------------------- Tx section -------------------------------------------------   
+   -- condition to start sending a response from the Tx buffer
+   Tx_packet_RQ  = Tx_packet_ready;
+   AnswerTxStart = Tx_packet_AG;
+
+   TxRQ_SRFF.(S,clk,R) = (AnswerTxStart, Clock, TxRQ_Reset_ES.q OR Reset);
+   TxByte_Cnt.(clock,clk_en,cnt_en,sclr) = (Clock,VCC, TxRQ_SRFF.q AND !Out_FIFO_full, AnswerTxStart);
+   IF ((TxByte_Cnt.q[] >= PacketLenghts_at_signaling_layer-1) OR (TxByte_Cnt.q[] >= PacketLenghts_to_be_transmitted_Reg.q[RxByte_Cnt_Width..0]))
+  		THEN TxRQ_Reset	= VCC;
+		ELSE TxRQ_Reset	= GND;
+   END IF;
+   TxRQ_Reset_ES.(d,clk) = (TxRQ_Reset,Clock);
+  
+   Eth_Tx_End    = TxRQ_Reset_ES.q; 	
+    
+
+   TxRAM.data_a[7..0] = GND;  
+   TxRAM.(address_a[RxByte_Cnt_Width-1..0]   , clock_a, wren_a) =
+         (TxByte_Cnt.q[RxByte_Cnt_Width-1..0], Clock  , GND   ); 
+
+   TxRAM.clock_b = BUS_Clock;
+   TxRAM.address_b[RxByte_Cnt_Width-2..0] = Tx_RAM_Address_Bus[RxByte_Cnt_Width-2..0];
+   TxRAM.data_b[] = Tx_RAM_Data_Bus[];
+   TxRAM.wren_b   = TxRAM_wren;
+   
+   Tx_Data_for_FIFO[]  = TxRAM.q_a[];
+   Tx_Strobe_for_FIFO  = DFF(.d=TxRQ_SRFF.q,.clk=Clock);
+   Tx_End_Pkt_for_FIFO = DFF(.d=TxRQ_Reset_ES.q,.clk=Clock);
+
+   -------------------------------------------------------------------------------------------------------------------  
+   ------------------- data parcer 
+   Pkt_parcer.Clock         = Clock;
+   Pkt_parcer.Reset			= SetRxReadyToRecive;
+   Pkt_parcer.Rx_Data[]     = Buffer_RAM_Data[];
+   Pkt_parcer.Rx_Parcer_RQ  = (RAM_Ptr_Packet_End and RxReadyToRecive.q);
+   Pkt_parcer.Rx_NUM_Data[] = (GND,RxWordRecive_Reg.q[RxByte_Cnt_Width-2..0]-2);
+   
+   Pkt_parcer.Module_MAC[15..0]  = Module_MAC_Reg[0].q[15..0];
+   Pkt_parcer.Module_MAC[31..16] = Module_MAC_Reg[1].q[15..0];
+   Pkt_parcer.Module_MAC[47..32] = Module_MAC_Reg[2].q[15..0];
+
+   Pkt_parcer.Module_IP[15..0] 	 = Module_IP_Reg[0].q[15..0];
+   Pkt_parcer.Module_IP[31..16]  = Module_IP_Reg[1].q[15..0];
+   
+   Pkt_parcer.Module_Port[15..0] = Port_Reg.q[15..0];
+   
+   Data_Flow_parcing = Pkt_parcer.Progress_Flag;
+   Tx_packet_ready 	 = Pkt_parcer.Tx_Start;
+   SetRxReadyToRecive_Parcer = Pkt_parcer.CycleEndErr or TxRQ_Reset_ES.q;
+   
+   IF(Data_Flow_parcing == VCC) THEN  
+		Tx_RAM_Address_Bus[] = Pkt_parcer.Tx_Addr[RxByte_Cnt_Width-2..0];
+	    Rx_RAM_Address_Bus[] = Pkt_parcer.Rx_Addr_o[RxByte_Cnt_Width-2..0];
+		Tx_RAM_Data_Bus[] 	 = Pkt_parcer.Tx_Data[];
+        TxRAM_wren			 = Pkt_parcer.Tx_Word_Strobe;
+									   ELSE 
+		Tx_RAM_Address_Bus[RxByte_Cnt_Width-2..0] = AddrBus_In[RxByte_Cnt_Width-2..0];
+        Tx_RAM_Data_Bus[15..8]   				  = DataBus_In[7..0]; 
+        Tx_RAM_Data_Bus[7..0] 					  = DataBus_In[15..8];
+        TxRAM_wren	          					  = TxRAM_CS AND DataBusStrobe AND DirectIn AND Select;
+        Rx_RAM_Address_Bus[]     				  = AddrBus_In[RxByte_Cnt_Width-2..0];
+   END IF;
+   
+   -- Skeleton bus control signals  
+   Pkt_parcer.AccessGranted 	 = AccessGranted; 
+   Pkt_parcer.DataBusStrobe 	 = DataBusStrobe;
+   Pkt_parcer.DataBus_In[] 		 = DataBus_In[];
+   AccessRequest = Pkt_parcer.AccessRequest;
+   DirectOut     = Pkt_parcer.DirectOut;
+   AddrBusOut[]  = Pkt_parcer.AddrBusOut[];
+   
+   
+
+   -- source MAC-address buffer
+   FOR i IN 0 TO 2 GENERATE  
+      Source_MAC_Reg[i].(data[],clock, load, enable) = (Buffer_RAM_Data[],Clock,VCC, (Rx_RAM_Address_Bus[] == 3+i) );--AND MAC_Decoder.Tx_Word_Strobe);
+   END GENERATE;
+   -- latch incoming number bytes and convert to 16-bit words
+   Rx_Packet_Lenght_Reg.data[15..RxByte_Cnt_Width]   = GND;
+   Rx_Packet_Lenght_Reg.data[RxByte_Cnt_Width-1..0]  = RxByte_Cnt.q[RxByte_Cnt_Width..1]-(HEADER_LENGTH_WORDS-1)-3;
+   Rx_Packet_Lenght_Reg.(clock,enable,load) = (Clock,RAM_Ptr_Packet_End,VCC); 
+  
+   RxWordRecive_Reg.(data[15..RxByte_Cnt_Width],data[RxByte_Cnt_Width-1..0]) = (B"00000",RxByte_Cnt.q[RxByte_Cnt_Width..1]);
+   RxWordRecive_Reg.(clock,enable,load) = (Clock,RAM_Ptr_Packet_End,VCC); 
+    
+--------------------------------------- BUS Section ---------------------------------------------------   
+--************************************************************************* 
+-- module in master mode:
+   CASE  (Select, DirectOut,Data_Flow_parcing) IS          
+		  WHEN b"100"  => DataBusOut[]      = DataBusOut_[]; -- идет чтение со скелеткой шины
+		  WHEN b"110"  => DataBusOut[]      = DataBusOut_[]; -- идет запись со скелеткой шины
+	      WHEN b"011"  => DataBusOut[]  	= Pkt_parcer.DataBusOut[];   -- packet to be processed comes from ethernet
+ 	      WHEN b"111"  => DataBusOut[]  	= Pkt_parcer.DataBusOut[]; 
+		  WHEN b"101"  => DataBusOut[]      = DataBusOut_[];
+	      WHEN OTHERS  => DataBusOut[]      = GND; 
+   END CASE;
+    
+    IF ( (AddrBus_In[] >= 1024) AND (AddrBus_In[] < 2048) ) 
+			THEN DataBusOut_[7..0] = TxRAM.q_b[15..8]; DataBusOut_[15..8] = TxRAM.q_b[7..0]; --DataBusOut[] = TxRAM.q_b[];
+				 TxRAM_CS     = VCC;    
+			ELSE TxRAM_CS     = GND;     
+	END IF;
+	IF ( (AddrBus_In[] >= 0) AND (AddrBus_In[] < 1024) ) 
+			THEN DataBusOut_[7..0] = Buffer_RAM_Data[15..8]; DataBusOut_[15..8] = Buffer_RAM_Data[7..0];
+				 RxRAM_CS     = VCC;    
+			ELSE RxRAM_CS     = GND; 
+	END IF;
+   
+	IF (AddrBus_In[] ==  2048) THEN DataBusOut_[]  = Status_REG.q[];
+										Status_REG_CS = VCC;  
+								   ELSE Status_REG_CS = GND; 
+	END IF;
+	IF (AddrBus_In[] ==  2049) 
+				THEN SetRxReadyToRecive_Sc_Bus = DataBusStrobe; 
+				ELSE SetRxReadyToRecive_Sc_Bus = GND; 
+	END IF;
+--	IF (AddrBus_In[] ==  2050) 
+--				THEN InternalTxStart    = DataBusStrobe;
+--				ELSE InternalTxStart    = GND;
+--	END IF;
+	IF (AddrBus_In[] ==  2051) THEN DataBusOut_[] = RxByte_Cnt_Reg.q[];--PacketLenghts_to_be_transmitted_Reg.q[];
+										PacketLenghts_to_be_transmitted_Reg_CS = VCC;
+								   ELSE PacketLenghts_to_be_transmitted_Reg_CS = GND;
+	END IF;
+	IF (AddrBus_In[] ==  2052) THEN DataBusOut_[] = RxLostPacket_Cnt_REG.q[]; -- число не принятых пакетов за время обработки текущего
+										RxLostPacket_Cnt_REG_CS = VCC;
+								   ELSE RxLostPacket_Cnt_REG_CS = GND;
+	END IF;
+        -- MAC-адрес и IP-адрес мезанина
+	FOR i IN 0 TO 2 GENERATE  -- MAC-адрес
+			IF (AddrBus_In[] ==  2053+i) THEN DataBusOut_[] = Module_MAC_Reg[i].q[];
+											  Module_MAC_Reg_CS[i] = VCC;
+										 ELSE Module_MAC_Reg_CS[i] = GND;
+			END IF;
+	END GENERATE;
+	FOR i IN 0 TO 1 GENERATE  --IP-адрес мезанина
+			IF (AddrBus_In[] ==  2056+i) THEN DataBusOut_[] = Module_IP_Reg[i].q[];
+											  Module_IP_Reg_CS[i] = VCC;
+										 ELSE Module_IP_Reg_CS[i] = GND;
+			END IF;
+	END GENERATE;
+		
+		-- MAC-адрес последнего отправившего посылку устройства
+	IF (AddrBus_In[] ==  2058) THEN DataBusOut_[7..0] = Source_MAC_Reg[0].q[15..8]; DataBusOut_[15..8] = Source_MAC_Reg[0].q[7..0]; END IF;
+	IF (AddrBus_In[] ==  2059) THEN DataBusOut_[7..0] = Source_MAC_Reg[1].q[15..8]; DataBusOut_[15..8] = Source_MAC_Reg[1].q[7..0]; END IF;
+	IF (AddrBus_In[] ==  2060) THEN DataBusOut_[7..0] = Source_MAC_Reg[2].q[15..8]; DataBusOut_[15..8] = Source_MAC_Reg[2].q[7..0]; END IF;
+	
+		-- Port мезанина
+	IF (AddrBus_In[] ==  2061) THEN DataBusOut_[] = Port_Reg.q[];--DataBusOut[7..0] = Port_Reg.q[15..8]; DataBusOut[15..8] = Port_Reg.q[7..0];
+                                        Port_Reg_CS  = VCC;
+		                           ELSE Port_Reg_CS  = GND;
+	END IF;
+		
+	IF (AddrBus_In[] ==  2062) THEN DataBusOut_[] = Test_Reg.q[];
+                                        Test_Reg_CS  = VCC;
+		                           ELSE Test_Reg_CS  = GND;
+	END IF;
+	
+	IF (AddrBus_In[] ==  2063) THEN DataBusOut_[] = Pkt_parcer.Identification[]; END IF;
+	IF (AddrBus_In[] ==  2064) THEN DataBusOut_[] = GND; END IF;--Raw_Decoder.Identification[];  END IF;
+	
+	IF (AddrBus_In[] ==  2065) THEN DataBusOut_[] = Rx_Packet_Cnt.q[]; END IF;
+	IF (AddrBus_In[] ==  2066) THEN DataBusOut_[] = Tx_Packet_Cnt.q[]; END IF;
+	IF (AddrBus_In[] ==  2067) THEN DataBusOut_[] = GND; Rx_Packet_Cnt_Reset = DataBusStrobe AND DirectIn AND Select; 
+							   ELSE Rx_Packet_Cnt_Reset = GND;
+	END IF;
+	IF (AddrBus_In[] ==  2068) THEN DataBusOut_[] = GND; Tx_Packet_Cnt_Reset = DataBusStrobe AND DirectIn AND Select;
+							   ELSE Tx_Packet_Cnt_Reset = GND;
+	END IF;
+	
+   
+--***************************************************************************
+   
+      
+    -- MAC-адрес и IP-адрес мезанина
+   FOR i IN 0 TO 2 GENERATE  
+			Module_MAC_Reg[i].(data[],clock, load, enable) = (DataBus_In[],Clock,VCC, Module_MAC_Reg_CS[i] AND DataBusStrobe AND DirectIn AND Select);
+   END GENERATE;
+   FOR i IN 0 TO 1 GENERATE  
+			Module_IP_Reg[i].(data[],clock, load, enable) = (DataBus_In[],Clock,VCC, Module_IP_Reg_CS[i] AND DataBusStrobe AND DirectIn AND Select);
+   END GENERATE;
+   Port_Reg.(data[],clock, load, enable) = (DataBus_In[],Clock,VCC, Port_Reg_CS AND DataBusStrobe AND DirectIn AND Select);
+   Test_Reg.(data[],clock, load, enable) = (DataBus_In[],Clock,VCC, Test_Reg_CS AND DataBusStrobe AND DirectIn AND Select);
+    
+   Status_REG_ES.(d,clk) 				   	= (Status_REG_CS AND Select, Clock);
+   Status_REG.(clock, load, enable) 	   	= (BUS_Clock, VCC,  Status_REG_ES.q);
+   Status_REG.data[12..0]   			   	= GND;--RxByte_Cnt.q[];
+   Status_REG.data[13]     				   	= RxReadyToRecive.q;
+   Status_REG.data[14]     					= GND;
+   Status_REG.data[15]     				    = GND;
+
+  
+   -- определяем число отправляемых байт
+   PacketLenghts_to_be_transmitted_Reg.(data[],clock, load, enable) = (PacketLenghts_DataBus[], BUS_Clock, VCC, PacketLenghts_to_be_transmitted_Reg_EN);
+   IF(Select==VCC) THEN PacketLenghts_DataBus[] = DataBus_In[];  PacketLenghts_to_be_transmitted_Reg_EN = (PacketLenghts_to_be_transmitted_Reg_CS AND DataBusStrobe AND DirectIn AND Select);
+                   ELSE 
+						PacketLenghts_DataBus[RxByte_Cnt_Width..0]  = (RxByte_Cnt.q[]-7); -- вычитаем 7 байт 
+						PacketLenghts_DataBus[15..RxByte_Cnt_Width+1] = GND;
+						PacketLenghts_to_be_transmitted_Reg_EN = AnswerTxStart;
+   END IF; 
+   RxByte_Cnt_Reg.data[RxByte_Cnt_Width..0]  = (RxByte_Cnt.q[]-1);
+   RxByte_Cnt_Reg.data[15..RxByte_Cnt_Width+1] = GND;
+   RxByte_Cnt_Reg.(clock, load, enable) = (Clock,VCC,Edge_Sensing_Sync(.d=FIFO_to_RxRAM_Copy,.clk=Clock));
+   
+   ------------ счетчики пришедших(опознаным MAC-адресом) и отправленных пакетов
+   Rx_Packet_Cnt.(clock,cnt_en,sclr) = (BUS_Clock,Edge_Sensing_Sync(.d=Pkt_parcer.MAC_recognized,.clk=BUS_Clock),Rx_Packet_Cnt_Reset);  
+   Tx_Packet_Cnt.(clock,cnt_en,sclr) = (BUS_Clock,Edge_Sensing_Sync(.d=AnswerTxStart,.clk=BUS_Clock),Tx_Packet_Cnt_Reset);  
+
+END;

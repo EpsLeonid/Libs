@@ -1,0 +1,166 @@
+TITLE "Ethernet packets byte decoder";
+
+CONSTANT NumRxByte  = 2048;
+CONSTANT RxByte_Cnt_Width = Ceil( LOG2(NumRxByte));
+
+Constant WORD_WIDTH	= 16; 
+
+
+SUBDESIGN EthByteDecoder
+(
+   Clock                    : input;
+
+-- PHY Ethernet I/O
+   -- Rx section
+   Byte_Strobe          		: input;
+   Rx_Data[7..0]       	 		: input;
+   Packet_in_progress   		: input;
+   Packet_End              		: input;
+   
+   Packet_Decode_Error			: output;
+   
+   
+ -- Standard Bus signaling for Master/Slave connection
+	-- General Signals
+   Bus_Clock					: input;  -- частота работы модуля 
+   DataBusStrobe				: input ; -- строб приема/передачи данных наружу (высокий уровень, защелкиваем по заднему фронту)
+   AddrBus_In[8..0]				: input ; -- шина адреса для доступа в пространство памяти
+ 
+   Reset						: input=gnd ; -- Common FPGA signal Reset (Active HIGH)
+   DataBus_In[WORD_WIDTH-1..0]	: input ; -- 
+   DataBusOut[WORD_WIDTH-1..0]	: output; -- 
+    
+	-- Master Mode Signals -- eniieucoaony i?e ?aaioa aaiiiai Iiaoey a ?a?eia Master)
+   AccessRequest			    : output; -- cai?in e A?aeo?o ia ainooi e oeia aey ?oaiey/caiene aaiiuo Iieuciaaoaey a ?a?eia Master	
+   AccessGranted			    : input;  -- ?ac?aoaiea A?aeo?a aunoaaeou Aa?an e iai?aaeaiea iaiaia (caoaao oeiu)
+   DirectOut				    : output; -- iai?aaeaiea ia?aaa?e aaiiuo, ia aioo?aii?? oeio eee n iaa, ii oiie?aie? =GND, ia?aaa?a io aioo?aiieo ?ano?nia ieaou Iiaoeu,
+   AddrBusOut[WORD_WIDTH-1..0]	: output; -- aa?an i?e iia?aoeyo ainooia ei aioo?aiiei ?ano?nai Ioeo?iaueea (?oaiey/caiene ii Eiiaiaiiio Eenoo).
+   Direct_In				    : input; 
+		-- Slave Mode Signals	-- eniieucoaony i?e ?aaioa aaiiiai Iiaoey a ?a?eia Slave
+   Select					   	: input ;
+
+)
+
+VARIABLE
+
+   RxByte_Cnt       	    	: LPM_COUNTER WITH (LPM_WIDTH = RxByte_Cnt_Width);
+   Cnt_Enable					: node;
+   Cnt_Overflow_Edge			: Edge_Sensing_Sync;
+   
+   
+   MAC_receiver_REG[5..0]   	: LPM_SHIFTREG with (lpm_width=8); -- здесь храниться MAC адрес получателя
+   MAC_receiver_REG_CS[5..0]	: node;
+   MAC_source_REG[5..0]     	: LPM_SHIFTREG with (lpm_width=8); -- здесь храниться MAC адрес отправителя
+   MAC_source_REG_CS[5..0]      : node;
+   Internal_MAC_REG[5..0]   	: LPM_SHIFTREG with (lpm_width=8); -- здесь храниться внутренний MAC адрес этого устройства
+   
+   Type_REG[1..0]               : LPM_SHIFTREG with (lpm_width=8);
+   Type_REG_CS[1..0]            : node;
+   
+   Command_REG                  : LPM_SHIFTREG with (lpm_width=8);
+   Command_REG_CS		        : node;  
+   WriteCommands                : node;
+   ReadWord                     : node;
+   WriteWord                    : node;
+   
+   Master_Requiest              : node;
+   
+   Addr_REG[1..0]               : LPM_SHIFTREG with (lpm_width=8);
+   Addr_REG_CS[1..0]            : node;
+   Data_REG[1..0]               : LPM_SHIFTREG with (lpm_width=8);
+   Data_REG_CS[1..0]            : node;
+   
+BEGIN
+   
+   RxByte_Cnt.(clock,clk_en,cnt_en,sclr) = (Clock,VCC,Byte_Strobe AND Cnt_Enable,Packet_in_progress);
+   IF 	(AdRcnt[10..0].q == h"7ff") 
+		THEN Cnt_Enable	=	GND;
+		ELSE Cnt_Enable	=	VCC;
+   END IF;
+   Cnt_Overflow_Edge.(clk,d)	=	(Clock, Cnt_Enable); -- неверный размер пакета
+   
+   
+   Packet_Decode_Error = Cnt_Overflow_Edge.q OR Indefinite_MAC; -- пакет не определен 
+   
+   FOR i IN 0 TO 5 GENERATE
+      -- защелкиваем MAC адрес получателя
+      IF (RxByte_Cnt.q[] == i) THEN MAC_receiver_REG_CS[i] = VCC;
+                               ELSE MAC_receiver_REG_CS[i] = GND;
+      END IF;
+      MAC_receiver_REG[i].(data[],clock, load, enable) = (Rx_Data[],Clock,VCC,Byte_Strobe AND MAC_receiver_REG_CS[i]);
+      -- защелкиваем MAC адрес отправителя
+      IF (RxByte_Cnt.q[] == i+6) THEN MAC_source_REG_CS[i] = VCC;
+                                 ELSE MAC_source_REG_CS[i] = GND;
+      END IF;
+      MAC_source_REG[i].(data[],clock, load, enable) = (Rx_Data[],Clock,VCC,Byte_Strobe AND MAC_source_REG_CS[i]);
+      -- проверяем полученный MAC адрес
+      IF (RxByte_Cnt.q[] == i+6) THEN IF ((MAC_receiver_REG[i].q[] == Internal_MAC_REG[i].q[]) OR( MAC_receiver_REG[i].q[] == h"FF")) THEN Indefinite_MAC = GND;
+                                                                                                                                      ELSE Indefinite_MAC = VCC;
+                                      END IF;
+      END IF;
+   END GENERATE;
+   
+   -- защелкиваем код протокола   
+   FOR i IN 0 TO 1 GENERATE
+      IF (RxByte_Cnt.q[] == i+12) THEN Type_REG_CS[i] = VCC;
+                                  ELSE Type_REG_CS[i] = GND;
+      END IF;
+      Type_REG[i].(data[],clock, load, enable) = (Rx_Data[],Clock,VCC,Byte_Strobe AND Type_REG_CS[i]);
+   END GENERATE;
+  
+   
+   
+   -- защелкиваем команду
+   IF (RxByte_Cnt.q[] == 14) THEN Command_REG_CS = VCC;
+                             ELSE Command_REG_CS = GND;
+   END IF;
+   Command_REG.(data[],clock, load, enable) = (Rx_Data[],Clock,VCC,Byte_Strobe AND Command_REG_CS);
+   -- дешифруем команду
+   IF(Packet_Decode_Error == GND) THEN
+     CASE Command_REG.q[] IS
+		WHEN B"0x01" =>	ReadWord		= VCC;
+		WHEN B"0x02" =>	WriteWord		= VCC;
+	    WHEN OTHERs  =>	ReadData		= GND;
+						WriteData		= GND;
+     END CASE;
+   END IF;
+   WriteCommands = WriteWord;
+   
+--????????????????????????????????????????????????????
+   FOR i IN 0 TO 254 GENERATE  -- защелкиваем данные (2x8бит адрес, 2x8бит данные)  всего максимум 1020байт, т.е 1020/4 = 255 слов данных можно записать по указанным адресам
+      IF (RxByte_Cnt.q[] == i*4+15) THEN Addr_REG_CS[0] = VCC;
+                                    ELSE Addr_REG_CS[0] = GND;
+      END IF;
+      IF (RxByte_Cnt.q[] == i*4+16) THEN Addr_REG_CS[1] = VCC;
+                                    ELSE Addr_REG_CS[1] = GND;
+      END IF;
+      
+      IF (RxByte_Cnt.q[] == i*4+17) THEN Data_REG_CS[0] = VCC;
+                                    ELSE Data_REG_CS[0] = GND;
+      END IF;
+      IF (RxByte_Cnt.q[] == i*4+18) THEN Data_REG_CS[1] = VCC; Master_Requiest = VCC;
+                                    ELSE Data_REG_CS[1] = GND; Master_Requiest = GND;
+      END IF;
+   END GENERATE;
+   Addr_REG[0].(data[],clock, load, enable) = (Rx_Data[],Clock,VCC,Byte_Strobe AND Addr_REG_CS[0]);
+   Addr_REG[1].(data[],clock, load, enable) = (Rx_Data[],Clock,VCC,Byte_Strobe AND Addr_REG_CS[1]);
+   Data_REG[0].(data[],clock, load, enable) = (Rx_Data[],Clock,VCC,Byte_Strobe AND Data_REG_CS[0]);
+   Data_REG[1].(data[],clock, load, enable) = (Rx_Data[],Clock,VCC,Byte_Strobe AND Data_REG_CS[1]);
+
+ 
+   -- Master Access Control
+   -- отправляем данные на шину проекта
+   Access_Request.S  	=	Requiest_Enable; 
+   Access_Request.clk 	=  	Clock;
+   Access_Request.R  	=	Data_Sent_OK; 
+   AccessRequest		=	Access_Request.q;
+   DirectOut            =   --???;
+
+   Data_Sent_OK	    	=	DataBusStrobe AND AccessGranted;
+   Requiest_Enable     	=   Byte_Strobe AND Master_Requiest AND WriteCommands;
+   
+   
+   AddrBusOut[WORD_WIDTH-1..0] = (Addr_REG[1].q[],Addr_REG[0].q[]);
+   DataBusOut[WORD_WIDTH-1..0] = (Data_REG[1].q[],Data_REG[0].q[]);	
+
+END;

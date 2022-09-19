@@ -1,0 +1,195 @@
+Title "DDR shaper and register module";
+
+
+Include "LPM_Counter.inc";
+Include "LPM_shiftreg.inc";
+Include "Discr_TOT_RAM.inc";
+
+Include "Pulse_Shaper.inc";
+Include "Pulse_Shaper_Restartable.inc";
+Include "Coincidence_Module.inc";
+INCLUDE "Edge_Sensing.inc";
+
+
+Constant WORD_WIDTH	 = 16;
+Constant CHANNEL_NUM = 8;
+
+Constant OUT_NUM = CHANNEL_NUM * 4;
+
+CONSTANT Input_Freq = 100000000; -- входная частота 100МГц
+CONSTANT PRESCALER_RATIO = Input_Freq DIV 1;    -- шаг 1 с
+CONSTANT PRESCALER_SIZE = FLOOR(LOG2(PRESCALER_RATIO))+1; -- определяем размер счетчика-делителя для получения секундных интервалов
+
+
+
+
+SUBDESIGN Discr_Time_Channel
+(
+	Clock						: input ; -- частота работы модуля 
+	Clock_x_2					: input ; -- частота работы модуля 
+	
+-- Skeleton BUS signals	
+	DataBusStrobe				: input ; -- строб приема/передачи данных наружу (высокий уровень, защелкиваем по заднему фронту)
+	DirectIn					: input ; -- направление передачи данных на шину КАМАК
+    AddrBusIn[10..0]			: input ; -- шина адреса для доступа в пространство памяти
+	DataBusIn[WORD_WIDTH-1..0]  : input  ; -- 
+	DataBusOut[WORD_WIDTH-1..0] : output ; -- 
+	Select						: input  ; -- Module Select from External Address Comparator
+ 	Reset						: input=gnd ; -- Common FPGA signal Reset (Active HIGH)
+
+
+-- Function Specific Signals
+	DDR_In_H[CHANNEL_NUM-1..0]	: input;
+	DDR_In_L[CHANNEL_NUM-1..0]	: input;
+	DDR_Out[OUT_NUM-1..0]		: output;
+
+	Trigger_In					: input;
+	Trigger_Out			   		: output;
+	
+	LinkMsg                     : input; -- сигнал о работе линка (общий стоп)
+	
+	
+	
+	-- test signals
+	DDR_In_H_out[7..0] 			: output;
+	DDR_In_L_out[7..0] 			: output;
+	DDR_Trig_En_Out				: output;
+)
+
+Variable 
+   -- поиск и фиксирование TOT времени   
+   DDR_Trig_H_H[CHANNEL_NUM-1..0]				  : DFFE;
+   DDR_Trig_H_L[CHANNEL_NUM-1..0]				  : DFFE;
+   DDR_Trig_L_H[CHANNEL_NUM-1..0]				  : DFFE;
+   DDR_Trig_L_L[CHANNEL_NUM-1..0]				  : DFFE;
+   DDR_Trig_En									  : DFF;
+ 
+   TOT_RAM										  : Discr_TOT_RAM;
+   TOT_RAM_CS 									  : node;
+   TOT_RAM_Addr_Cnt			  					  : LPM_COUNTER with ( lpm_width=9);
+   TOT_RAM_AddrBus[9..0]                          : node;
+   TOT_RAM_Addr_Cnt_Shift[9..0]                   : node;
+   
+   Coincidence_CNT_RST                            : node;
+      
+   DDR_Out_Reg									  : lpm_shiftreg with (LPM_WIDTH = OUT_NUM, LPM_DIRECTION="unused");
+   
+   -- схема совпадения
+   Shaper_H[7..0]                                 : Pulse_Shaper_Restartable with (MAX_DURATION = 32);
+   Shaper_L[7..0]                                 : Pulse_Shaper_Restartable with (MAX_DURATION = 32);
+   Permitting_Time_Reg							  : lpm_shiftreg with (LPM_WIDTH = WORD_WIDTH, LPM_DIRECTION="unused");
+   Permitting_Time_Reg_CS						  : node;
+   
+   Coincidence 									  : Coincidence_Module;
+   Coincidence_CS 								  : node;
+   Shaper_Tigger                                  : Pulse_Shaper with (MAX_DURATION = 32);
+   -- пересчетка совпадений
+   Prescaler_1s									  : LPM_COUNTER with (lpm_width=PRESCALER_SIZE, lpm_direction="UNUSED");
+   Prescaler_1s_Rst								  : node; 
+   Coincidence_CNT								  : LPM_COUNTER with ( lpm_width=WORD_WIDTH*2, lpm_direction="up" );
+   Coincidence_CNT_Reg							  : lpm_shiftreg with (LPM_WIDTH = WORD_WIDTH*2, LPM_DIRECTION="unused");
+
+ 
+ BEGIN
+
+   DDR_Trig_En.(d,clk) = (!DDR_Trig_En.q,Clock_x_2);
+   
+   DDR_Out_Reg.(clock, enable, load)	=	(Clock, VCC, VCC);
+   DDR_Out_Reg.data[7..0]   = DDR_Trig_H_H[7..0].q;
+   DDR_Out_Reg.data[15..8]  = DDR_Trig_H_L[7..0].q;
+   DDR_Out_Reg.data[23..16] = DDR_Trig_L_H[7..0].q;
+   DDR_Out_Reg.data[31..24] = DDR_Trig_L_L[7..0].q;
+   
+   FOR i IN 0 TO CHANNEL_NUM-1 GENERATE
+ 		DDR_Trig_H_H[i].(d,clk,ena) = (DDR_In_H[i],Clock_x_2, DDR_Trig_En.q);
+		DDR_Trig_H_L[i].(d,clk,ena) = (DDR_In_L[i],Clock_x_2, DDR_Trig_En.q);
+		DDR_Trig_L_H[i].(d,clk,ena) = (DDR_In_H[i],Clock_x_2,!DDR_Trig_En.q);
+		DDR_Trig_L_L[i].(d,clk,ena) = (DDR_In_L[i],Clock_x_2,!DDR_Trig_En.q);
+   END GENERATE;
+   
+   TOT_RAM.clock_a     = Clock;
+   TOT_RAM.address_a[] = TOT_RAM_AddrBus[9..0];--AddrBusIn[9..0];
+   TOT_RAM.data_a[]    = DataBusIn[];
+   TOT_RAM.wren_a      = TOT_RAM_CS AND DataBusStrobe AND DirectIn AND Select;  
+   
+   TOT_RAM.clock_b     = Clock;
+   TOT_RAM.address_b[] = TOT_RAM_Addr_Cnt.q[8..0];--TOT_RAM_AddrBus[8..0];
+   TOT_RAM.data_b[]    = DDR_Out_Reg.q[];
+   TOT_RAM.wren_b      = !LinkMsg;  
+   
+   TOT_RAM_Addr_Cnt.(clock, cnt_en) = (Clock, !LinkMsg);
+  -- TOT_RAM_AddrBus[8..0] = TOT_RAM_Addr_Cnt.q[8..0] - AddrBusIn[8..0]-1; -- выставление адреса в 0 для текущего набора
+   TOT_RAM_AddrBus[9..0] = TOT_RAM_Addr_Cnt_Shift[9..0] - AddrBusIn[9..0]-1; -- выставление адреса в 0 для текущего набора
+   TOT_RAM_Addr_Cnt_Shift[9..1] = TOT_RAM_Addr_Cnt.q[8..0];
+   TOT_RAM_Addr_Cnt_Shift[0] = GND; 
+     
+   DDR_Out[] = DDR_Out_Reg.q[];
+ 
+   --********************** схема совпадения ******************************
+   Permitting_Time_Reg.(clock,enable,load) = (Clock, Permitting_Time_Reg_CS AND Select AND DirectIn AND DataBusStrobe,VCC);
+   Permitting_Time_Reg.data[] = DataBusIn[];
+   FOR i IN 0 TO 7 GENERATE
+       Shaper_H[i].clk = Clock_x_2;
+       Shaper_H[i].d   = DDR_In_H[i];
+       Shaper_H[i].Duration[] = Permitting_Time_Reg.q[5..0];
+       Shaper_H[i].cnt_en = VCC;
+       
+       Shaper_L[i].clk = Clock_x_2;
+       Shaper_L[i].d   = DDR_In_L[i];
+       Shaper_L[i].Duration[] = Permitting_Time_Reg.q[5..0];
+       Shaper_L[i].cnt_en = VCC;
+        
+       Coincidence.Signal_In[i]	= Shaper_L[i].q OR Shaper_H[i].q;
+   END GENERATE;
+   
+   Coincidence.Clock 			= Clock;
+   Coincidence.Clock_x_2 		= Clock_x_2;
+   Coincidence.DataBusStrobe 	= DataBusStrobe;
+   Coincidence.AddrBusIn[] 		= AddrBusIn[3..0];
+   Coincidence.DirectIn 		= DirectIn;
+   Coincidence.DataBusIn[] 		= DataBusIn[];
+   Coincidence.Select			= Select AND Coincidence_CS;
+   
+   
+   Shaper_Tigger.clk = Clock_x_2;
+   Shaper_Tigger.d   = Coincidence.Trigger_Out;
+   Shaper_Tigger.Duration[] = 2;
+   Shaper_Tigger.cnt_en = VCC;
+      
+   Trigger_Out = Shaper_Tigger.q;
+   
+   
+   -- получаем опорную частоту для получения секундных интервалов (длительность 1 Сlock такт) 
+   Prescaler_1s.(clock,sclr) = (Clock, Prescaler_1s_Rst);
+   IF (Prescaler_1s.q[] == PRESCALER_RATIO) THEN Prescaler_1s_Rst = VCC;
+                                            ELSE Prescaler_1s_Rst = GND;
+   END IF;
+   Coincidence_CNT.clock  = Clock;
+   Coincidence_CNT.cnt_en = Edge_Sensing(.d=Shaper_Tigger.q,.clk=Clock);
+   Coincidence_CNT.sclr   = Coincidence_CNT_RST OR Prescaler_1s_Rst;
+   Coincidence_CNT_Reg.(clock,enable,load) = (Clock,Prescaler_1s_Rst,VCC);
+   Coincidence_CNT_Reg.data[] = Coincidence_CNT.q[];
+  
+  
+   -- работа со скелетской шиной
+   IF ((AddrBusIn[] >= 0) AND (AddrBusIn[] <= 1023)) THEN DataBusOut[] = TOT_RAM.q_a[]; TOT_RAM_CS = VCC;
+													 ELSE TOT_RAM_CS = GND;
+   END IF;
+   IF ((AddrBusIn[10..0] >= 1024) AND (AddrBusIn[] < 1024+16)) THEN DataBusOut[] = Coincidence.DataBusOut[]; Coincidence_CS = VCC; 
+															   ELSE Coincidence_CS = GND;
+   END IF;
+   IF ( AddrBusIn[10..0] == 1024+16) THEN DataBusOut[] = Permitting_Time_Reg.q[]; Permitting_Time_Reg_CS = VCC;
+								     ELSE Permitting_Time_Reg_CS = GND;
+   END IF;
+   IF ( AddrBusIn[10..0] == 1024+17) THEN DataBusOut[] = Coincidence_CNT_Reg.q[15..0]; END IF;
+   IF ( AddrBusIn[10..0] == 1024+18) THEN DataBusOut[] = Coincidence_CNT_Reg.q[31..16]; END IF;
+   IF ( AddrBusIn[10..0] == 1024+19) THEN DataBusOut[] = GND; Coincidence_CNT_RST = Select and DirectIn and DataBusStrobe;
+							         ELSE Coincidence_CNT_RST = GND;
+   END IF;
+
+   -- test signals
+   DDR_In_H_out[7..0] = DDR_Trig_H_H[7..0].q;
+   DDR_In_L_out[7..0] = DDR_In_H[7..0];
+   DDR_Trig_En_Out    = DDR_Trig_En.q;
+  
+END;

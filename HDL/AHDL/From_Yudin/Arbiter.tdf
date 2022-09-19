@@ -1,0 +1,179 @@
+%
+This function ONLY defines how Master device asserts address on Address Lines. 
+Read or Write data through Data Lines is under Master control.  Target Slave 
+device is selected by recognizing its address.  Selected Slave device performs 
+input/output of data according to Read/Write request signal of Master.
+When Target is READY for transfer, DataStrobe signal is generated to complete 
+the cycle.
+%
+TITLE "Arbiter";
+-- Ver3.6 (14.09.2009)
+
+%
+Bus access is organized in some steps:
+1. Master Device asserts "Bus Access ReQuiest".
+2. At positive transitions of CLK supplied to Arbiter "Bus Access GranteD" occuried.
+If more than one requiest found, high priority device will be granted first.
+3. Master Device which is granted, opens tri-state buffers and thus asserts "Adderess Lines" and "Bus Direction" .
+4. At next positive transition of CLK "Address Valid" signal asserted by Arbiter. 
+5. Now it's some WaiteStates inserted to address decode by Targets'.
+6. When any Target Device recognize it's address, (Address decoded), It asserts signal "Target Ready".
+7. At positive transitions of CLK signal "Target Ready" sampled and, if present, 
+signal "Data Strobe" generated. "Data Strobe" is 1T of CLK, negative transitions
+is the end of transfer cycle.
+P.S. 
+1.  If address has not been recognized ( => AddressValid has not flipped to =1) 
+  while TimeOut expired, "Error" signal is generated, and "Data Strobe" is 
+  generated to finish the current bus access cycle.
+2.  If device granted does not remove request after bus cycle completed it 
+will be ignored for 1 clock cycle.
+This features are to be used at initial system testing, ajusting.
+%
+
+
+include "lpm_counter.inc"  ;
+--constant DeviceMaxNumber = 4;
+
+PARAMETERS
+(
+DeviceMaxNumber = 2, -- Number of Master Devices connected to Bus, default = 4
+TimeOut         = 4  -- Maximum waiting time for "TargetReady", default = 4Tclk
+);
+ASSERT (TimeOut>1) and (TimeOut<60)
+	report "Arbiter TimeOut should be 1..60" ;
+	 
+Subdesign Arbiter
+(
+-- Requestes from Master devices for access to Bus
+BARQ[DeviceMaxNumber-1..0]  : INPUT = GND; 
+
+-- "Access Granted" signals to Master devices
+BAGD[DeviceMaxNumber-1..0]  : OUTPUT;
+
+--Negotiation signals
+AddressSettled  : OUTPUT; -- Flag: Address is settled on Address Bus
+AddressValid    : INPUT;  -- Address is recognized as VALID one
+DataStrobe      : OUTPUT; -- 1-clock _/^^\_ when data is ready
+
+clock           : INPUT;  -- System clock
+Reset           : INPUT;  -- Reset, Active High
+Error           : OUTPUT; -- One clock HIGH when TimeOut occured
+
+--Test1, Test2        : output; 
+)
+
+
+VARIABLE
+
+BARQ_inBuff[DeviceMaxNumber-1..0]   : DFFE ; -- Input sampling
+BAGD_outBuff[DeviceMaxNumber-1..0]  : DFFE ; -- Output strobed (optional)
+Mask_Buff[DeviceMaxNumber-1..0]     : DFFE ; -- Register_of_Mask
+
+TimeOutCnt      : LPM_COUNTER with (LPM_WIDTH = 6, LPM_DIRECTION = "Down");
+
+Trig1           : node; -- registered "AddressValid"
+Trig2           : node;
+Trig3           : node; -- Shaping of "DataStrobe"
+
+BARQ_OR                         : NODE;
+BARQ_OR_[DeviceMaxNumber..0]    : node;
+BAGD_OR                         : NODE;
+BAGD_OR_[DeviceMaxNumber..0]    : node;
+RST                             : NODE;  -- RESET
+
+wire_AND[DeviceMaxNumber-2..0]  : node;                              
+
+
+BEGIN
+
+--============================================================================
+DEFAULTS 
+    wire_AND[] = VCC;  -- доопределяем явно до логической 1
+END Defaults;
+
+--============================================================================
+--******** Bus connection ********
+-- Inputs 
+FOR i in 0 to (DeviceMaxNumber-1) GENERATE
+BARQ_inBuff[i].(d, clk) = (BARQ[i], clock); 
+BARQ_inBuff[i].clrn     = !Mask_Buff[i].q;
+-- Outputs
+--BAGD_outBuff[i].d   = see below, in Priority Encoder section
+BAGD_outBuff[i].(clk, clrn) = (clock, !RST);
+BAGD[i]             = BAGD_outBuff[i].q;
+
+Mask_Buff[i].(d, clk, ena)  = (BAGD_outBuff[i].q, clock, DataStrobe);
+Mask_Buff[i].clrn   = !RST ;
+End GENERATE;
+
+-- Inpit sampling control
+BARQ_OR_[0] = GND;
+FOR i in 0 to (DeviceMaxNumber-1) GENERATE
+   BARQ_OR_[i+1] = BARQ_OR_[i] OR BARQ_inBuff[i];
+   BARQ_inBuff[i].ena=!BARQ_OR; -- IF any request exist, stop next sampling
+End GENERATE;
+BARQ_OR = BARQ_OR_[DeviceMaxNumber];
+
+--============================================================================
+--******** Priority Encoder to ensure single active BAGD ********
+
+-- Highest Priority input:
+BAGD_outBuff[DeviceMaxNumber-1].d= BARQ_inBuff[DeviceMaxNumber-1].q;
+-- Other inputs:
+FOR j in 0 to (DeviceMaxNumber-2)  GENERATE
+   wire_AND[j]  = BARQ_inBuff[j].q;
+   FOR i in j to (DeviceMaxNumber-2)  GENERATE
+      wire_AND[j]   = !BARQ_inBuff[i+1].q;
+   End GENERATE;
+   BAGD_outBuff[j].d    = wire_AND[j];
+End GENERATE;
+
+--============================================================================
+--************ Bus Access Chronogram Generation ******************************
+--100MHz Clock  __/^^^\___/^^^\___/^^^\___/^^^\___/^^^\___/^^^\___/^^^\___/^^^\__
+--BARQ_in[#Mast]___/^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\___
+--  BAGD[#Mast] ___________/^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\___
+--AddressSettled___________________/^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\___
+--  DevSel[#n].D______________//////////^^^^^^ if Addr recognized, flips to =1
+--  DevSel[#n].Q___________________________/^^ if Addr recognized, flips to =1
+-- AddressValid ____________________________///^^^^if DevSel appears, flips to =1
+--        Trig1 ___________________________________/^^^^^^^^^^if AddressValid=1
+--   DataStrobe ___________________________________________________/^^^^^^^\___
+
+BAGD_OR_[0] = GND;
+FOR i in 0 to (DeviceMaxNumber-1) GENERATE
+   BAGD_OR_[i+1] = BAGD_OR_[i] OR BAGD_outBuff[i];
+End GENERATE;
+BAGD_OR = BAGD_OR_[DeviceMaxNumber];
+
+AddressSettled  = DFF(.D=BAGD_OR, .clk=clock, .clrn=!RST); -- AddressValid is ..
+                                       -- .. by 1clk later than BAGD
+
+--============================================================================
+-- From "Target Ready" to "Data Strobe" control
+--		Derive 1clock wide pulse from positive edge of Target Ready
+--
+Trig1 = DFF(.D=AddressValid,.clk=clock, .clrn=!RST);-- reset after DataStrobe or by Reset
+Trig2 = DFF(.D=Trig1,  .clk=clock, .clrn=!RST); -- reset after DataStrobe or by Reset
+Trig3 = DFF(.D=Trig2,  .clk=clock, .clrn=!RST); -- reset after DataStrobe or by Reset
+
+DataStrobe = DFF(.D=((Trig2 & !Trig3) OR Error), .clk=clock); -- _/^\_
+
+RST     = DFF(.D=DataStrobe,            --\  when data transfer done..
+              .clk=clock,               -- > .. or by external Reset ..
+              .prn=!Reset);             --/  ..Reset ARBITER to initial state
+
+--Time_Out Timer: Starts on "AddressValid", reset at next clock after DataStrobe
+    -- Since the delay from _/ of TargetReady to _/ of RST is 2clocks => 
+    -- => the actual value from which the CountDown begins should be (TimeOut+2) !!
+TimeOutCnt.data[]   = (TimeOut+2);      -- initial value to be loaded
+TimeOutCnt.(clock, clk_en)  = (clock, VCC);
+TimeOutCnt.cnt_en   = AddressSettled;   -- Count enabled when Address settled
+TimeOutCnt.sload    = RST ;             -- (Re)Set to initial state
+
+Error = DFF(.D=TimeOutCnt.eq0, .clk=clock); -- Error marker for external light
+
+--test1   = Trig3;
+--test2   = TimeOutCnt.eq0;
+
+END;

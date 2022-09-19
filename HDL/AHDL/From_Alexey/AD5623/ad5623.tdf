@@ -1,0 +1,121 @@
+TITLE "AD5623";
+
+INCLUDE "DAC_RAM.inc";
+--INCLUDE "Edge_Sensing.inc";
+INCLUDE "lpm_counter.inc";
+INCLUDE "lpm_shiftreg.inc";
+constant PresclrValue   = 4;-- 50MHz Fmax
+Constant HalfPresclr    = FLOOR( PresclrValue DIV 2);
+constant DAC_cycle_len       = 32; --24bit + 8 idle
+Constant WordNumber     = 5;
+Constant Stopping_bit     = WordNumber * DAC_cycle_len;--128;
+
+Constant Order_BitCt    = Ceil( LOG2(DAC_cycle_len))+1;
+Constant Order_WordCt   = Ceil( LOG2(WordNumber))+1;
+Constant Order_Presc    = Ceil( LOG2(PresclrValue))+1;
+
+SUBDESIGN AD5623
+(
+--Design specific inputs outputs
+Conv_Clock							: INPUT ;
+--Conversion_Start,Conversion_Stop	: INPUT ;
+--Non_Stopping						: INPUT ;
+
+DAC_DATA							: OUTPUT ;
+DAC_nCS,DAC_nCLK					: OUTPUT;
+
+DAC_is_busy							: OUTPUT;
+
+--ADC_Data_Out[11..0]					: OUTPUT;
+--ADC_Data_Strobe						: OUTPUT;
+
+--Standart BUS input output
+	Bus_Clock					: input ; -- частота работы модуля (25..125МГц). Main clock, assumed F_link x 4 = 100MHz
+	DataBusStrobe				: input ; -- строб приема/передачи данных наружу (высокий уровень, защелкиваем по заднему фронту)
+	Direct_In					: input ; -- направление передачи данных на шину КАМАК
+    AddrBus_In[7..0]			: input ; -- шина адреса для доступа в пространство памяти
+	DataBus_In[15..0]  			: input  ; -- 
+	DataBusOut[15..0] 			: output ; -- 
+	Select						: input  ; -- Module Select from External Address Comparator
+ 	Reset						: input=gnd ; -- Common FPGA signal Reset (Active HIGH)
+--	Error						: OUTPUT;
+)
+
+VARIABLE
+RAM_DAC					: DAC_RAM;
+PRESCALER				:lpm_counter with (lpm_width=Order_Presc, lpm_direction="up" );
+DACclk						:node;
+DAC_nCS_					:node;
+
+SPI_Start					:DFFE;
+Sample_ena					:DFF;
+RAM_Read_Pointer			:lpm_counter with (lpm_width=12, lpm_direction="up" );
+SPI_Stop					:DFFE;
+Work_is_in_Progress			:SRFFE;
+
+BEGIN
+--DEFAULTS
+--ADCcs=VCC; --ADCclk=VCC;
+--END DEFAULTS;
+
+--Prescaler clock divider----------------------------------
+  PRESCALER.clock= Conv_Clock;
+  PRESCALER.sclr=(PRESCALER.q[]==PresclrValue-1);--OR !Digitizer_Active_Flag;--na?anuaaai n?ao?ee anee iu ia a oeeea eee ainoeaee eiioa n?aoa
+--  ADCclk=(PRESCALER.q[]=>(HalfPresclr-1));--oi?ie?oai aeeoaeuiinou eeieia; ADCclk yoi iiaa ; ne?uoue IF
+   IF PRESCALER.q[]<=(HalfPresclr-1)
+		THEN DACclk=GND;
+		ELSE DACclk=VCC;
+   END IF;		
+
+ Sample_ena.d=(PRESCALER.q[]==HalfPresclr+1);--Eiioeun ii eioi?iio i?iaaeaa?ony ana aaiiua; ne?uoue IF
+ Sample_ena.clk=Conv_Clock;
+
+RAM_Read_Pointer.clock		= 	Conv_Clock;
+RAM_Read_Pointer.cnt_en		=	Sample_ena.q;
+RAM_Read_Pointer.sclr		=	!Work_is_in_Progress.q;
+
+
+
+
+SPI_Start.(clk, d)			=	(Conv_Clock, DFF(.clk=Bus_Clock, .d=(Direct_In AND Select AND DataBusStrobe and (AddrBus_In[7..0]==10))));
+Work_is_in_Progress.(S, clk,R)	=	( (SPI_Start.q and !Reset), Conv_Clock, (Reset OR SPI_Stop.q));
+SPI_Stop.(d, clk)	=	((RAM_Read_Pointer.q[]==Stopping_bit), Conv_Clock);
+
+DAC_is_busy	=	Work_is_in_Progress.q;
+
+
+
+
+--IF ((RAM_Read_Pointer.q[4..0] > 7) and (RAM_Read_Pointer.q[4..0] < 31))
+IF ((RAM_Read_Pointer.q[4..0] > 7) )
+then DAC_nCS_	=	GND;
+else DAC_nCS_	=	VCC;
+end if;
+DAC_nCS	=	DFF(.d=DAC_nCS_, .clk=Conv_Clock);
+
+
+
+
+RAM_DAC.clock_b			    =	Conv_Clock;
+-- Bit reordering
+RAM_DAC.address_b[11..5]	=	RAM_Read_Pointer.q[11..5];
+RAM_DAC.address_b[4..0]		=	!RAM_Read_Pointer.q[4..0];
+
+RAM_DAC.data_b[0]	=	GND;
+RAM_DAC.wren_b		=	GND;
+--DAC_DATA	=	DFF(.d=(DFFE(.d=RAM_DAC.q_b[0], .clk=Conv_Clock, .ena=Sample_ena.q)), .clk=Conv_Clock);
+DAC_DATA	=	RAM_DAC.q_b[0];
+DAC_nCLK  =DFF(.d=(DACclk AND !DAC_nCS_), .clk=Conv_Clock);
+--DAC_nCS	=	SPI_Start.q;
+
+
+--Память. Порт А. подсоединение на внешнюю шину
+RAM_DAC.clock_a			=	Bus_Clock;
+RAM_DAC.address_a[7..0]	=	AddrBus_In[7..0];
+RAM_DAC.data_a[15..0]	=	DataBus_In[15..0];
+DataBusOut[15..0] 		=	RAM_DAC.q_a[15..0];
+RAM_DAC.wren_a= Direct_In AND Select AND DataBusStrobe;
+
+
+--Присвоение выходных сигналов
+END;
